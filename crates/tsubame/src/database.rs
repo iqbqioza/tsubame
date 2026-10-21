@@ -12,6 +12,7 @@ use anyhow::ensure;
 
 use crate::Result;
 use crate::env::EnvInner;
+use crate::iter::RoIter;
 use crate::storage::btree;
 use crate::storage::page::MAX_KEY_SIZE;
 use crate::traits::{BoxedError, BytesDecode, BytesEncode};
@@ -80,6 +81,25 @@ impl<KC, DC> Database<KC, DC> {
         Ok(Some(DC::bytes_decode(value).map_err(|error| {
             codec_error("value decoding failed", error)
         })?))
+    }
+
+    /// Returns an iterator over all entries in ascending key order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be resolved in the transaction
+    /// snapshot.
+    pub fn iter<'txn, 'env>(&self, txn: &'txn RoTxn<'env>) -> Result<RoIter<'txn, 'env, KC, DC>>
+    where
+        KC: BytesDecode<'txn>,
+        DC: BytesDecode<'txn>,
+    {
+        ensure!(
+            txn.belongs_to(&self.env),
+            "transaction belongs to a different environment"
+        );
+        let root = txn.root_for(&self.kind)?;
+        RoIter::new(txn, root)
     }
 
     /// Stores `data` under `key`.
