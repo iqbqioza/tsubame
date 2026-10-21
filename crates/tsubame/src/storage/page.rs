@@ -87,23 +87,18 @@ impl<'a> Page<'a> {
     /// validated this page with [`Page::parse`] in this process and must not
     /// have observed external modifications to the mapped file.
     #[inline]
-    pub(crate) fn parse_verified(bytes: &'a [u8]) -> Result<Self> {
-        ensure!(
-            bytes.len() == PAGE_SIZE,
-            "page has {} bytes, expected {PAGE_SIZE}",
-            bytes.len()
-        );
-        let page_type = PageType::from_byte(bytes[4])?;
+    pub(crate) fn parse_verified(bytes: &'a [u8]) -> Self {
+        let page_type = if bytes[4] == PageType::Branch.as_byte() {
+            PageType::Branch
+        } else {
+            PageType::Leaf
+        };
         let slot_count = LittleEndian::read_u16(&bytes[6..8]) as usize;
-        ensure!(
-            slot_count <= (PAGE_SIZE - HEADER_SIZE) / SLOT_SIZE,
-            "page has too many slots: {slot_count}"
-        );
-        Ok(Self {
+        Self {
             bytes,
             page_type,
             slot_count,
-        })
+        }
     }
 
     fn parse_inner(
@@ -502,6 +497,7 @@ impl<'a> Page<'a> {
     }
 
     /// Returns the value stored in a leaf slot.
+    #[allow(dead_code)] // Used by page tests and kept for low-level callers.
     #[inline]
     pub(crate) fn value(&self, index: usize) -> Result<&'a [u8]> {
         let (offset, key_len, value_len, _) = self.slot(index)?;
@@ -521,13 +517,6 @@ impl<'a> Page<'a> {
         Ok(LittleEndian::read_u64(&self.bytes[start..start + 8]))
     }
 
-    /// Returns whether a leaf slot points to an overflow extent.
-    #[inline]
-    pub(crate) fn is_overflow(&self, index: usize) -> Result<bool> {
-        let (_, _, _, flags) = self.slot(index)?;
-        Ok(flags & FLAG_OVERFLOW != 0)
-    }
-
     /// Returns the slot index containing `key`, if it exists.
     #[inline]
     pub(crate) fn leaf_index(&self, key: &[u8]) -> Result<Option<usize>> {
@@ -537,7 +526,7 @@ impl<'a> Page<'a> {
         );
 
         let index = self.lower_bound(key)?;
-        if index == self.slot_count || self.key(index)? != key {
+        if index == self.slot_count || self.key_at(index) != key {
             Ok(None)
         } else {
             Ok(Some(index))
@@ -547,7 +536,7 @@ impl<'a> Page<'a> {
     /// Returns the key and value of a leaf slot with one slot walk.
     #[inline]
     pub(crate) fn leaf_entry(&self, index: usize) -> Result<(&'a [u8], LeafValue<'a>)> {
-        let (offset, key_len, value_len, flags) = self.slot(index)?;
+        let (offset, key_len, value_len, flags) = self.slot_at(index);
         let key = &self.bytes[offset..offset + key_len];
         let value_start = offset + key_len;
         let value_bytes = &self.bytes[value_start..value_start + value_len];
@@ -562,13 +551,7 @@ impl<'a> Page<'a> {
     /// Returns the value stored in a leaf slot.
     #[inline]
     pub(crate) fn leaf_value(&self, index: usize) -> Result<LeafValue<'a>> {
-        if self.is_overflow(index)? {
-            Ok(LeafValue::Overflow(OverflowRef::decode(
-                self.value(index)?,
-            )?))
-        } else {
-            Ok(LeafValue::Inline(self.value(index)?))
-        }
+        Ok(self.leaf_entry(index)?.1)
     }
 
     /// Returns the child to follow for `key` in a branch page.
@@ -591,7 +574,7 @@ impl<'a> Page<'a> {
         let mut right = self.slot_count;
         while left < right {
             let mid = (left + right) / 2;
-            if self.key(mid)? <= key {
+            if self.key_at(mid) <= key {
                 left = mid + 1;
             } else {
                 right = mid;
@@ -609,7 +592,7 @@ impl<'a> Page<'a> {
         let mut right = self.slot_count;
         while left < right {
             let mid = (left + right) / 2;
-            if self.key(mid)? < key {
+            if self.key_at(mid) < key {
                 left = mid + 1;
             } else {
                 right = mid;
@@ -624,13 +607,31 @@ impl<'a> Page<'a> {
         let mut right = self.slot_count;
         while left < right {
             let mid = (left + right) / 2;
-            if self.key(mid)? <= key {
+            if self.key_at(mid) <= key {
                 left = mid + 1;
             } else {
                 right = mid;
             }
         }
         Ok(left)
+    }
+
+    /// Reads a slot that the caller has already bounds-checked.
+    #[inline]
+    fn slot_at(&self, index: usize) -> (usize, usize, usize, u8) {
+        let slot = HEADER_SIZE + index * SLOT_SIZE;
+        let offset = LittleEndian::read_u16(&self.bytes[slot..slot + 2]) as usize;
+        let key_len = LittleEndian::read_u16(&self.bytes[slot + 2..slot + 4]) as usize;
+        let value_len = LittleEndian::read_u32(&self.bytes[slot + 4..slot + 8]) as usize;
+        let flags = self.bytes[slot + 8];
+        (offset, key_len, value_len, flags)
+    }
+
+    /// Returns a key for a slot that the caller has already bounds-checked.
+    #[inline]
+    fn key_at(&self, index: usize) -> &'a [u8] {
+        let (offset, key_len, _, _) = self.slot_at(index);
+        &self.bytes[offset..offset + key_len]
     }
 
     /// Reads the raw slot fields.

@@ -550,7 +550,7 @@ impl EnvInner {
 
         let page = &self.mmap[start..end];
         if self.is_verified(page_id) {
-            Page::parse_verified(page)
+            Ok(Page::parse_verified(page))
         } else {
             let parsed = Page::parse(page, Some(page_id))?;
             self.mark_verified(page_id);
