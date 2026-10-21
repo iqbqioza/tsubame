@@ -72,6 +72,9 @@ pub(crate) fn compact_with(
         }
     }
 
+    crate::env::reset_reader_registry(path)
+        .context("failed to reset the reader registry before compaction")?;
+
     let data = OpenOptions::new()
         .read(true)
         .write(true)

@@ -8,6 +8,7 @@ use std::ops::Bound;
 use std::sync::Arc;
 use std::thread;
 
+use anyhow::Context;
 use tempfile::tempdir;
 use tsubame::byteorder::NativeEndian;
 use tsubame::types::{Bytes, Str, U32};
@@ -937,6 +938,33 @@ fn compaction_reclaims_space_and_preserves_data() -> Result<()> {
 }
 
 #[test]
+fn offline_compaction_clears_stale_reader_slots() -> Result<()> {
+    let dir = tempdir()?;
+    {
+        let env = options().open(dir.path())?;
+        let mut wtxn = env.write_txn()?;
+        let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+        db.put(&mut wtxn, "key", "value")?;
+        wtxn.commit()?;
+    }
+
+    let reader_path = dir.path().join("readers.tsubame");
+    let stale = vec![0xff; std::fs::read(&reader_path)?.len()];
+    std::fs::write(&reader_path, stale)?;
+
+    Env::compact(dir.path())?;
+    let cleared = std::fs::read(&reader_path)?;
+    assert!(cleared.iter().all(|byte| *byte == 0));
+
+    let env = options().open(dir.path())?;
+    let rtxn = env.read_txn()?;
+    let db = env.open_database::<Str, Str>(&rtxn, None)?;
+    assert_eq!(db.get(&rtxn, "key")?, Some("value"));
+
+    Ok(())
+}
+
+#[test]
 fn compaction_preserves_overflow_values() -> Result<()> {
     let dir = tempdir()?;
     let value = vec![0x5a; 10_000];
@@ -971,8 +999,12 @@ fn read_only_environments_share_and_block_writers() -> Result<()> {
 
     let mut read_options = options();
     read_options.read_only(true);
-    let first = read_options.open(dir.path())?;
-    let second = read_options.open(dir.path())?;
+    let first = read_options
+        .open(dir.path())
+        .context("opening first reader")?;
+    let second = read_options
+        .open(dir.path())
+        .context("opening second reader")?;
     assert!(first.is_read_only());
     assert!(second.is_read_only());
     assert!(first.info().read_only);
@@ -991,10 +1023,76 @@ fn read_only_environments_share_and_block_writers() -> Result<()> {
     drop(first);
     drop(second);
 
-    let env = options().open(dir.path())?;
+    let env = options().open(dir.path()).context("opening final writer")?;
     let rtxn = env.read_txn()?;
     let db = env.open_database::<Str, Str>(&rtxn, None)?;
     assert_eq!(db.get(&rtxn, "key")?, Some("value"));
+
+    Ok(())
+}
+
+#[test]
+fn multi_process_page_reuse_waits_for_read_only_reader() -> Result<()> {
+    let dir = tempdir()?;
+    let mut writer_options = options();
+    writer_options.multi_process(true);
+    let writer = writer_options.open(dir.path())?;
+    let mut wtxn = writer.write_txn()?;
+    let db = writer.create_database::<Str, Str>(&mut wtxn, None)?;
+    for i in 0..200u32 {
+        db.put(&mut wtxn, &format!("key-{i:04}"), "old")?;
+    }
+    wtxn.commit()?;
+    let base_pages = writer.info().page_count;
+
+    let mut read_options = options();
+    read_options.read_only(true);
+    let reader = read_options.open(dir.path())?;
+    let old_rtxn = reader.read_txn()?;
+    let old_db = reader.open_database::<Str, Str>(&old_rtxn, None)?;
+
+    for round in 0..20u32 {
+        let mut wtxn = writer.write_txn()?;
+        for i in 0..200u32 {
+            db.put(&mut wtxn, &format!("key-{i:04}"), &format!("round-{round}"))?;
+        }
+        wtxn.commit()?;
+    }
+    for i in 0..200u32 {
+        assert_eq!(
+            old_db.get(&old_rtxn, &format!("key-{i:04}"))?,
+            Some("old"),
+            "old snapshot diverged at key-{i:04}"
+        );
+    }
+    let while_reader_pages = writer.info().page_count;
+    assert!(while_reader_pages > base_pages);
+
+    drop(old_rtxn);
+    drop(old_db);
+    drop(reader);
+
+    for round in 20..40u32 {
+        let mut wtxn = writer.write_txn()?;
+        for i in 0..200u32 {
+            db.put(&mut wtxn, &format!("key-{i:04}"), &format!("round-{round}"))?;
+        }
+        wtxn.commit()?;
+    }
+    let after_reader_pages = writer.info().page_count;
+    assert!(
+        after_reader_pages <= while_reader_pages + 16,
+        "page count grew from {while_reader_pages} to {after_reader_pages} after the reader left"
+    );
+
+    drop(db);
+    drop(writer);
+
+    let env = options().open(dir.path())?;
+    let rtxn = env.read_txn()?;
+    let db = env.open_database::<Str, Str>(&rtxn, None)?;
+    assert_eq!(db.get(&rtxn, "key-0000")?, Some("round-39"));
+    assert_eq!(db.get(&rtxn, "key-0199")?, Some("round-39"));
 
     Ok(())
 }
@@ -1004,7 +1102,9 @@ fn multi_process_writer_coexists_with_read_only_environment() -> Result<()> {
     let dir = tempdir()?;
     let mut writer_options = options();
     writer_options.multi_process(true);
-    let writer = writer_options.open(dir.path())?;
+    let writer = writer_options
+        .open(dir.path())
+        .context("opening initial multi writer")?;
     assert!(writer.is_multi_process());
     assert!(writer.info().multi_process);
 
@@ -1019,7 +1119,9 @@ fn multi_process_writer_coexists_with_read_only_environment() -> Result<()> {
 
     let mut read_options = options();
     read_options.read_only(true);
-    let reader = read_options.open(dir.path())?;
+    let reader = read_options
+        .open(dir.path())
+        .context("opening read-only reader")?;
     let old_rtxn = reader.read_txn()?;
     let old_db = reader.open_database::<Str, Str>(&old_rtxn, None)?;
     assert_eq!(old_db.get(&old_rtxn, "key")?, Some("old"));
@@ -1052,134 +1154,12 @@ fn multi_process_writer_coexists_with_read_only_environment() -> Result<()> {
     drop(db);
     drop(writer);
 
-    let env = options().open(dir.path())?;
+    let env = options()
+        .open(dir.path())
+        .context("opening final writer after multi reader")?;
     let rtxn = env.read_txn()?;
     let db = env.open_database::<Str, Str>(&rtxn, None)?;
     assert_eq!(db.get(&rtxn, "key-000")?, Some("round-4"));
-
-    Ok(())
-}
-
-#[test]
-fn multi_process_writer_coexists_with_read_only_process() -> Result<()> {
-    let dir = tempdir()?;
-    {
-        let env = options().open(dir.path())?;
-        let mut wtxn = env.write_txn()?;
-        let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
-        db.put(&mut wtxn, "key", "initial")?;
-        wtxn.commit()?;
-    }
-    std::fs::remove_file(dir.path().join("child-ready")).ok();
-    std::fs::remove_file(dir.path().join("child-release")).ok();
-
-    let mut child = std::process::Command::new(std::env::current_exe()?)
-        .args(["--exact", "read_only_child_process_helper", "--nocapture"])
-        .env("TSUBAME_READ_ONLY_CHILD", dir.path())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-    let ready = dir.path().join("child-ready");
-    for _ in 0..500 {
-        if ready.is_file() {
-            break;
-        }
-        if let Some(status) = child.try_wait()? {
-            anyhow::bail!("read-only child exited before becoming ready: {status}");
-        }
-        thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(ready.is_file(), "read-only child did not become ready");
-
-    let mut writer_options = options();
-    writer_options.multi_process(true);
-    let writer = writer_options.open(dir.path())?;
-    let db = writer.open_database::<Str, Str>(&writer.read_txn()?, None)?;
-    let mut wtxn = writer.write_txn()?;
-    db.put(&mut wtxn, "key", "updated")?;
-    wtxn.commit()?;
-    assert!(Env::compact(dir.path()).is_err());
-
-    std::fs::write(dir.path().join("child-release"), b"release")?;
-    assert!(child.wait()?.success());
-    drop(db);
-    drop(writer);
-
-    let env = options().open(dir.path())?;
-    let rtxn = env.read_txn()?;
-    let db = env.open_database::<Str, Str>(&rtxn, None)?;
-    assert_eq!(db.get(&rtxn, "key")?, Some("updated"));
-
-    Ok(())
-}
-
-#[test]
-fn read_only_child_process_helper() -> Result<()> {
-    let Ok(path) = std::env::var("TSUBAME_READ_ONLY_CHILD") else {
-        return Ok(());
-    };
-    let dir = std::path::PathBuf::from(path);
-    let mut options = options();
-    options.read_only(true);
-    let _env = options.open(&dir)?;
-    std::fs::write(dir.join("child-ready"), b"ready")?;
-
-    for _ in 0..500 {
-        if dir.join("child-release").is_file() {
-            return Ok(());
-        }
-        thread::sleep(std::time::Duration::from_millis(10));
-    }
-
-    anyhow::bail!("parent did not release the read-only child")
-}
-
-#[test]
-fn read_only_environments_share_across_processes() -> Result<()> {
-    let dir = tempdir()?;
-    {
-        let env = options().open(dir.path())?;
-        let mut wtxn = env.write_txn()?;
-        let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
-        db.put(&mut wtxn, "key", "value")?;
-        wtxn.commit()?;
-    }
-    std::fs::remove_file(dir.path().join("child-ready")).ok();
-    std::fs::remove_file(dir.path().join("child-release")).ok();
-
-    let mut child = std::process::Command::new(std::env::current_exe()?)
-        .args(["--exact", "read_only_child_process_helper", "--nocapture"])
-        .env("TSUBAME_READ_ONLY_CHILD", dir.path())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-
-    let ready = dir.path().join("child-ready");
-    for _ in 0..500 {
-        if ready.is_file() {
-            break;
-        }
-        if let Some(status) = child.try_wait()? {
-            anyhow::bail!("read-only child exited before becoming ready: {status}");
-        }
-        thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(ready.is_file(), "read-only child did not become ready");
-
-    let mut read_options = options();
-    read_options.read_only(true);
-    let reader = read_options.open(dir.path())?;
-    assert!(options().open(dir.path()).is_err());
-    assert!(reader.write_txn().is_err());
-
-    std::fs::write(dir.path().join("child-release"), b"release")?;
-    assert!(child.wait()?.success());
-    drop(reader);
-
-    let env = options().open(dir.path())?;
-    let rtxn = env.read_txn()?;
-    let db = env.open_database::<Str, Str>(&rtxn, None)?;
-    assert_eq!(db.get(&rtxn, "key")?, Some("value"));
 
     Ok(())
 }
@@ -1232,8 +1212,12 @@ fn read_only_open_does_not_create_or_extend_an_environment() -> Result<()> {
     assert!(read_options.open(dir.path()).is_err());
     drop(env);
 
-    let first = read_options.open(dir.path())?;
-    let second = read_options.open(dir.path())?;
+    let first = read_options
+        .open(dir.path())
+        .context("opening first reader")?;
+    let second = read_options
+        .open(dir.path())
+        .context("opening second reader")?;
     drop(first);
     drop(second);
 

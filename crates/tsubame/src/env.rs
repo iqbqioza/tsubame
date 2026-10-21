@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -38,6 +38,11 @@ const LOCK_FILE: &str = "lock.tsubame";
 const WRITER_LOCK_FILE: &str = "writer.tsubame.lock";
 const CLEAN_FILE: &str = "clean.tsubame";
 const COMPARATOR_FILE: &str = "comparator.tsubame";
+const READER_FILE: &str = "readers.tsubame";
+const READER_LOCK_FILE: &str = "readers.tsubame.lock";
+const READER_SLOTS: usize = 4096;
+const READER_SLOT_SIZE: usize = 8;
+const READER_RESERVED: u64 = u64::MAX;
 const COMPARATOR_MAGIC: [u8; 8] = *b"TSUBCMP\0";
 const COMPARATOR_VERSION: u32 = 1;
 const MAX_COMPARATOR_ID_LEN: usize = 1024;
@@ -81,10 +86,16 @@ impl Env {
 
     /// Returns a consistent snapshot of the environment metadata.
     pub fn info(&self) -> EnvInfo {
+        let state_guard = self
+            .inner
+            .state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let map_size = state_guard.map_size;
         let committed = self.inner.read_committed();
-        let state = self.inner.read_state();
+        drop(state_guard);
         EnvInfo {
-            map_size: state.map_size,
+            map_size,
             page_size: PAGE_SIZE,
             page_count: committed.meta.page_count,
             txn_id: committed.meta.txn_id,
@@ -99,22 +110,47 @@ impl Env {
     /// Starts a read-only transaction.
     ///
     /// Read-only transactions can run concurrently with each other and see a
-    /// consistent snapshot of the environment.
+    /// consistent snapshot of the environment. In a read-only environment, the
+    /// transaction reserves a slot in the shared reader registry so a
+    /// concurrent multi-process writer cannot recycle pages it still needs.
     pub fn read_txn(&self) -> Result<RoTxn<'_>> {
         self.inner.ensure_usable()?;
-        if self.inner.read_only {
-            self.inner.refresh_read_only()?;
+        // Reserve before loading the snapshot. A writer that starts between
+        // the snapshot load and registration must see the reservation and
+        // stop reusing pages, otherwise a slow reader could be handed a page
+        // that was recycled several commits later.
+        let reader_slot = if self.inner.read_only {
+            Some(self.inner.reserve_external_reader()?)
+        } else {
+            None
+        };
+        self.inner.reserve_reader();
+        let result = (|| {
+            if self.inner.read_only {
+                self.inner.refresh_read_only()?;
+            }
+            let state_guard = self
+                .inner
+                .state
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let state = Arc::clone(&state_guard);
+            let committed = self.inner.read_committed();
+            drop(state_guard);
+            if let Some(slot) = reader_slot {
+                self.inner
+                    .publish_external_reader(slot, committed.meta.txn_id)?;
+            }
+            self.inner.publish_reader(committed.meta.txn_id);
+            Ok(RoTxn::new(self, state, committed.meta, reader_slot))
+        })();
+        if result.is_err() {
+            self.inner.cancel_reader_reservation();
+            if let Some(slot) = reader_slot {
+                self.inner.release_external_reader(slot);
+            }
         }
-        let state_guard = self
-            .inner
-            .state
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let state = Arc::clone(&state_guard);
-        let committed = self.inner.read_committed();
-        drop(state_guard);
-        self.inner.register_reader(committed.meta.txn_id);
-        Ok(RoTxn::new(self, state, committed.meta))
+        result
     }
 
     /// Starts a read-write transaction.
@@ -211,7 +247,8 @@ impl Env {
     ///
     /// The environment must be closed; if it is open, this returns an error.
     /// Compaction removes pages that are no longer reachable, including pages
-    /// left behind by updates and deletes.
+    /// left behind by updates and deletes, and clears stale cross-process
+    /// reader registry slots.
     ///
     /// # Errors
     ///
@@ -726,6 +763,8 @@ pub(crate) struct EnvInner {
     /// extents into its transaction and returns the unused ones.
     pub(crate) free_pool: Mutex<Vec<FreeExtent>>,
     free_pool_ready: AtomicBool,
+    reader_file: Mutex<File>,
+    reader_lock: File,
     pub(crate) poisoned: AtomicBool,
     clean_marker_on_drop: AtomicBool,
     _lock: File,
@@ -763,11 +802,38 @@ impl EnvInner {
         self.poisoned.store(true, Ordering::Release);
     }
 
-    pub(crate) fn register_reader(&self, txn_id: u64) {
+    pub(crate) fn reserve_reader(&self) {
         let mut readers = self
             .readers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *readers.entry(READER_RESERVED).or_insert(0) += 1;
+    }
+
+    pub(crate) fn cancel_reader_reservation(&self) {
+        let mut readers = self
+            .readers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = readers.get_mut(&READER_RESERVED) {
+            *count -= 1;
+            if *count == 0 {
+                readers.remove(&READER_RESERVED);
+            }
+        }
+    }
+
+    pub(crate) fn publish_reader(&self, txn_id: u64) {
+        let mut readers = self
+            .readers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = readers.get_mut(&READER_RESERVED) {
+            *count -= 1;
+            if *count == 0 {
+                readers.remove(&READER_RESERVED);
+            }
+        }
         *readers.entry(txn_id).or_insert(0) += 1;
     }
 
@@ -785,13 +851,124 @@ impl EnvInner {
     }
 
     pub(crate) fn oldest_reader_snapshot(&self, fallback: u64) -> u64 {
-        self.readers
+        let readers = self
+            .readers
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .keys()
-            .next()
-            .copied()
-            .unwrap_or(fallback)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if readers.contains_key(&READER_RESERVED) {
+            return 0;
+        }
+        let oldest = readers.keys().next().copied().unwrap_or(fallback);
+        drop(readers);
+        if !self.multi_process {
+            return oldest;
+        }
+        match self.oldest_external_reader() {
+            Ok(Some(external)) => oldest.min(external),
+            Ok(None) => oldest,
+            // If the registry cannot be read, disable reuse for this
+            // transaction rather than risk overwriting a reader's pages.
+            Err(_) => 0,
+        }
+    }
+
+    fn lock_reader_registry(&self, exclusive: bool) -> Result<()> {
+        if exclusive {
+            fs4::FileExt::lock(&self.reader_lock)
+        } else {
+            fs4::FileExt::lock_shared(&self.reader_lock)
+        }
+        .with_context(|| {
+            format!(
+                "failed to lock `{}`",
+                self.path.join(READER_LOCK_FILE).display()
+            )
+        })
+    }
+
+    fn read_reader_slots(&self, file: &mut File) -> Result<Vec<u8>> {
+        file.seek(SeekFrom::Start(0))?;
+        let mut slots = vec![0u8; READER_SLOTS * READER_SLOT_SIZE];
+        file.read_exact(&mut slots)?;
+        Ok(slots)
+    }
+
+    pub(crate) fn oldest_external_reader(&self) -> Result<Option<u64>> {
+        let mut file = self
+            .reader_file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.lock_reader_registry(false)?;
+        let result = (|| {
+            let slots = self.read_reader_slots(&mut file)?;
+            let mut oldest = None;
+            for chunk in slots.chunks_exact(READER_SLOT_SIZE) {
+                let txn_id = LittleEndian::read_u64(chunk);
+                if txn_id == READER_RESERVED {
+                    return Ok(Some(0));
+                }
+                if txn_id != 0 {
+                    oldest = Some(oldest.map_or(txn_id, |value: u64| value.min(txn_id)));
+                }
+            }
+            Ok(oldest)
+        })();
+        let _ = fs4::FileExt::unlock(&self.reader_lock);
+        result
+    }
+
+    pub(crate) fn reserve_external_reader(&self) -> Result<u64> {
+        let mut file = self
+            .reader_file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.lock_reader_registry(true)?;
+        let result = (|| {
+            let slots = self.read_reader_slots(&mut file)?;
+            for (index, chunk) in slots.chunks_exact(READER_SLOT_SIZE).enumerate() {
+                if LittleEndian::read_u64(chunk) == 0 {
+                    let offset = (index * READER_SLOT_SIZE) as u64;
+                    file.seek(SeekFrom::Start(offset))?;
+                    file.write_all(&READER_RESERVED.to_le_bytes())?;
+                    file.flush()?;
+                    return Ok(index as u64);
+                }
+            }
+            bail!("too many concurrent readers")
+        })();
+        let _ = fs4::FileExt::unlock(&self.reader_lock);
+        result
+    }
+
+    pub(crate) fn publish_external_reader(&self, slot: u64, txn_id: u64) -> Result<()> {
+        let mut file = self
+            .reader_file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.lock_reader_registry(true)?;
+        let result = (|| {
+            file.seek(SeekFrom::Start(slot * READER_SLOT_SIZE as u64))?;
+            file.write_all(&txn_id.to_le_bytes())?;
+            file.flush()?;
+            Ok(())
+        })();
+        let _ = fs4::FileExt::unlock(&self.reader_lock);
+        result
+    }
+
+    pub(crate) fn release_external_reader(&self, slot: u64) {
+        let Ok(mut file) = self.reader_file.lock() else {
+            return;
+        };
+        if self.lock_reader_registry(true).is_err() {
+            return;
+        }
+        let offset = slot * READER_SLOT_SIZE as u64;
+        if file.seek(SeekFrom::Start(offset)).is_ok() {
+            let _ = file.write_all(&0u64.to_le_bytes());
+            let _ = file.flush();
+        }
+        let _ = fs4::FileExt::unlock(&self.reader_lock);
     }
 
     pub(crate) fn take_reusable_free(&self, limit_txn: u64) -> Vec<FreeExtent> {
@@ -1086,9 +1263,12 @@ impl EnvOpenOptions {
 
     /// Allows a writable environment to coexist with read-only environments.
     ///
-    /// Cross-transaction page reuse is disabled in this mode so pages retained
-    /// by another process's snapshot are never overwritten. The data file can
-    /// grow until it is compacted offline.
+    /// Cross-process page reuse remains enabled. Read-only transactions record
+    /// their snapshots in `readers.tsubame`; pages needed by those snapshots
+    /// are not recycled. A fixed number of reader slots is available, and
+    /// stale slots left by a crash conservatively block reuse until offline
+    /// compaction clears them. Read-only environments need write access to
+    /// the environment directory for the registry sidecar.
     pub fn multi_process(&mut self, multi_process: bool) -> &mut Self {
         self.multi_process = multi_process;
         self
@@ -1119,13 +1299,16 @@ impl EnvOpenOptions {
     ///
     /// A writable environment creates the directory and data file when needed.
     /// A read-only environment requires an existing, initialized data file and
-    /// takes a shared lock.
+    /// takes a shared lock. It needs write access to the directory for the
+    /// `readers.tsubame` registry sidecars used to coordinate cross-process
+    /// page reuse.
     ///
     /// # Errors
     ///
     /// Returns an error if the directory cannot be created or opened, the
     /// environment is already locked by another process, the on-disk format is
-    /// invalid, or the data file cannot be mapped.
+    /// invalid, the reader registry cannot be opened, or the data file cannot
+    /// be mapped.
     pub fn open(&self, path: impl AsRef<Path>) -> Result<Env> {
         let path = path.as_ref();
         let comparator_id = self.comparator_id.clone().unwrap_or_else(|| {
@@ -1218,6 +1401,8 @@ impl EnvOpenOptions {
         } else {
             None
         };
+
+        let (reader_file, reader_lock) = open_reader_registry(path)?;
 
         let data_path = path.join(DATA_FILE);
         let data = if self.read_only {
@@ -1363,7 +1548,7 @@ impl EnvOpenOptions {
             state: RwLock::new(Arc::new(state)),
             read_only: self.read_only,
             multi_process: self.multi_process && !self.read_only,
-            page_reuse: !self.read_only && !self.multi_process,
+            page_reuse: !self.read_only,
             comparator: self.comparator,
             comparator_id,
             committed: RwLock::new(Committed {
@@ -1374,6 +1559,8 @@ impl EnvOpenOptions {
             readers: Mutex::new(BTreeMap::new()),
             free_pool: Mutex::new(Vec::new()),
             free_pool_ready: AtomicBool::new(false),
+            reader_file: Mutex::new(reader_file),
+            reader_lock,
             poisoned: AtomicBool::new(false),
             clean_marker_on_drop: AtomicBool::new(!self.read_only),
             _lock: lock,
@@ -1384,6 +1571,57 @@ impl EnvOpenOptions {
             inner: Arc::new(inner),
         })
     }
+}
+
+/// Opens or creates the shared reader registry used for cross-process reuse.
+fn open_reader_registry(path: &Path) -> Result<(File, File)> {
+    let registry_path = path.join(READER_FILE);
+    let read_write_create = || {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&registry_path)
+    };
+    let file = read_write_create()
+        .with_context(|| format!("failed to open `{}`", registry_path.display()))?;
+    let expected = (READER_SLOTS * READER_SLOT_SIZE) as u64;
+    if file
+        .metadata()
+        .with_context(|| format!("failed to inspect `{}`", registry_path.display()))?
+        .len()
+        < expected
+    {
+        file.set_len(expected)
+            .with_context(|| format!("failed to size `{}`", registry_path.display()))?;
+    }
+    let lock_path = path.join(READER_LOCK_FILE);
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open `{}`", lock_path.display()))?;
+    Ok((file, lock))
+}
+
+/// Clears stale reader slots after the environment is known to be closed.
+pub(crate) fn reset_reader_registry(path: &Path) -> Result<()> {
+    let (file, lock) = open_reader_registry(path)?;
+    fs4::FileExt::lock(&lock)
+        .with_context(|| format!("failed to lock `{}`", path.join(READER_LOCK_FILE).display()))?;
+    let result = (|| {
+        let expected = (READER_SLOTS * READER_SLOT_SIZE) as u64;
+        file.set_len(0)
+            .with_context(|| format!("failed to clear `{}`", path.join(READER_FILE).display()))?;
+        file.set_len(expected)
+            .with_context(|| format!("failed to size `{}`", path.join(READER_FILE).display()))?;
+        Ok(())
+    })();
+    let _ = fs4::FileExt::unlock(&lock);
+    result
 }
 
 /// Validates a user-provided named database name.

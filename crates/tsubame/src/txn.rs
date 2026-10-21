@@ -245,11 +245,22 @@ pub struct RoTxn<'env> {
     env: &'env Env,
     state: Arc<EnvState>,
     meta: Meta,
+    reader_slot: Option<u64>,
 }
 
 impl<'env> RoTxn<'env> {
-    pub(crate) fn new(env: &'env Env, state: Arc<EnvState>, meta: Meta) -> Self {
-        Self { env, state, meta }
+    pub(crate) fn new(
+        env: &'env Env,
+        state: Arc<EnvState>,
+        meta: Meta,
+        reader_slot: Option<u64>,
+    ) -> Self {
+        Self {
+            env,
+            state,
+            meta,
+            reader_slot,
+        }
     }
 
     #[inline]
@@ -291,6 +302,9 @@ impl<'env> RoTxn<'env> {
 impl Drop for RoTxn<'_> {
     fn drop(&mut self) {
         self.env.inner.release_reader(self.meta.txn_id);
+        if let Some(slot) = self.reader_slot {
+            self.env.inner.release_external_reader(slot);
+        }
     }
 }
 

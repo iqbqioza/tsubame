@@ -8,8 +8,8 @@ inspired by [heed].
 > [!WARNING]
 > Tsubame is pre-1.0. The current codebase includes the environment format,
 > B+tree, transactions, named databases, crash-safe commit records, ordered
-> iteration, serde codecs, in-process page reuse, online compaction, and
-> offline compaction. APIs may still change before 1.0.
+> iteration, serde codecs, generation-tagged page reuse across processes,
+> online compaction, and offline compaction. APIs may still change before 1.0.
 
 ## Why Tsubame
 
@@ -47,7 +47,7 @@ added without changing the main API.
 - [x] Range, prefix, and reverse iterators
 - [x] Write transaction reads and iteration with pending writes
 - [x] Serde-based codecs behind features
-- [x] Cross-transaction page reuse within a process
+- [x] Cross-transaction page reuse within and across processes
 - [x] Lazy free-list reconstruction after reopening
 - [x] Read-only environments with shared locks
 - [x] Concurrent writer and read-only processes (`multi_process`)
@@ -137,11 +137,17 @@ The examples use a temporary directory and clean up after themselves.
 - A writable environment normally holds an exclusive file lock. Multiple
   read-only environments use a shared lock and can share the same data file.
   A writable environment can coexist with read-only processes when opened with
-  `multi_process(true)`; in that mode cross-transaction page reuse is disabled
-  so reader snapshots remain valid.
+  `multi_process(true)`. Readers advertise their snapshots through
+  `readers.tsubame`, and the writer only recycles pages that no advertised
+  snapshot can still need. The registry supports up to 4096 simultaneous
+  cross-process readers; stale slots left by a crashed process conservatively
+  block reuse until offline compaction clears them. Read-only environments therefore need write
+  access to their directory for the registry sidecar.
 - Freed pages are reused across transactions once the two recoverable meta
-  snapshots no longer reference them and no active reader can still observe
-  them. This keeps long-running update workloads from growing the file
+  snapshots no longer reference them and no active reader, in any process, can
+  still observe them. Readers reserve a registry slot before loading a
+  snapshot, so a writer cannot recycle a page during the snapshot/registration
+  window. This keeps long-running update workloads from growing the file
   indefinitely. Commit-record pages are recycled with one additional
   generation of delay.
 - The free list is in memory. The first write transaction after reopening
