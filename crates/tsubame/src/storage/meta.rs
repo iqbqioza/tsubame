@@ -21,6 +21,9 @@ const CHECKSUM_OFFSET: usize = 64;
 /// Maximum number of commit descriptors stored directly in a meta page.
 pub(crate) const INLINE_COMMIT_CAPACITY: usize = 16;
 
+/// Bytes of a meta page that actually carry metadata.
+const ENCODED_LEN: usize = 80 + INLINE_COMMIT_CAPACITY * 16;
+
 /// One inline commit descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct InlineCommit {
@@ -75,6 +78,16 @@ impl Meta {
     /// Encodes this meta state into a complete page.
     pub(crate) fn encode(&self) -> [u8; PAGE_SIZE] {
         let mut page = [0u8; PAGE_SIZE];
+        self.encode_into(&mut page);
+        page
+    }
+
+    /// Encodes this meta state into an existing page buffer.
+    ///
+    /// Only the metadata prefix is cleared and rewritten; the unused tail of
+    /// the buffer must already be zero.
+    pub(crate) fn encode_into(&self, page: &mut [u8; PAGE_SIZE]) {
+        page[..ENCODED_LEN].fill(0);
 
         page[0..8].copy_from_slice(&MAGIC);
         LittleEndian::write_u32(&mut page[8..12], FORMAT_VERSION);
@@ -94,10 +107,8 @@ impl Meta {
             LittleEndian::write_u64(&mut page[offset + 8..offset + 16], entry.page_count);
         }
 
-        let checksum = crc32c_fast::crc32c(&page);
+        let checksum = crc32c_fast::crc32c(page);
         LittleEndian::write_u32(&mut page[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4], checksum);
-
-        page
     }
 
     /// Decodes and validates a meta page.
@@ -264,6 +275,16 @@ pub(crate) fn write_slot(file: &File, slot: usize, meta: &Meta) -> Result<()> {
     ensure!(slot < META_SLOTS, "invalid meta slot {slot}");
 
     io::write_all_at(file, &meta.encode(), slot_offset(slot))
+        .with_context(|| format!("failed to write meta slot {slot}"))?;
+
+    Ok(())
+}
+
+/// Writes a pre-encoded meta page, touching only the metadata prefix.
+pub(crate) fn write_slot_page(file: &File, slot: usize, page: &[u8; PAGE_SIZE]) -> Result<()> {
+    ensure!(slot < META_SLOTS, "invalid meta slot {slot}");
+
+    io::write_all_at(file, &page[..ENCODED_LEN], slot_offset(slot))
         .with_context(|| format!("failed to write meta slot {slot}"))?;
 
     Ok(())

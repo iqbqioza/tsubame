@@ -38,6 +38,9 @@ All notable changes to this project are documented here.
   copying the full page first, and write paths use a faster hardware-backed
   CRC32C implementation. Single-key commit CPU time drops substantially while
   the on-disk checksum algorithm and format remain unchanged.
+- Commits reuse a pre-zeroed meta buffer and write only the metadata prefix
+  instead of a full page; single-page commits skip commit-entry vector
+  construction.
 - Bulk loading builds leaf pages from borrowed entries instead of cloning
   every key and value.
 - Verified page reads bypass redundant header checks, and binary-search slot
