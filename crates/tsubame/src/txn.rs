@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail, ensure};
 
 use crate::comparator::KeyComparator;
 use crate::database::DatabaseKind;
-use crate::env::{Committed, Env, EnvInner, FreeExtent};
+use crate::env::{Committed, Env, EnvInner, EnvState, FreeExtent};
 use crate::storage::btree;
 use crate::storage::btree::PageSource;
 use crate::storage::commit::{self, CommitEntry, Descriptor};
@@ -243,12 +243,13 @@ fn sort_pending<'a>(
 /// are dropped. They are created with [`crate::Env::read_txn`].
 pub struct RoTxn<'env> {
     env: &'env Env,
+    state: Arc<EnvState>,
     meta: Meta,
 }
 
 impl<'env> RoTxn<'env> {
-    pub(crate) fn new(env: &'env Env, meta: Meta) -> Self {
-        Self { env, meta }
+    pub(crate) fn new(env: &'env Env, state: Arc<EnvState>, meta: Meta) -> Self {
+        Self { env, state, meta }
     }
 
     #[inline]
@@ -296,11 +297,11 @@ impl Drop for RoTxn<'_> {
 impl PageSource for RoTxn<'_> {
     #[inline]
     fn page(&self, page_id: u64) -> Result<Page<'_>> {
-        self.env.inner.read_page(page_id, &self.meta)
+        self.state.read_page(page_id, &self.meta)
     }
 
     fn overflow(&self, reference: OverflowRef) -> Result<&[u8]> {
-        self.env.inner.read_overflow(reference, &self.meta)
+        self.state.read_overflow(reference, &self.meta)
     }
 
     fn comparator(&self) -> &crate::comparator::KeyComparator {
@@ -314,6 +315,7 @@ impl PageSource for RoTxn<'_> {
 /// transactions only after [`RwTxn::commit`] succeeds.
 pub struct RwTxn<'env> {
     env: &'env Env,
+    state: Arc<EnvState>,
     base: Meta,
     base_slot: u8,
     txn_id: u64,
@@ -351,6 +353,7 @@ impl<'env> RwTxn<'env> {
         env: &'env Env,
         writer: MutexGuard<'env, ()>,
         committed: Committed,
+        state: Arc<EnvState>,
     ) -> Result<Self> {
         let txn_id = committed
             .meta
@@ -367,6 +370,7 @@ impl<'env> RwTxn<'env> {
 
         Ok(Self {
             env,
+            state,
             base: committed.meta,
             base_slot: committed.slot,
             txn_id,
@@ -759,7 +763,7 @@ impl<'env> RwTxn<'env> {
     }
 
     fn write_and_sync(&self, new_meta: &Meta) -> Result<()> {
-        let data = &self.env.inner.data;
+        let data = &self.state.data;
 
         let mut pages = self.overlay.iter().peekable();
         while let Some((&start_page, first)) = pages.next() {
@@ -848,7 +852,7 @@ impl PageSource for RwTxn<'_> {
         if let Some(page) = self.overlay.get(page_id) {
             Page::parse_trusted(page, Some(page_id))
         } else {
-            self.env.inner.read_page(page_id, &self.base)
+            self.state.read_page(page_id, &self.base)
         }
     }
 
@@ -856,7 +860,7 @@ impl PageSource for RwTxn<'_> {
         if let Some(bytes) = self.extents.get(&reference.start_page) {
             overflow::validate_extent(bytes, reference)
         } else {
-            self.env.inner.read_overflow(reference, &self.base)
+            self.state.read_overflow(reference, &self.base)
         }
     }
 
@@ -872,7 +876,7 @@ impl PageStore for RwTxn<'_> {
         }
 
         let mut page = [0u8; PAGE_SIZE];
-        page.copy_from_slice(self.env.inner.read_page(page_id, &self.base)?.bytes());
+        page.copy_from_slice(self.state.read_page(page_id, &self.base)?.bytes());
         Ok(page)
     }
 
@@ -925,7 +929,7 @@ impl PageStore for RwTxn<'_> {
             .checked_add(pages)
             .context("page ID overflow")?;
         let max_pages =
-            u64::try_from(self.env.inner.map_size / PAGE_SIZE).context("map size is too large")?;
+            u64::try_from(self.state.map_size / PAGE_SIZE).context("map size is too large")?;
         ensure!(
             self.next_page <= max_pages,
             "environment map is full at {} pages; reopen it with a larger map_size",
