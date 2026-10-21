@@ -20,8 +20,8 @@ All notable changes to this project are documented here.
 
 - Bulk loading builds leaf pages from borrowed entries instead of cloning
   every key and value.
-- Verified page reads skip redundant validation, and hot page/btree accessors
-  are inlined.
+- Verified page reads bypass redundant header checks, and binary-search slot
+  access avoids repeated bounds checks; hot page/btree accessors are inlined.
 - Leaves with changed-length values shift a packed cell block in place instead
   of rebuilding the page entry by entry, and adjacent dirty pages are written
   in batches.
