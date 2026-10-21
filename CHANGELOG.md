@@ -6,10 +6,13 @@ All notable changes to this project are documented here.
 
 ### Added
 
-- Cross-transaction page reuse for long-running writers. Pages freed by a
-  commit become reusable after both recoverable meta snapshots no longer
-  reference them and no older reader can observe them. Commit-record pages are
-  recycled as well.
+- Cross-transaction page reuse for long-running writers, including in
+  `multi_process` mode. Pages freed by a commit become reusable after both
+  recoverable meta snapshots no longer reference them and no older reader, in
+  this process or another read-only process, can observe them. Readers reserve
+  a shared registry slot before loading a snapshot, closing the window between
+  snapshot selection and registration. Commit-record pages are recycled as
+  well.
 - Lazy free-list reconstruction on the first write after reopening, so pages
   freed by a previous process become reusable without a compaction.
 - `get_rw`, `range_rw`, `rev_iter_rw`, `rev_range_rw`, `prefix_rw`, and
@@ -26,8 +29,8 @@ All notable changes to this project are documented here.
   can share an environment while a writable environment holds the exclusive
   lock.
 - `multi_process(true)` lets a writable environment coexist with read-only
-  processes. Cross-transaction page reuse is disabled in this mode so external
-  snapshots remain valid.
+  processes while retaining cross-process page reuse. Reader snapshots are
+  advertised in `readers.tsubame`; offline compaction clears stale slots.
 
 ### Performance
 
