@@ -8,15 +8,16 @@ use anyhow::{Context, Result, bail, ensure};
 use byteorder::{ByteOrder, LittleEndian};
 
 use super::PAGE_SIZE;
+use super::overflow::{OVERFLOW_REF_SIZE, OverflowRef};
 
 /// The maximum encoded key size accepted by format version 1.
 pub(crate) const MAX_KEY_SIZE: usize = 1024;
 
-/// The size of an overflow reference stored in a leaf cell.
-pub(crate) const OVERFLOW_REF_SIZE: usize = 24;
+/// The maximum inline entry size, including its slot.
+pub(crate) const INLINE_BUDGET: usize = PAGE_SIZE / 4;
 
-const HEADER_SIZE: usize = 32;
-const SLOT_SIZE: usize = 12;
+pub(crate) const HEADER_SIZE: usize = 32;
+pub(crate) const SLOT_SIZE: usize = 12;
 const CHECKSUM_OFFSET: usize = 0;
 const BRANCH_CHILD_SIZE: usize = 8;
 const FLAG_OVERFLOW: u8 = 1 << 0;
@@ -45,6 +46,15 @@ impl PageType {
             Self::Leaf => 2,
         }
     }
+}
+
+/// A leaf value, which may be stored inline or in an overflow extent.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum LeafValue<'a> {
+    /// The value bytes are stored directly in the page.
+    Inline(&'a [u8]),
+    /// The value is stored in a contiguous overflow extent.
+    Overflow(OverflowRef),
 }
 
 /// A validated view over one page.
@@ -222,30 +232,43 @@ impl<'a> Page<'a> {
         Ok(flags & FLAG_OVERFLOW != 0)
     }
 
-    /// Looks up `key` in a leaf page.
-    pub(crate) fn leaf_get(&self, key: &[u8]) -> Result<Option<&'a [u8]>> {
+    /// Returns the slot index containing `key`, if it exists.
+    pub(crate) fn leaf_index(&self, key: &[u8]) -> Result<Option<usize>> {
         ensure!(
             self.page_type == PageType::Leaf,
-            "leaf_get called on a branch page"
+            "leaf_index called on a branch page"
         );
 
         let index = self.lower_bound(key)?;
         if index == self.slot_count || self.key(index)? != key {
-            return Ok(None);
+            Ok(None)
+        } else {
+            Ok(Some(index))
         }
-        ensure!(
-            !self.is_overflow(index)?,
-            "overflow values are not implemented yet"
-        );
+    }
 
-        Ok(Some(self.value(index)?))
+    /// Returns the value stored in a leaf slot.
+    pub(crate) fn leaf_value(&self, index: usize) -> Result<LeafValue<'a>> {
+        if self.is_overflow(index)? {
+            Ok(LeafValue::Overflow(OverflowRef::decode(
+                self.value(index)?,
+            )?))
+        } else {
+            Ok(LeafValue::Inline(self.value(index)?))
+        }
     }
 
     /// Returns the child to follow for `key` in a branch page.
     pub(crate) fn branch_child(&self, key: &[u8]) -> Result<u64> {
+        let index = self.branch_child_index(key)?;
+        self.child(index)
+    }
+
+    /// Returns the child slot index to follow for `key` in a branch page.
+    pub(crate) fn branch_child_index(&self, key: &[u8]) -> Result<usize> {
         ensure!(
             self.page_type == PageType::Branch,
-            "branch_child called on a leaf page"
+            "branch_child_index called on a leaf page"
         );
         ensure!(self.slot_count > 0, "branch page has no children");
 
@@ -260,10 +283,8 @@ impl<'a> Page<'a> {
             }
         }
 
-        let index = left
-            .checked_sub(1)
-            .context("branch page has no child for the requested key")?;
-        self.child(index)
+        left.checked_sub(1)
+            .context("branch page has no child for the requested key")
     }
 
     /// Returns the first slot whose key is `>= key`.
@@ -300,6 +321,7 @@ impl<'a> Page<'a> {
 }
 
 /// Builds a leaf page from sorted key/value pairs.
+#[allow(dead_code)] // Convenience wrapper used by page tests and future callers.
 pub(crate) fn build_leaf(
     page_id: u64,
     txn_id: u64,
@@ -315,6 +337,32 @@ pub(crate) fn build_leaf(
     let mut builder = PageBuilder::new(PageType::Leaf);
     for (key, value) in entries {
         builder.push(key, value, 0)?;
+    }
+
+    builder.finish(page_id, txn_id)
+}
+
+/// Builds a leaf page from sorted entries that may reference overflow extents.
+pub(crate) fn build_leaf_entries(
+    page_id: u64,
+    txn_id: u64,
+    entries: &[(&[u8], LeafValue<'_>)],
+) -> Result<[u8; PAGE_SIZE]> {
+    for pair in entries.windows(2) {
+        ensure!(
+            pair[0].0 < pair[1].0,
+            "leaf keys must be strictly ascending"
+        );
+    }
+
+    let mut builder = PageBuilder::new(PageType::Leaf);
+    for (key, value) in entries {
+        match value {
+            LeafValue::Inline(value) => builder.push(key, value, 0)?,
+            LeafValue::Overflow(reference) => {
+                builder.push(key, &reference.encode(), FLAG_OVERFLOW)?;
+            }
+        }
     }
 
     builder.finish(page_id, txn_id)
@@ -456,10 +504,14 @@ mod tests {
         let bytes = leaf();
         let page = Page::parse(&bytes, Some(2)).unwrap();
 
-        assert_eq!(page.leaf_get(b"a").unwrap(), Some(&b"1"[..]));
-        assert_eq!(page.leaf_get(b"b").unwrap(), Some(&b"2"[..]));
-        assert_eq!(page.leaf_get(b"c").unwrap(), None);
-        assert_eq!(page.leaf_get(b"").unwrap(), None);
+        assert_eq!(page.leaf_index(b"a").unwrap(), Some(0));
+        assert_eq!(page.leaf_index(b"b").unwrap(), Some(1));
+        assert_eq!(page.leaf_index(b"c").unwrap(), None);
+        assert_eq!(page.leaf_index(b"").unwrap(), None);
+        assert!(matches!(
+            page.leaf_value(0).unwrap(),
+            LeafValue::Inline(value) if value == b"1"
+        ));
     }
 
     #[test]
@@ -522,6 +574,6 @@ mod tests {
         let page = Page::parse(&page_bytes, Some(2)).unwrap();
 
         assert_eq!(page.slot_count(), 0);
-        assert_eq!(page.leaf_get(b"a").unwrap(), None);
+        assert_eq!(page.leaf_index(b"a").unwrap(), None);
     }
 }
