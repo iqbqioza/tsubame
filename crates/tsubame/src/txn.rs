@@ -106,10 +106,49 @@ impl<'a> Iterator for PageOverlayIter<'a> {
     }
 }
 
+const INLINE_PENDING_VALUE: usize = 32;
+
+#[derive(Clone, Debug)]
+enum PendingValue {
+    Inline {
+        bytes: [u8; INLINE_PENDING_VALUE],
+        len: u8,
+    },
+    Owned(Vec<u8>),
+}
+
+impl PendingValue {
+    fn new(value: &[u8]) -> Self {
+        if value.len() <= INLINE_PENDING_VALUE {
+            let mut bytes = [0u8; INLINE_PENDING_VALUE];
+            bytes[..value.len()].copy_from_slice(value);
+            Self::Inline {
+                bytes,
+                len: value.len() as u8,
+            }
+        } else {
+            Self::Owned(value.to_vec())
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Inline { bytes, len } => &bytes[..*len as usize],
+            Self::Owned(value) => value,
+        }
+    }
+}
+
+impl AsRef<[u8]> for PendingValue {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
 enum Pending {
     Empty,
-    One(Vec<u8>, Option<Vec<u8>>),
-    Map(BTreeMap<Vec<u8>, Option<Vec<u8>>>),
+    One(Vec<u8>, Option<PendingValue>),
+    Map(BTreeMap<Vec<u8>, Option<PendingValue>>),
 }
 
 impl Pending {
@@ -117,7 +156,7 @@ impl Pending {
         Self::Empty
     }
 
-    fn insert(&mut self, key: Vec<u8>, value: Option<Vec<u8>>) {
+    fn insert(&mut self, key: Vec<u8>, value: Option<PendingValue>) {
         match std::mem::replace(self, Self::Empty) {
             Self::Empty => *self = Self::One(key, value),
             Self::One(existing_key, existing_value) => {
@@ -140,33 +179,41 @@ impl Pending {
     fn get(&self, key: &[u8]) -> Option<Option<&[u8]>> {
         match self {
             Self::Empty => None,
-            Self::One(pending_key, value) => {
-                (pending_key.as_slice() == key).then_some(value.as_deref())
-            }
-            Self::Map(map) => map.get(key).map(|value| value.as_deref()),
+            Self::One(pending_key, value) => (pending_key.as_slice() == key)
+                .then_some(value.as_ref().map(PendingValue::as_slice)),
+            Self::Map(map) => map
+                .get(key)
+                .map(|value| value.as_ref().map(PendingValue::as_slice)),
         }
     }
 
     fn iter(&self) -> PendingIter<'_> {
         match self {
             Self::Empty => Box::new(std::iter::empty()),
-            Self::One(key, value) => Box::new(std::iter::once((key.as_slice(), value.as_deref()))),
-            Self::Map(map) => Box::new(
-                map.iter()
-                    .map(|(key, value)| (key.as_slice(), value.as_deref())),
-            ),
+            Self::One(key, value) => Box::new(std::iter::once((
+                key.as_slice(),
+                value.as_ref().map(PendingValue::as_slice),
+            ))),
+            Self::Map(map) => {
+                Box::new(map.iter().map(|(key, value)| {
+                    (key.as_slice(), value.as_ref().map(PendingValue::as_slice))
+                }))
+            }
         }
     }
 
     fn iter_rev(&self) -> PendingRevIter<'_> {
         match self {
             Self::Empty => Box::new(std::iter::empty()),
-            Self::One(key, value) => Box::new(std::iter::once((key.as_slice(), value.as_deref()))),
-            Self::Map(map) => Box::new(
-                map.iter()
-                    .rev()
-                    .map(|(key, value)| (key.as_slice(), value.as_deref())),
-            ),
+            Self::One(key, value) => Box::new(std::iter::once((
+                key.as_slice(),
+                value.as_ref().map(PendingValue::as_slice),
+            ))),
+            Self::Map(map) => {
+                Box::new(map.iter().rev().map(|(key, value)| {
+                    (key.as_slice(), value.as_ref().map(PendingValue::as_slice))
+                }))
+            }
         }
     }
 }
@@ -348,7 +395,8 @@ impl<'env> RwTxn<'env> {
         Arc::ptr_eq(&self.env.inner, env)
     }
 
-    pub(crate) fn put_raw(&mut self, kind: DatabaseKind, key: Vec<u8>, value: Vec<u8>) {
+    pub(crate) fn put_raw(&mut self, kind: DatabaseKind, key: Vec<u8>, value: &[u8]) {
+        let value = PendingValue::new(value);
         match kind {
             DatabaseKind::Unnamed => self.unnamed_pending.insert(key, Some(value)),
             DatabaseKind::Named(name) => self
@@ -656,7 +704,7 @@ impl<'env> RwTxn<'env> {
             Pending::One(key, value) => self.apply_one(root, key, value, comparator),
             Pending::Map(pending) => {
                 if *root == 0 && pending.len() >= BULK_LOAD_THRESHOLD {
-                    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = pending
+                    let mut entries: Vec<(Vec<u8>, PendingValue)> = pending
                         .into_iter()
                         .filter_map(|(key, value)| value.map(|value| (key, value)))
                         .collect();
@@ -681,11 +729,18 @@ impl<'env> RwTxn<'env> {
         &mut self,
         root: &mut u64,
         key: Vec<u8>,
-        value: Option<Vec<u8>>,
+        value: Option<PendingValue>,
         comparator: KeyComparator,
     ) -> Result<()> {
         *root = match value {
-            Some(value) => btree::insert_with(self, *root, &key, &value, self.txn_id, &comparator)?,
+            Some(value) => btree::insert_with(
+                self,
+                *root,
+                &key,
+                value.as_slice(),
+                self.txn_id,
+                &comparator,
+            )?,
             None => btree::delete_with(self, *root, &key, self.txn_id, &comparator)?,
         };
         Ok(())

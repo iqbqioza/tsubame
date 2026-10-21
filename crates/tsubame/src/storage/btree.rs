@@ -651,9 +651,9 @@ pub(crate) fn bulk_load<S: PageStore>(
     bulk_load_with(store, entries, txn_id, &KeyComparator::lexicographic())
 }
 
-pub(crate) fn bulk_load_with<S: PageStore>(
+pub(crate) fn bulk_load_with<S: PageStore, V: AsRef<[u8]>>(
     store: &mut S,
-    entries: &[(Vec<u8>, Vec<u8>)],
+    entries: &[(Vec<u8>, V)],
     txn_id: u64,
     comparator: &KeyComparator,
 ) -> Result<u64> {
@@ -680,6 +680,7 @@ pub(crate) fn bulk_load_with<S: PageStore>(
             "key is {} bytes, maximum is {MAX_KEY_SIZE}",
             key.len()
         );
+        let value = value.as_ref();
         let inline = SLOT_SIZE + key.len() + value.len() <= INLINE_BUDGET;
         let value_len = if inline {
             value.len()
@@ -791,9 +792,9 @@ fn flush_leaf<S: PageStore>(
     Ok(())
 }
 
-fn flush_bulk_leaf<S: PageStore>(
+fn flush_bulk_leaf<S: PageStore, V: AsRef<[u8]>>(
     store: &mut S,
-    entries: &[(Vec<u8>, Vec<u8>)],
+    entries: &[(Vec<u8>, V)],
     values: &[LeafValue<'_>],
     leaves: &mut Vec<(Vec<u8>, u64)>,
     txn_id: u64,
