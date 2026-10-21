@@ -6,10 +6,10 @@
 inspired by [heed].
 
 > [!WARNING]
-> Tsubame is pre-1.0. The 0.1.0 release includes the environment format,
+> Tsubame is pre-1.0. The current codebase includes the environment format,
 > B+tree, transactions, named databases, crash-safe commit records, ordered
-> iteration, serde codecs, and offline compaction. APIs may still change
-> before 1.0.
+> iteration, serde codecs, in-process page reuse, and offline compaction. APIs
+> may still change before 1.0.
 
 ## Why Tsubame
 
@@ -47,6 +47,7 @@ added without changing the main API.
 - [x] Range, prefix, and reverse iterators
 - [x] Write transaction iteration with pending writes
 - [x] Serde-based codecs behind features
+- [x] Cross-transaction page reuse within a process
 - [x] Offline compaction
 
 ## Codec features
@@ -103,8 +104,14 @@ The examples use a temporary directory and clean up after themselves.
 ## Limitations
 
 - One process per environment; the file lock is exclusive.
-- Cross-transaction page reuse is not implemented. Use offline compaction to
-  reclaim space:
+- Freed pages are reused across transactions once the two recoverable meta
+  snapshots no longer reference them and no active reader can still observe
+  them. This keeps long-running update workloads from growing the file
+  indefinitely. Commit-record pages are recycled with one additional
+  generation of delay.
+- The free list is in memory. After reopening, pages that were free in the
+  previous process are not reused automatically; offline compaction reclaims
+  them:
   ```rust
   Env::compact("/path/to/env")?;
   ```

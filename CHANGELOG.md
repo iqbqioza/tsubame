@@ -2,6 +2,27 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+### Added
+
+- Cross-transaction page reuse for long-running writers. Pages freed by a
+  commit become reusable after both recoverable meta snapshots no longer
+  reference them and no older reader can observe them. Commit-record pages are
+  recycled as well.
+- Clearing a database now releases its old tree pages for reuse.
+
+### Fixed
+
+- Inserting a key that sorts before an existing leaf entry replaced the
+  existing entry instead of inserting the new key.
+
+### Notes
+
+- The free list is maintained in memory. Reopening an environment starts with
+  an empty free list; run `Env::compact` to reclaim pages left free by a
+  previous process.
+
 ## [0.1.0] - 2026-10-21
 
 ### Added

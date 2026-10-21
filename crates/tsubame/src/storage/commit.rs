@@ -143,6 +143,11 @@ pub(crate) enum Descriptor {
     Chain(u64),
 }
 
+/// Returns the number of pages needed for a commit-record chain.
+pub(crate) fn chain_page_count(entry_count: usize) -> Result<u64> {
+    u64::try_from(entry_count.div_ceil(CAPACITY)).context("commit record is too large")
+}
+
 /// Allocates and writes the commit-record chain, returning its first page.
 pub(crate) fn build<S: PageStore>(
     store: &mut S,
@@ -160,8 +165,7 @@ pub(crate) fn build<S: PageStore>(
     }
 
     let page_count = entries.len().div_ceil(CAPACITY);
-    let start_page =
-        store.allocate_pages(u64::try_from(page_count).context("commit record is too large")?)?;
+    let start_page = store.allocate_pages(chain_page_count(entries.len())?)?;
 
     for index in 0..page_count {
         let from = index * CAPACITY;

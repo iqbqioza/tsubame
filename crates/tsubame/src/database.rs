@@ -322,18 +322,24 @@ impl<KC, DC> Database<KC, DC> {
 
     /// Removes every entry from the database.
     ///
-    /// The old tree becomes unreachable and is reclaimed by compaction.
+    /// Pages reachable from the old tree become reusable after the same
+    /// generation checks as any other freed page.
     ///
     /// # Errors
     ///
-    /// Returns an error if the transaction belongs to a different environment.
+    /// Returns an error if the transaction belongs to a different environment
+    /// or the old tree cannot be traversed. A failed clear marks the
+    /// transaction as failed; it can only be aborted.
     pub fn clear(&self, txn: &mut RwTxn<'_>) -> Result<()> {
         ensure!(
             txn.belongs_to(&self.env),
             "transaction belongs to a different environment"
         );
-        txn.clear_raw(self.kind.clone())?;
-        Ok(())
+        let result = txn.clear_raw(self.kind.clone());
+        if result.is_err() {
+            txn.mark_failed();
+        }
+        result
     }
 }
 
