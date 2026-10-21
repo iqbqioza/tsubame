@@ -18,6 +18,18 @@ const META_SLOTS: usize = 2;
 
 const CHECKSUM_OFFSET: usize = 64;
 
+/// Maximum number of commit descriptors stored directly in a meta page.
+pub(crate) const INLINE_COMMIT_CAPACITY: usize = 16;
+
+/// One inline commit descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct InlineCommit {
+    /// Page ID, or the first page of an overflow extent.
+    pub(crate) page_id: u64,
+    /// Zero for a normal page, or the number of pages in an extent.
+    pub(crate) page_count: u64,
+}
+
 /// The committed state of an environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Meta {
@@ -37,6 +49,10 @@ pub(crate) struct Meta {
     pub(crate) commit_record: u64,
     /// Single committed page when the commit wrote exactly one page.
     pub(crate) commit_page: u64,
+    /// Number of inline commit descriptors.
+    pub(crate) inline_count: u32,
+    /// Inline commit descriptors for small commits.
+    pub(crate) inline: [InlineCommit; INLINE_COMMIT_CAPACITY],
 }
 
 impl Meta {
@@ -51,6 +67,8 @@ impl Meta {
             flags: 0,
             commit_record: 0,
             commit_page: 0,
+            inline_count: 0,
+            inline: [InlineCommit::default(); INLINE_COMMIT_CAPACITY],
         }
     }
 
@@ -69,6 +87,12 @@ impl Meta {
         LittleEndian::write_u32(&mut page[52..56], self.flags);
         LittleEndian::write_u64(&mut page[56..64], self.commit_record);
         LittleEndian::write_u64(&mut page[68..76], self.commit_page);
+        LittleEndian::write_u32(&mut page[76..80], self.inline_count);
+        for (index, entry) in self.inline.iter().enumerate() {
+            let offset = 80 + index * 16;
+            LittleEndian::write_u64(&mut page[offset..offset + 8], entry.page_id);
+            LittleEndian::write_u64(&mut page[offset + 8..offset + 16], entry.page_count);
+        }
 
         let checksum = checksum(&page);
         LittleEndian::write_u32(&mut page[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4], checksum);
@@ -116,6 +140,8 @@ impl Meta {
             flags: LittleEndian::read_u32(&bytes[52..56]),
             commit_record: LittleEndian::read_u64(&bytes[56..64]),
             commit_page: LittleEndian::read_u64(&bytes[68..76]),
+            inline_count: LittleEndian::read_u32(&bytes[76..80]),
+            inline: read_inline(&bytes[80..]),
         };
         meta.validate()?;
 
@@ -152,6 +178,34 @@ impl Meta {
             self.commit_record == 0 || self.commit_page == 0,
             "meta cannot have both a commit record and a single commit page"
         );
+        ensure!(
+            self.inline_count as usize <= INLINE_COMMIT_CAPACITY,
+            "meta has too many inline commit entries"
+        );
+        if self.inline_count > 0 {
+            ensure!(
+                self.commit_record == 0 && self.commit_page == 0,
+                "meta cannot mix inline commit entries with other commit records"
+            );
+            for entry in &self.inline[..self.inline_count as usize] {
+                ensure!(
+                    entry.page_id >= META_SLOTS as u64 && entry.page_id < self.page_count,
+                    "inline commit page {} is outside the page range",
+                    entry.page_id
+                );
+                if entry.page_count > 0 {
+                    let end = entry
+                        .page_id
+                        .checked_add(entry.page_count)
+                        .context("inline commit extent overflow")?;
+                    ensure!(
+                        end <= self.page_count,
+                        "inline commit extent {}..{end} is outside the page range",
+                        entry.page_id
+                    );
+                }
+            }
+        }
 
         validate_root("unnamed database", self.unnamed_root, self.page_count)?;
         validate_root("database catalog", self.catalog_root, self.page_count)?;
@@ -170,6 +224,19 @@ impl Meta {
 
         Ok(())
     }
+}
+
+/// Reads inline commit descriptors from the meta page tail.
+fn read_inline(bytes: &[u8]) -> [InlineCommit; INLINE_COMMIT_CAPACITY] {
+    let mut inline = [InlineCommit::default(); INLINE_COMMIT_CAPACITY];
+    for (index, entry) in inline.iter_mut().enumerate() {
+        let offset = index * 16;
+        if offset + 16 <= bytes.len() {
+            entry.page_id = LittleEndian::read_u64(&bytes[offset..offset + 8]);
+            entry.page_count = LittleEndian::read_u64(&bytes[offset + 8..offset + 16]);
+        }
+    }
+    inline
 }
 
 /// Validates that a root page is either empty or inside the page range.
@@ -301,6 +368,8 @@ mod tests {
             flags: 0,
             commit_record: 0,
             commit_page: 0,
+            inline_count: 0,
+            inline: [InlineCommit::default(); INLINE_COMMIT_CAPACITY],
         }
     }
 
@@ -329,6 +398,8 @@ mod tests {
             flags: 0,
             commit_record: 0,
             commit_page: 0,
+            inline_count: 0,
+            inline: [InlineCommit::default(); INLINE_COMMIT_CAPACITY],
         };
 
         assert_eq!(Meta::decode(&meta.encode()).unwrap(), meta);

@@ -9,7 +9,7 @@ use anyhow::{Context, Result, ensure};
 use byteorder::{ByteOrder, LittleEndian};
 
 use super::PAGE_SIZE;
-use super::meta::Meta;
+use super::meta::{INLINE_COMMIT_CAPACITY, Meta};
 use super::overflow::{self, OverflowRef};
 use super::page::Page;
 use super::store::PageStore;
@@ -131,12 +131,14 @@ impl CommitPage {
 }
 
 /// Where a commit stored its list of new pages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Descriptor {
     /// No pages were written.
     None,
     /// Exactly one page, stored directly in the meta page.
     Page(u64),
+    /// A small number of pages stored inline in the meta page.
+    Inline(Vec<CommitEntry>),
     /// A chain of commit-record pages.
     Chain(u64),
 }
@@ -152,6 +154,9 @@ pub(crate) fn build<S: PageStore>(
     }
     if let [CommitEntry::Page(page_id)] = entries {
         return Ok(Descriptor::Page(*page_id));
+    }
+    if entries.len() <= INLINE_COMMIT_CAPACITY {
+        return Ok(Descriptor::Inline(entries.to_vec()));
     }
 
     let page_count = entries.len().div_ceil(CAPACITY);
@@ -187,6 +192,17 @@ pub(crate) fn build<S: PageStore>(
 
 /// Validates the commit record and every page it references.
 pub(crate) fn validate(data: &[u8], meta: &Meta) -> Result<()> {
+    if meta.inline_count > 0 {
+        for entry in &meta.inline[..meta.inline_count as usize] {
+            if entry.page_count == 0 {
+                validate_page(data, meta, entry.page_id)?;
+            } else {
+                validate_extent(data, meta, entry.page_id, entry.page_count)?;
+            }
+        }
+        return Ok(());
+    }
+
     if meta.commit_page != 0 {
         validate_page(data, meta, meta.commit_page)?;
         return Ok(());
@@ -229,39 +245,7 @@ pub(crate) fn validate(data: &[u8], meta: &Meta) -> Result<()> {
                 CommitEntry::Extent {
                     start_page,
                     page_count,
-                } => {
-                    let end = start_page
-                        .checked_add(page_count)
-                        .context("commit extent page overflow")?;
-                    ensure!(
-                        start_page >= 2 && end <= meta.page_count,
-                        "committed extent {start_page}..{end} is outside the page range"
-                    );
-                    let byte_len = usize::try_from(page_count)
-                        .context("commit extent is too large")?
-                        .checked_mul(PAGE_SIZE)
-                        .context("commit extent size overflow")?;
-                    let start = page_offset(start_page)?;
-                    let end = start
-                        .checked_add(byte_len)
-                        .context("commit extent offset overflow")?;
-                    ensure!(
-                        end <= data.len(),
-                        "committed extent is outside the mapped region"
-                    );
-                    let bytes = &data[start..end];
-                    let total_len = LittleEndian::read_u32(&bytes[4..8]);
-                    let reference = OverflowRef {
-                        total_len,
-                        start_page,
-                        page_count,
-                    };
-                    overflow::validate_extent(bytes, reference)?;
-                    ensure!(
-                        overflow::txn_id(bytes)? == meta.txn_id,
-                        "overflow extent at page {start_page} has the wrong txn ID"
-                    );
-                }
+                } => validate_extent(data, meta, start_page, page_count)?,
             }
         }
 
@@ -272,6 +256,41 @@ pub(crate) fn validate(data: &[u8], meta: &Meta) -> Result<()> {
         page_id = record.next_page;
     }
 
+    Ok(())
+}
+
+fn validate_extent(data: &[u8], meta: &Meta, start_page: u64, page_count: u64) -> Result<()> {
+    let end = start_page
+        .checked_add(page_count)
+        .context("commit extent page overflow")?;
+    ensure!(
+        start_page >= 2 && end <= meta.page_count,
+        "committed extent {start_page}..{end} is outside the page range"
+    );
+    let byte_len = usize::try_from(page_count)
+        .context("commit extent is too large")?
+        .checked_mul(PAGE_SIZE)
+        .context("commit extent size overflow")?;
+    let start = page_offset(start_page)?;
+    let end = start
+        .checked_add(byte_len)
+        .context("commit extent offset overflow")?;
+    ensure!(
+        end <= data.len(),
+        "committed extent is outside the mapped region"
+    );
+    let bytes = &data[start..end];
+    let total_len = LittleEndian::read_u32(&bytes[4..8]);
+    let reference = OverflowRef {
+        total_len,
+        start_page,
+        page_count,
+    };
+    overflow::validate_extent(bytes, reference)?;
+    ensure!(
+        overflow::txn_id(bytes)? == meta.txn_id,
+        "overflow extent at page {start_page} has the wrong txn ID"
+    );
     Ok(())
 }
 
