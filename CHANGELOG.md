@@ -22,8 +22,9 @@ All notable changes to this project are documented here.
   every key and value.
 - Verified page reads skip redundant validation, and hot page/btree accessors
   are inlined.
-- Leaves with changed-length values are rebuilt from borrowed slots, and
-  adjacent dirty pages are written in batches.
+- Leaves with changed-length values are rebuilt from borrowed slots, sorted
+  leaf construction skips redundant validation, and adjacent dirty pages are
+  written in batches.
 
 ### Fixed
 

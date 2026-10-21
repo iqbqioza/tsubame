@@ -271,17 +271,22 @@ fn insert_leaf<S: PageStore>(
                 .context("leaf size overflow")?;
             if size <= PAGE_SIZE {
                 let new_page_id = store.allocate_pages(1)?;
-                let mut refs: Vec<(&[u8], LeafValue<'_>)> = Vec::with_capacity(page.slot_count());
-                for index in 0..page.slot_count() {
-                    let (key, existing) = page.leaf_entry(index)?;
-                    let value = if index == position {
-                        LeafValue::Inline(value)
-                    } else {
-                        existing
-                    };
-                    refs.push((key, value));
-                }
-                let new_page = page::build_leaf_entries(new_page_id, txn_id, &refs)?;
+                let new_page = page::build_leaf_entries_with(
+                    new_page_id,
+                    txn_id,
+                    page.slot_count(),
+                    |index| {
+                        let (key, existing) = page.leaf_entry(index)?;
+                        Ok((
+                            key,
+                            if index == position {
+                                LeafValue::Inline(value)
+                            } else {
+                                existing
+                            },
+                        ))
+                    },
+                )?;
                 store.write_page(new_page_id, new_page)?;
                 store.free_pages(page_id, 1)?;
                 if let LeafValue::Overflow(reference) = old_value {
@@ -756,12 +761,14 @@ fn flush_bulk_leaf<S: PageStore>(
         entries[0].0.clone()
     };
     let page_id = store.allocate_pages(1)?;
-    let refs: Vec<(&[u8], LeafValue<'_>)> = entries
-        .iter()
-        .zip(values)
-        .map(|((key, _), value)| (key.as_slice(), *value))
-        .collect();
-    let page = page::build_leaf_entries(page_id, txn_id, &refs)?;
+    let page = page::build_leaf_entries_from_iter(
+        page_id,
+        txn_id,
+        entries
+            .iter()
+            .zip(values)
+            .map(|((key, _), value)| (key.as_slice(), *value)),
+    )?;
     store.write_page(page_id, page)?;
     leaves.push((separator, page_id));
     Ok(())
@@ -777,11 +784,13 @@ fn allocate_leaf<S: PageStore>(
         "leaf entries do not fit in a page"
     );
     let page_id = store.allocate_pages(1)?;
-    let refs: Vec<(&[u8], LeafValue<'_>)> = entries
-        .iter()
-        .map(|entry| (entry.key.as_slice(), entry.value.as_leaf_value()))
-        .collect();
-    let page = page::build_leaf_entries(page_id, txn_id, &refs)?;
+    let page = page::build_leaf_entries_from_iter(
+        page_id,
+        txn_id,
+        entries
+            .iter()
+            .map(|entry| (entry.key.as_slice(), entry.value.as_leaf_value())),
+    )?;
     store.write_page(page_id, page)?;
     Ok(page_id)
 }
