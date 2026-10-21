@@ -583,6 +583,7 @@ pub(crate) fn build_leaf(
 }
 
 /// Builds a leaf page from sorted entries that may reference overflow extents.
+#[allow(dead_code)] // Validation wrapper for callers that do not already know key order.
 pub(crate) fn build_leaf_entries(
     page_id: u64,
     txn_id: u64,
@@ -595,17 +596,52 @@ pub(crate) fn build_leaf_entries(
         );
     }
 
+    build_leaf_entries_from_iter(
+        page_id,
+        txn_id,
+        entries.iter().map(|(key, value)| (*key, *value)),
+    )
+}
+
+/// Builds a leaf page from an ordered iterator of entries.
+pub(crate) fn build_leaf_entries_from_iter<'a, I>(
+    page_id: u64,
+    txn_id: u64,
+    entries: I,
+) -> Result<[u8; PAGE_SIZE]>
+where
+    I: IntoIterator<Item = (&'a [u8], LeafValue<'a>)>,
+{
     let mut builder = PageBuilder::new(PageType::Leaf);
     for (key, value) in entries {
-        match value {
-            LeafValue::Inline(value) => builder.push(key, value, 0)?,
-            LeafValue::Overflow(reference) => {
-                builder.push(key, &reference.encode(), FLAG_OVERFLOW)?;
-            }
-        }
+        push_leaf_entry(&mut builder, key, &value)?;
     }
-
     builder.finish(page_id, txn_id)
+}
+
+/// Builds a leaf page by asking `entry` for each slot in order.
+pub(crate) fn build_leaf_entries_with<'a, F>(
+    page_id: u64,
+    txn_id: u64,
+    slot_count: usize,
+    mut entry: F,
+) -> Result<[u8; PAGE_SIZE]>
+where
+    F: FnMut(usize) -> Result<(&'a [u8], LeafValue<'a>)>,
+{
+    let mut builder = PageBuilder::new(PageType::Leaf);
+    for index in 0..slot_count {
+        let (key, value) = entry(index)?;
+        push_leaf_entry(&mut builder, key, &value)?;
+    }
+    builder.finish(page_id, txn_id)
+}
+
+fn push_leaf_entry(builder: &mut PageBuilder, key: &[u8], value: &LeafValue<'_>) -> Result<()> {
+    match value {
+        LeafValue::Inline(value) => builder.push(key, value, 0),
+        LeafValue::Overflow(reference) => builder.push(key, &reference.encode(), FLAG_OVERFLOW),
+    }
 }
 
 /// Builds a branch page from separator keys and child page IDs.
