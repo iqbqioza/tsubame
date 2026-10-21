@@ -4,18 +4,22 @@
 //! database belongs to exactly one environment, and transactions are created
 //! from the environment.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{Context, bail, ensure};
 use fs4::TryLockError;
 use memmap2::Mmap;
 
 use crate::Result;
-use crate::database::Database;
+use crate::database::{Database, DatabaseKind};
 use crate::storage::meta::{self, Meta};
+use crate::storage::overflow::{self, OverflowRef};
+use crate::storage::page::Page;
 use crate::storage::{PAGE_SIZE, io, mmap};
 use crate::txn::{RoTxn, RwTxn};
 
@@ -34,7 +38,7 @@ const MIN_MAP_SIZE: usize = 3 * PAGE_SIZE;
 /// Environments are created with [`EnvOpenOptions::open`]. All databases in an
 /// environment share the same data file and transaction namespace.
 pub struct Env {
-    inner: Arc<EnvInner>,
+    pub(crate) inner: Arc<EnvInner>,
 }
 
 impl Env {
@@ -45,12 +49,13 @@ impl Env {
 
     /// Returns a consistent snapshot of the environment metadata.
     pub fn info(&self) -> EnvInfo {
+        let committed = self.inner.read_committed();
         EnvInfo {
             map_size: self.inner.map_size,
             page_size: PAGE_SIZE,
-            page_count: self.inner.meta.page_count,
-            txn_id: self.inner.meta.txn_id,
-            database_count: self.inner.meta.database_count,
+            page_count: committed.meta.page_count,
+            txn_id: committed.meta.txn_id,
+            database_count: committed.meta.database_count,
             max_dbs: self.inner.max_dbs,
             format_version: meta::FORMAT_VERSION,
         }
@@ -61,37 +66,68 @@ impl Env {
     /// Read-only transactions can run concurrently with each other and see a
     /// consistent snapshot of the environment.
     pub fn read_txn(&self) -> Result<RoTxn<'_>> {
-        bail!("read transactions are not implemented yet")
+        self.inner.ensure_usable()?;
+        let committed = self.inner.read_committed();
+        self.inner.register_reader(committed.meta.txn_id);
+        Ok(RoTxn::new(self, committed.meta))
     }
 
     /// Starts a read-write transaction.
     ///
     /// Only one read-write transaction can be active at a time.
     pub fn write_txn(&self) -> Result<RwTxn<'_>> {
-        bail!("write transactions are not implemented yet")
+        self.inner.ensure_usable()?;
+        let writer = self
+            .inner
+            .writer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("transaction lock is poisoned"))?;
+        let committed = self.inner.read_committed();
+        RwTxn::new(self, writer, committed)
     }
 
-    /// Opens an existing database, or the unnamed default database.
+    /// Opens the unnamed default database.
     ///
-    /// Opening a database that does not exist is an error. Use
-    /// [`Env::create_database`] to create it.
+    /// Named databases are not implemented yet; `name` must be `None`.
     pub fn open_database<KC, DC>(
         &self,
-        _txn: &RoTxn<'_>,
-        _name: Option<&str>,
+        txn: &RoTxn<'_>,
+        name: Option<&str>,
     ) -> Result<Database<KC, DC>> {
-        bail!("opening databases is not implemented yet")
+        ensure!(
+            txn.belongs_to(&self.inner),
+            "transaction belongs to a different environment"
+        );
+        if name.is_some() {
+            bail!("named databases are not implemented yet");
+        }
+
+        Ok(Database::new(
+            Arc::clone(&self.inner),
+            DatabaseKind::Unnamed,
+        ))
     }
 
-    /// Creates a named database, or opens it if it already exists.
+    /// Opens the unnamed default database, creating it if needed.
     ///
-    /// Pass `None` to use the unnamed default database.
+    /// Named databases are not implemented yet; `name` must be `None`.
     pub fn create_database<KC, DC>(
         &self,
-        _txn: &mut RwTxn<'_>,
-        _name: Option<&str>,
+        txn: &mut RwTxn<'_>,
+        name: Option<&str>,
     ) -> Result<Database<KC, DC>> {
-        bail!("creating databases is not implemented yet")
+        ensure!(
+            txn.belongs_to(&self.inner),
+            "transaction belongs to a different environment"
+        );
+        if name.is_some() {
+            bail!("named databases are not implemented yet");
+        }
+
+        Ok(Database::new(
+            Arc::clone(&self.inner),
+            DatabaseKind::Unnamed,
+        ))
     }
 }
 
@@ -123,15 +159,158 @@ pub struct EnvInfo {
     pub format_version: u32,
 }
 
+/// The committed meta state and the slot that contains it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Committed {
+    pub(crate) meta: Meta,
+    pub(crate) slot: u8,
+}
+
 /// The in-memory state shared by an environment and its handles.
-struct EnvInner {
-    path: PathBuf,
-    map_size: usize,
-    max_dbs: usize,
-    meta: Meta,
-    _data: File,
+pub(crate) struct EnvInner {
+    pub(crate) path: PathBuf,
+    pub(crate) map_size: usize,
+    pub(crate) max_dbs: usize,
+    pub(crate) data: File,
+    pub(crate) mmap: Mmap,
+    pub(crate) committed: RwLock<Committed>,
+    pub(crate) writer: Mutex<()>,
+    pub(crate) readers: Mutex<BTreeMap<u64, usize>>,
+    pub(crate) poisoned: AtomicBool,
+    verified: Vec<AtomicU64>,
     _lock: File,
-    _mmap: Mmap,
+}
+
+impl EnvInner {
+    pub(crate) fn read_committed(&self) -> Committed {
+        *self
+            .committed
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) fn ensure_usable(&self) -> Result<()> {
+        if self.poisoned.load(Ordering::Acquire) {
+            bail!(
+                "environment `{}` must be reopened after a failed commit",
+                self.path.display()
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn poison(&self) {
+        self.poisoned.store(true, Ordering::Release);
+    }
+
+    fn is_verified(&self, page_id: u64) -> bool {
+        let index = (page_id / 64) as usize;
+        let bit = 1u64 << (page_id % 64);
+        self.verified
+            .get(index)
+            .is_some_and(|word| word.load(Ordering::Relaxed) & bit != 0)
+    }
+
+    fn mark_verified(&self, page_id: u64) {
+        let index = (page_id / 64) as usize;
+        let bit = 1u64 << (page_id % 64);
+        if let Some(word) = self.verified.get(index) {
+            word.fetch_or(bit, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn register_reader(&self, txn_id: u64) {
+        let mut readers = self
+            .readers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *readers.entry(txn_id).or_insert(0) += 1;
+    }
+
+    pub(crate) fn release_reader(&self, txn_id: u64) {
+        let mut readers = self
+            .readers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = readers.get_mut(&txn_id) {
+            *count -= 1;
+            if *count == 0 {
+                readers.remove(&txn_id);
+            }
+        }
+    }
+
+    pub(crate) fn read_page(&self, page_id: u64, snapshot: &Meta) -> Result<Page<'_>> {
+        ensure!(
+            page_id >= 2 && page_id < snapshot.page_count,
+            "page {page_id} is outside snapshot {}..{}",
+            2,
+            snapshot.page_count
+        );
+        let index = usize::try_from(page_id - 2).context("page ID is too large")?;
+        let start = index
+            .checked_mul(PAGE_SIZE)
+            .context("page offset overflow")?;
+        let end = start
+            .checked_add(PAGE_SIZE)
+            .context("page offset overflow")?;
+        ensure!(
+            end <= self.mmap.len(),
+            "page {page_id} is outside the mapped region"
+        );
+
+        let page = &self.mmap[start..end];
+        if self.is_verified(page_id) {
+            Page::parse_unchecked(page, Some(page_id))
+        } else {
+            let parsed = Page::parse(page, Some(page_id))?;
+            self.mark_verified(page_id);
+            Ok(parsed)
+        }
+    }
+
+    pub(crate) fn read_overflow(&self, reference: OverflowRef, snapshot: &Meta) -> Result<&[u8]> {
+        ensure!(
+            reference.start_page >= 2,
+            "overflow extent points at reserved page {}",
+            reference.start_page
+        );
+        let end_page = reference
+            .start_page
+            .checked_add(reference.page_count)
+            .context("overflow extent page overflow")?;
+        ensure!(
+            end_page <= snapshot.page_count,
+            "overflow extent {}..{end_page} is outside snapshot {}..{}",
+            reference.start_page,
+            2,
+            snapshot.page_count
+        );
+
+        let index = usize::try_from(reference.start_page - 2)
+            .context("overflow start page is too large")?;
+        let start = index
+            .checked_mul(PAGE_SIZE)
+            .context("overflow offset overflow")?;
+        let len = usize::try_from(reference.page_count)
+            .context("overflow page count is too large")?
+            .checked_mul(PAGE_SIZE)
+            .context("overflow length overflow")?;
+        let end = start.checked_add(len).context("overflow offset overflow")?;
+        ensure!(
+            end <= self.mmap.len(),
+            "overflow extent is outside the mapped region"
+        );
+
+        let bytes = &self.mmap[start..end];
+        if self.is_verified(reference.start_page) {
+            overflow::validate_extent_unchecked(bytes, reference)
+        } else {
+            let payload = overflow::validate_extent(bytes, reference)?;
+            self.mark_verified(reference.start_page);
+            Ok(payload)
+        }
+    }
 }
 
 /// Options used to open an [`Env`].
@@ -231,23 +410,23 @@ impl EnvOpenOptions {
             .len();
         let requested_map_size = normalize_map_size(self.map_size)?;
 
-        let (meta, map_size) = if existing_len == 0 {
+        let (meta, meta_slot, map_size) = if existing_len == 0 {
             data.set_len(requested_map_size as u64)
                 .with_context(|| format!("failed to size `{}`", data_path.display()))?;
             let meta = meta::initialize(&data).context("failed to initialize the environment")?;
             data.sync_all()
                 .with_context(|| format!("failed to sync `{}`", data_path.display()))?;
             io::sync_dir(path).with_context(|| format!("failed to sync `{}`", path.display()))?;
-            (meta, requested_map_size)
+            (meta, 0, requested_map_size)
         } else {
-            let meta = meta::load(&data, &data_path)?;
-            let minimum = pages_to_bytes(meta.page_count)?;
+            let loaded = meta::load(&data, &data_path)?;
+            let minimum = pages_to_bytes(loaded.meta.page_count)?;
             ensure!(
                 existing_len >= minimum as u64,
                 "data file `{}` is truncated: {} bytes cannot hold {} pages",
                 data_path.display(),
                 existing_len,
-                meta.page_count
+                loaded.meta.page_count
             );
 
             let map_size = requested_map_size.max(minimum);
@@ -257,7 +436,7 @@ impl EnvOpenOptions {
                 data.sync_all()
                     .with_context(|| format!("failed to sync `{}`", data_path.display()))?;
             }
-            (meta, map_size)
+            (loaded.meta, loaded.slot, map_size)
         };
 
         let data_offset = (2 * PAGE_SIZE) as u64;
@@ -266,14 +445,24 @@ impl EnvOpenOptions {
             .with_context(|| format!("failed to map `{}`", data_path.display()))?;
         debug_assert_eq!(mmap.len(), mapped_len);
 
+        let verified_words = (map_size / PAGE_SIZE).div_ceil(64);
+        let verified = (0..verified_words).map(|_| AtomicU64::new(0)).collect();
+
         let inner = EnvInner {
             path: path.to_path_buf(),
             map_size,
             max_dbs: self.max_dbs,
-            meta,
-            _data: data,
+            data,
+            mmap,
+            committed: RwLock::new(Committed {
+                meta,
+                slot: meta_slot,
+            }),
+            writer: Mutex::new(()),
+            readers: Mutex::new(BTreeMap::new()),
+            poisoned: AtomicBool::new(false),
+            verified,
             _lock: lock,
-            _mmap: mmap,
         };
 
         Ok(Env {

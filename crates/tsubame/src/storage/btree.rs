@@ -87,7 +87,7 @@ pub(crate) fn insert<S: PageStore>(
         return allocate_leaf(store, &[entry], txn_id);
     }
 
-    let result = insert_into(store, root, key, value, txn_id)?;
+    let result = insert_into(store, root, key, value, txn_id, 0)?;
     if let Some(split) = result.split {
         let entries = vec![(Vec::new(), result.page_id), (split.separator, split.right)];
         allocate_branch(store, &entries, txn_id)
@@ -107,7 +107,7 @@ pub(crate) fn delete<S: PageStore>(
         return Ok(0);
     }
 
-    let result = delete_into(store, root, key, txn_id)?;
+    let result = delete_into(store, root, key, txn_id, 0)?;
     Ok(result.page_id)
 }
 
@@ -155,13 +155,19 @@ fn insert_into<S: PageStore>(
     key: &[u8],
     value: &[u8],
     txn_id: u64,
+    depth: usize,
 ) -> Result<InsertResult> {
+    ensure!(
+        depth < MAX_DEPTH,
+        "B+tree depth exceeded {MAX_DEPTH} during insert"
+    );
+
     let bytes = store.read_page(page_id)?;
     let page = Page::parse(&bytes, Some(page_id))?;
 
     match page.page_type() {
         PageType::Leaf => insert_leaf(store, page_id, &page, key, value, txn_id),
-        PageType::Branch => insert_branch(store, page_id, &page, key, value, txn_id),
+        PageType::Branch => insert_branch(store, page_id, &page, key, value, txn_id, depth),
     }
 }
 
@@ -208,10 +214,11 @@ fn insert_branch<S: PageStore>(
     key: &[u8],
     value: &[u8],
     txn_id: u64,
+    depth: usize,
 ) -> Result<InsertResult> {
     let mut entries = collect_branch(page)?;
     let index = page.branch_child_index(key)?;
-    let result = insert_into(store, entries[index].1, key, value, txn_id)?;
+    let result = insert_into(store, entries[index].1, key, value, txn_id, depth + 1)?;
 
     entries[index].1 = result.page_id;
     if let Some(split) = result.split {
@@ -226,13 +233,19 @@ fn delete_into<S: PageStore>(
     page_id: u64,
     key: &[u8],
     txn_id: u64,
+    depth: usize,
 ) -> Result<DeleteResult> {
+    ensure!(
+        depth < MAX_DEPTH,
+        "B+tree depth exceeded {MAX_DEPTH} during delete"
+    );
+
     let bytes = store.read_page(page_id)?;
     let page = Page::parse(&bytes, Some(page_id))?;
 
     match page.page_type() {
         PageType::Leaf => delete_leaf(store, page_id, &page, key, txn_id),
-        PageType::Branch => delete_branch(store, page_id, &page, key, txn_id),
+        PageType::Branch => delete_branch(store, page_id, &page, key, txn_id, depth),
     }
 }
 
@@ -282,10 +295,11 @@ fn delete_branch<S: PageStore>(
     page: &Page<'_>,
     key: &[u8],
     txn_id: u64,
+    depth: usize,
 ) -> Result<DeleteResult> {
     let mut entries = collect_branch(page)?;
     let index = page.branch_child_index(key)?;
-    let result = delete_into(store, entries[index].1, key, txn_id)?;
+    let result = delete_into(store, entries[index].1, key, txn_id, depth + 1)?;
 
     if !result.changed {
         return Ok(DeleteResult {
