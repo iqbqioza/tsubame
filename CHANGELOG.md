@@ -16,8 +16,9 @@ All notable changes to this project are documented here.
   `rev_prefix_rw` on write transactions, including staged puts and deletes.
 - Clearing a database now releases its old tree pages for reuse.
 - Environment-wide custom key comparators through `KeyComparator` and
-  `EnvOpenOptions::comparator`. Custom-order `Env::compact_with` is available
-  for offline compaction.
+  `EnvOpenOptions::comparator`. A comparator ID is persisted in
+  `comparator.tsubame` and checked on reopen and compaction; custom-order
+  `Env::compact_with` is available for offline compaction.
 - Read-only environments and shared read locks. Multiple read-only processes
   can share an environment while a writable environment holds the exclusive
   lock.

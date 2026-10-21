@@ -2,8 +2,9 @@
 //!
 //! By default Tsubame orders encoded keys lexicographically. Applications can
 //! supply a deterministic comparator to use a different order. The comparator
-//! is not stored in the data file: every process that opens the environment,
-//! and every offline compaction, must use the same comparator.
+//! implementation is not stored, but a stable identifier is persisted in
+//! `comparator.tsubame`; every process that opens the environment, and every
+//! offline compaction, must use the same comparator and identifier.
 
 use std::cmp::Ordering;
 
