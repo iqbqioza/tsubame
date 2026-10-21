@@ -261,7 +261,7 @@ impl EnvInner {
 
         let page = &self.mmap[start..end];
         if self.is_verified(page_id) {
-            Page::parse_unchecked(page, Some(page_id))
+            Page::parse_trusted(page, Some(page_id))
         } else {
             let parsed = Page::parse(page, Some(page_id))?;
             self.mark_verified(page_id);

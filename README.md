@@ -89,6 +89,19 @@ cargo publish -p tsubame-types
 cargo publish -p tsubame
 ```
 
+## Benchmarks
+
+The standalone [`benchmarks`](benchmarks) crate compares Tsubame with heed on
+batch inserts, point reads, durable commit latency, and reopen time:
+
+```sh
+cd benchmarks
+cargo run --release
+```
+
+It is excluded from the workspace so heed and its LMDB build are not part of
+the published crates or CI.
+
 ## License
 
 Licensed under either of

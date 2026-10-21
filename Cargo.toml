@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/tsubame", "crates/tsubame-traits", "crates/tsubame-types"]
+exclude = ["benchmarks"]
 resolver = "3"
 
 [workspace.package]

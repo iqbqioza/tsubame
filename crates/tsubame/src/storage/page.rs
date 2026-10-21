@@ -69,21 +69,23 @@ impl<'a> Page<'a> {
     ///
     /// When `expected_id` is provided, the page ID in the header must match it.
     pub(crate) fn parse(bytes: &'a [u8], expected_id: Option<u64>) -> Result<Self> {
-        Self::parse_inner(bytes, expected_id, true)
+        Self::parse_inner(bytes, expected_id, true, true)
     }
 
-    /// Validates and parses a page whose checksum has already been verified.
+    /// Parses a page that was produced by this crate and is already verified.
     ///
-    /// This still validates every structural invariant; it only skips the
-    /// expensive CRC32C pass.
-    pub(crate) fn parse_unchecked(bytes: &'a [u8], expected_id: Option<u64>) -> Result<Self> {
-        Self::parse_inner(bytes, expected_id, false)
+    /// Only the header is validated. The caller must only use this for pages
+    /// that were fully validated by [`Page::parse`] earlier or built by this
+    /// crate's page builder.
+    pub(crate) fn parse_trusted(bytes: &'a [u8], expected_id: Option<u64>) -> Result<Self> {
+        Self::parse_inner(bytes, expected_id, false, false)
     }
 
     fn parse_inner(
         bytes: &'a [u8],
         expected_id: Option<u64>,
         verify_checksum: bool,
+        validate_all_slots: bool,
     ) -> Result<Self> {
         ensure!(
             bytes.len() == PAGE_SIZE,
@@ -107,6 +109,10 @@ impl<'a> Page<'a> {
         ensure!(bytes[5] == 0, "unsupported page flags {:#04x}", bytes[5]);
 
         let slot_count = LittleEndian::read_u16(&bytes[6..8]) as usize;
+        ensure!(
+            slot_count <= (PAGE_SIZE - HEADER_SIZE) / SLOT_SIZE,
+            "page has too many slots: {slot_count}"
+        );
         let page_id = LittleEndian::read_u64(&bytes[8..16]);
         ensure!(page_id >= 2, "data page ID {page_id} is reserved");
         if let Some(expected_id) = expected_id {
@@ -142,66 +148,68 @@ impl<'a> Page<'a> {
             "page free_end {free_end} exceeds the page size"
         );
 
-        let mut previous_cell_start = PAGE_SIZE;
-        for index in 0..slot_count {
-            let slot = HEADER_SIZE + index * SLOT_SIZE;
-            let cell_offset = LittleEndian::read_u16(&bytes[slot..slot + 2]) as usize;
-            let key_len = LittleEndian::read_u16(&bytes[slot + 2..slot + 4]) as usize;
-            let value_len = LittleEndian::read_u32(&bytes[slot + 4..slot + 8]) as usize;
-            let flags = bytes[slot + 8];
+        if validate_all_slots {
+            let mut previous_cell_start = PAGE_SIZE;
+            for index in 0..slot_count {
+                let slot = HEADER_SIZE + index * SLOT_SIZE;
+                let cell_offset = LittleEndian::read_u16(&bytes[slot..slot + 2]) as usize;
+                let key_len = LittleEndian::read_u16(&bytes[slot + 2..slot + 4]) as usize;
+                let value_len = LittleEndian::read_u32(&bytes[slot + 4..slot + 8]) as usize;
+                let flags = bytes[slot + 8];
 
-            ensure!(
-                flags & !FLAG_OVERFLOW == 0,
-                "unsupported slot flags {flags:#04x}"
-            );
-            ensure!(
-                key_len <= MAX_KEY_SIZE,
-                "slot {index} key is {key_len} bytes, maximum is {MAX_KEY_SIZE}"
-            );
+                ensure!(
+                    flags & !FLAG_OVERFLOW == 0,
+                    "unsupported slot flags {flags:#04x}"
+                );
+                ensure!(
+                    key_len <= MAX_KEY_SIZE,
+                    "slot {index} key is {key_len} bytes, maximum is {MAX_KEY_SIZE}"
+                );
 
-            let cell_len = key_len
-                .checked_add(value_len)
-                .context("cell size overflow")?;
-            let cell_end = cell_offset
-                .checked_add(cell_len)
-                .context("cell end overflow")?;
-            ensure!(
-                cell_offset >= free_end,
-                "slot {index} starts before the free area"
-            );
-            ensure!(cell_end <= PAGE_SIZE, "slot {index} exceeds the page");
-            ensure!(
-                cell_end <= previous_cell_start,
-                "slot {index} overlaps a previous cell"
-            );
-            previous_cell_start = cell_offset;
+                let cell_len = key_len
+                    .checked_add(value_len)
+                    .context("cell size overflow")?;
+                let cell_end = cell_offset
+                    .checked_add(cell_len)
+                    .context("cell end overflow")?;
+                ensure!(
+                    cell_offset >= free_end,
+                    "slot {index} starts before the free area"
+                );
+                ensure!(cell_end <= PAGE_SIZE, "slot {index} exceeds the page");
+                ensure!(
+                    cell_end <= previous_cell_start,
+                    "slot {index} overlaps a previous cell"
+                );
+                previous_cell_start = cell_offset;
 
-            match page_type {
-                PageType::Branch => {
-                    ensure!(
-                        value_len == BRANCH_CHILD_SIZE,
-                        "branch slot {index} has a {value_len} byte child, expected {BRANCH_CHILD_SIZE}"
-                    );
-                    ensure!(
-                        flags & FLAG_OVERFLOW == 0,
-                        "branch slot {index} is marked as an overflow reference"
-                    );
-                }
-                PageType::Leaf => {
-                    if flags & FLAG_OVERFLOW != 0 {
+                match page_type {
+                    PageType::Branch => {
                         ensure!(
-                            value_len == OVERFLOW_REF_SIZE,
-                            "overflow slot {index} has {value_len} bytes, expected {OVERFLOW_REF_SIZE}"
+                            value_len == BRANCH_CHILD_SIZE,
+                            "branch slot {index} has a {value_len} byte child, expected {BRANCH_CHILD_SIZE}"
                         );
+                        ensure!(
+                            flags & FLAG_OVERFLOW == 0,
+                            "branch slot {index} is marked as an overflow reference"
+                        );
+                    }
+                    PageType::Leaf => {
+                        if flags & FLAG_OVERFLOW != 0 {
+                            ensure!(
+                                value_len == OVERFLOW_REF_SIZE,
+                                "overflow slot {index} has {value_len} bytes, expected {OVERFLOW_REF_SIZE}"
+                            );
+                        }
                     }
                 }
             }
-        }
 
-        ensure!(
-            free_end == previous_cell_start,
-            "page free_end {free_end} does not match the packed cells ({previous_cell_start})"
-        );
+            ensure!(
+                free_end == previous_cell_start,
+                "page free_end {free_end} does not match the packed cells ({previous_cell_start})"
+            );
+        }
 
         Ok(Self {
             bytes,

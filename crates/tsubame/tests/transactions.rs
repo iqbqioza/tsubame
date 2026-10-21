@@ -172,6 +172,28 @@ fn concurrent_readers_do_not_block_a_writer() -> Result<()> {
 }
 
 #[test]
+fn batch_insert_reuses_transaction_pages() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, U32<NativeEndian>>(&mut wtxn, None)?;
+
+    for i in 0..1_000u32 {
+        let key = format!("key-{i:04}");
+        db.put(&mut wtxn, &key, &i)?;
+    }
+    wtxn.commit()?;
+
+    assert!(
+        env.info().page_count < 100,
+        "page count {} suggests transaction pages were not reused",
+        env.info().page_count
+    );
+
+    Ok(())
+}
+
+#[test]
 fn named_databases_are_rejected_until_implemented() -> Result<()> {
     let dir = tempdir()?;
     let env = options().open(dir.path())?;

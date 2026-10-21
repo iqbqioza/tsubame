@@ -4,19 +4,24 @@
 //! provide a consistent snapshot and can coexist; a read-write transaction has
 //! exclusive access to the environment.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, MutexGuard};
 
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::database::DatabaseKind;
 use crate::env::{Committed, Env, EnvInner};
+use crate::storage::btree;
 use crate::storage::btree::PageSource;
 use crate::storage::meta::{self, Meta};
 use crate::storage::overflow::{self, OverflowRef};
 use crate::storage::page::Page;
 use crate::storage::store::PageStore;
 use crate::storage::{PAGE_SIZE, io};
+
+/// Transactions writing at least this many entries into an empty database
+/// build the tree bottom-up instead of inserting one path at a time.
+const BULK_LOAD_THRESHOLD: usize = 1024;
 
 /// A read-only transaction.
 ///
@@ -71,8 +76,10 @@ pub struct RwTxn<'env> {
     overlay: BTreeMap<u64, [u8; PAGE_SIZE]>,
     extents: BTreeMap<u64, Vec<u8>>,
     next_page: u64,
-    #[allow(dead_code)] // Reused by the future free-space allocator.
+    free_single: BTreeSet<u64>,
+    free_runs: BTreeMap<u64, u64>,
     freed: Vec<(u64, u64)>,
+    pending: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     root: Option<u64>,
     failed: bool,
     _writer: MutexGuard<'env, ()>,
@@ -98,29 +105,31 @@ impl<'env> RwTxn<'env> {
             overlay: BTreeMap::new(),
             extents: BTreeMap::new(),
             next_page: committed.meta.page_count,
+            free_single: BTreeSet::new(),
+            free_runs: BTreeMap::new(),
             freed: Vec::new(),
+            pending: BTreeMap::new(),
             root: None,
             failed: false,
             _writer: writer,
         })
     }
 
-    pub(crate) fn root_for(&self, kind: DatabaseKind) -> u64 {
-        match kind {
-            DatabaseKind::Unnamed => self.root.unwrap_or(self.base.unnamed_root),
-        }
-    }
-
-    pub(crate) fn set_root(&mut self, root: u64) {
-        self.root = Some(root);
-    }
-
     pub(crate) fn belongs_to(&self, env: &Arc<EnvInner>) -> bool {
         Arc::ptr_eq(&self.env.inner, env)
     }
 
-    pub(crate) fn txn_id(&self) -> u64 {
-        self.txn_id
+    pub(crate) fn put_raw(&mut self, key: Vec<u8>, value: Vec<u8>) {
+        self.pending.insert(key, Some(value));
+    }
+
+    pub(crate) fn delete_raw(&mut self, key: Vec<u8>) {
+        self.pending.insert(key, None);
+    }
+
+    pub(crate) fn clear_raw(&mut self) {
+        self.pending.clear();
+        self.root = Some(0);
     }
 
     pub(crate) fn mark_failed(&mut self) {
@@ -131,17 +140,20 @@ impl<'env> RwTxn<'env> {
     ///
     /// # Errors
     ///
-    /// Returns an error if a page or the meta page cannot be written or synced.
-    /// After a storage error the environment is marked unusable and must be
-    /// reopened.
-    pub fn commit(self) -> Result<()> {
+    /// Returns an error if a staged entry cannot be applied, or if a page or
+    /// the meta page cannot be written or synced. After a storage error the
+    /// environment is marked unusable and must be reopened.
+    pub fn commit(mut self) -> Result<()> {
         if self.failed {
             bail!("transaction cannot be committed after a failed operation");
         }
 
+        let mut root = self.root.unwrap_or(self.base.unnamed_root);
+        self.apply_pending(&mut root)?;
+
         let new_meta = Meta {
             txn_id: self.txn_id,
-            unnamed_root: self.root.unwrap_or(self.base.unnamed_root),
+            unnamed_root: root,
             catalog_root: self.base.catalog_root,
             page_count: self.next_page,
             database_count: self.base.database_count,
@@ -152,6 +164,33 @@ impl<'env> RwTxn<'env> {
         if let Err(error) = self.write_and_sync(&new_meta) {
             self.env.inner.poison();
             return Err(error);
+        }
+
+        Ok(())
+    }
+
+    fn apply_pending(&mut self, root: &mut u64) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+
+        let pending = std::mem::take(&mut self.pending);
+        if *root == 0 && pending.len() >= BULK_LOAD_THRESHOLD {
+            let entries: Vec<(Vec<u8>, Vec<u8>)> = pending
+                .into_iter()
+                .filter_map(|(key, value)| value.map(|value| (key, value)))
+                .collect();
+            if !entries.is_empty() {
+                *root = btree::bulk_load(self, &entries, self.txn_id)?;
+            }
+            return Ok(());
+        }
+
+        for (key, value) in pending {
+            *root = match value {
+                Some(value) => btree::insert(self, *root, &key, &value, self.txn_id)?,
+                None => btree::delete(self, *root, &key, self.txn_id)?,
+            };
         }
 
         Ok(())
@@ -196,11 +235,11 @@ impl<'env> RwTxn<'env> {
                 .with_context(|| format!("failed to write overflow extent at page {start_page}"))?;
         }
 
-        data.sync_all().context("failed to sync data pages")?;
+        data.sync_data().context("failed to sync data pages")?;
 
         let slot = 1 - self.base_slot;
         meta::write_slot(data, slot as usize, new_meta)?;
-        data.sync_all().context("failed to sync the meta page")?;
+        data.sync_data().context("failed to sync the meta page")?;
 
         let mut committed = self
             .env
@@ -220,7 +259,7 @@ impl<'env> RwTxn<'env> {
 impl PageSource for RwTxn<'_> {
     fn page(&self, page_id: u64) -> Result<Page<'_>> {
         if let Some(page) = self.overlay.get(&page_id) {
-            Page::parse_unchecked(page, Some(page_id))
+            Page::parse_trusted(page, Some(page_id))
         } else {
             self.env.inner.read_page(page_id, &self.base)
         }
@@ -248,6 +287,28 @@ impl PageStore for RwTxn<'_> {
 
     fn allocate_pages(&mut self, pages: u64) -> Result<u64> {
         ensure!(pages > 0, "allocation must contain at least one page");
+
+        if pages == 1 {
+            if let Some(page) = self.free_single.pop_first() {
+                return Ok(page);
+            }
+            if let Some((&start, &len)) = self.free_runs.iter().next() {
+                self.free_runs.remove(&start);
+                if len == 2 {
+                    self.free_single.insert(start + 1);
+                } else {
+                    self.free_runs.insert(start + 1, len - 1);
+                }
+                return Ok(start);
+            }
+        } else if let Some((&start, &len)) = self.free_runs.iter().find(|(_, len)| **len >= pages) {
+            self.free_runs.remove(&start);
+            if len > pages {
+                self.free_runs.insert(start + pages, len - pages);
+            }
+            return Ok(start);
+        }
+
         let start = self.next_page;
         self.next_page = self
             .next_page
@@ -298,7 +359,47 @@ impl PageStore for RwTxn<'_> {
 
     fn free_pages(&mut self, start_page: u64, pages: u64) -> Result<()> {
         ensure!(pages > 0, "free must contain at least one page");
-        self.freed.push((start_page, pages));
+        let end = start_page
+            .checked_add(pages)
+            .context("free range overflow")?;
+        let base = self.base.page_count;
+
+        if start_page < base {
+            let base_end = end.min(base);
+            self.freed.push((start_page, base_end - start_page));
+            if end > base {
+                self.free_new_pages(base, end - base)?;
+            }
+        } else {
+            self.free_new_pages(start_page, pages)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl RwTxn<'_> {
+    fn free_new_pages(&mut self, start_page: u64, pages: u64) -> Result<()> {
+        ensure!(
+            start_page >= self.base.page_count,
+            "page {start_page} is not owned by this transaction"
+        );
+        let end = start_page
+            .checked_add(pages)
+            .context("free range overflow")?;
+        ensure!(
+            end <= self.next_page,
+            "free range {start_page}..{end} exceeds the transaction high-water mark"
+        );
+
+        if pages == 1 {
+            self.overlay.remove(&start_page);
+            self.free_single.insert(start_page);
+        } else {
+            self.extents.remove(&start_page);
+            self.free_runs.insert(start_page, pages);
+        }
+
         Ok(())
     }
 }
