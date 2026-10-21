@@ -814,6 +814,253 @@ fn online_page_reuse_reclaims_overflow_extents() -> Result<()> {
 }
 
 #[test]
+fn reopen_reconstructs_free_pages() -> Result<()> {
+    let dir = tempdir()?;
+    {
+        let env = options().open(dir.path())?;
+        let mut wtxn = env.write_txn()?;
+        let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+        for i in 0..1_000u32 {
+            db.put(&mut wtxn, &format!("key-{i:04}"), "initial")?;
+        }
+        wtxn.commit()?;
+
+        for round in 0..5u32 {
+            let mut wtxn = env.write_txn()?;
+            for i in 0..1_000u32 {
+                db.put(
+                    &mut wtxn,
+                    &format!("key-{i:04}"),
+                    &format!("before-{round}"),
+                )?;
+            }
+            wtxn.commit()?;
+        }
+    }
+
+    let env = options().open(dir.path())?;
+    let db = env.open_database::<Str, Str>(&env.read_txn()?, None)?;
+
+    for round in 0..4u32 {
+        let mut wtxn = env.write_txn()?;
+        for i in 0..1_000u32 {
+            db.put(&mut wtxn, &format!("key-{i:04}"), &format!("warm-{round}"))?;
+        }
+        wtxn.commit()?;
+    }
+    let steady_pages = env.info().page_count;
+
+    for round in 4..24u32 {
+        let mut wtxn = env.write_txn()?;
+        for i in 0..1_000u32 {
+            db.put(&mut wtxn, &format!("key-{i:04}"), &format!("after-{round}"))?;
+        }
+        wtxn.commit()?;
+    }
+
+    let after_pages = env.info().page_count;
+    assert!(
+        after_pages <= steady_pages + 40,
+        "reopened free list did not stabilize: {steady_pages} -> {after_pages}"
+    );
+
+    let rtxn = env.read_txn()?;
+    assert_eq!(db.get(&rtxn, "key-0000")?, Some("after-23"));
+    assert_eq!(db.get(&rtxn, "key-0999")?, Some("after-23"));
+    drop(rtxn);
+    drop(db);
+    drop(env);
+
+    let env = options().open(dir.path())?;
+    let rtxn = env.read_txn()?;
+    let db = env.open_database::<Str, Str>(&rtxn, None)?;
+    assert_eq!(db.get(&rtxn, "key-0000")?, Some("after-23"));
+    assert_eq!(db.get(&rtxn, "key-0999")?, Some("after-23"));
+
+    Ok(())
+}
+
+#[test]
+fn reopen_reconstruction_preserves_overflow_values() -> Result<()> {
+    let dir = tempdir()?;
+    {
+        let env = options().open(dir.path())?;
+        let mut wtxn = env.write_txn()?;
+        let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+        for i in 0..10u32 {
+            db.put(
+                &mut wtxn,
+                &format!("key-{i:04}"),
+                &format!("initial-{i}-{}", "x".repeat(10_000)),
+            )?;
+        }
+        wtxn.commit()?;
+
+        for round in 0..3u32 {
+            let mut wtxn = env.write_txn()?;
+            for i in 0..10u32 {
+                db.put(
+                    &mut wtxn,
+                    &format!("key-{i:04}"),
+                    &format!("before-{round}-{i}-{}", "y".repeat(10_000)),
+                )?;
+            }
+            wtxn.commit()?;
+        }
+    }
+
+    let env = options().open(dir.path())?;
+    let db = env.open_database::<Str, Str>(&env.read_txn()?, None)?;
+
+    for round in 0..5u32 {
+        let mut wtxn = env.write_txn()?;
+        for i in 0..10u32 {
+            db.put(
+                &mut wtxn,
+                &format!("key-{i:04}"),
+                &format!("warm-{round}-{i}-{}", "z".repeat(10_000)),
+            )?;
+        }
+        wtxn.commit()?;
+    }
+    let steady_pages = env.info().page_count;
+
+    for round in 5..15u32 {
+        let mut wtxn = env.write_txn()?;
+        for i in 0..10u32 {
+            db.put(
+                &mut wtxn,
+                &format!("key-{i:04}"),
+                &format!("after-{round}-{i}-{}", "w".repeat(10_000)),
+            )?;
+        }
+        wtxn.commit()?;
+    }
+
+    let after_pages = env.info().page_count;
+    assert!(
+        after_pages <= steady_pages + 20,
+        "overflow pages did not stabilize after reopen: {steady_pages} -> {after_pages}"
+    );
+
+    let rtxn = env.read_txn()?;
+    let value = db.get(&rtxn, "key-0000")?.expect("missing value");
+    assert!(value.starts_with("after-14-0-"));
+    let value = db.get(&rtxn, "key-0009")?.expect("missing value");
+    assert!(value.starts_with("after-14-9-"));
+
+    Ok(())
+}
+
+#[test]
+fn reopen_reconstruction_preserves_named_databases() -> Result<()> {
+    let dir = tempdir()?;
+    {
+        let env = options().open(dir.path())?;
+        let mut wtxn = env.write_txn()?;
+        let named = env.create_database::<Str, Str>(&mut wtxn, Some("named"))?;
+        let unnamed = env.create_database::<Str, Str>(&mut wtxn, None)?;
+        for i in 0..100u32 {
+            let key = format!("key-{i:03}");
+            named.put(&mut wtxn, &key, "named-initial")?;
+            unnamed.put(&mut wtxn, &key, "unnamed-initial")?;
+        }
+        wtxn.commit()?;
+
+        for round in 0..3u32 {
+            let mut wtxn = env.write_txn()?;
+            for i in 0..100u32 {
+                let key = format!("key-{i:03}");
+                named.put(&mut wtxn, &key, &format!("named-before-{round}"))?;
+                unnamed.put(&mut wtxn, &key, &format!("unnamed-before-{round}"))?;
+            }
+            wtxn.commit()?;
+        }
+    }
+
+    let env = options().open(dir.path())?;
+    let named = env.open_database::<Str, Str>(&env.read_txn()?, Some("named"))?;
+    let unnamed = env.open_database::<Str, Str>(&env.read_txn()?, None)?;
+
+    for round in 0..6u32 {
+        let mut wtxn = env.write_txn()?;
+        for i in 0..100u32 {
+            let key = format!("key-{i:03}");
+            named.put(&mut wtxn, &key, &format!("named-after-{round}"))?;
+            unnamed.put(&mut wtxn, &key, &format!("unnamed-after-{round}"))?;
+        }
+        wtxn.commit()?;
+    }
+
+    let rtxn = env.read_txn()?;
+    assert_eq!(named.get(&rtxn, "key-000")?, Some("named-after-5"));
+    assert_eq!(named.get(&rtxn, "key-099")?, Some("named-after-5"));
+    assert_eq!(unnamed.get(&rtxn, "key-000")?, Some("unnamed-after-5"));
+    assert_eq!(unnamed.get(&rtxn, "key-099")?, Some("unnamed-after-5"));
+
+    Ok(())
+}
+
+#[test]
+fn reopen_reconstruction_keeps_previous_meta_recoverable() -> Result<()> {
+    let dir = tempdir()?;
+    {
+        let env = options().open(dir.path())?;
+        let mut wtxn = env.write_txn()?;
+        let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+        for i in 0..100u32 {
+            db.put(&mut wtxn, &format!("key-{i:03}"), "initial")?;
+        }
+        wtxn.commit()?;
+
+        for round in 0..4u32 {
+            let mut wtxn = env.write_txn()?;
+            for i in 0..100u32 {
+                db.put(
+                    &mut wtxn,
+                    &format!("key-{i:03}"),
+                    &format!("before-{round}"),
+                )?;
+            }
+            wtxn.commit()?;
+        }
+    }
+
+    let latest_txn;
+    {
+        let env = options().open(dir.path())?;
+        let db = env.open_database::<Str, Str>(&env.read_txn()?, None)?;
+        for round in 0..5u32 {
+            let mut wtxn = env.write_txn()?;
+            for i in 0..100u32 {
+                db.put(&mut wtxn, &format!("key-{i:03}"), &format!("after-{round}"))?;
+            }
+            wtxn.commit()?;
+        }
+        latest_txn = env.info().txn_id;
+        let rtxn = env.read_txn()?;
+        assert_eq!(db.get(&rtxn, "key-000")?, Some("after-4"));
+    }
+
+    std::fs::remove_file(dir.path().join("clean.tsubame")).ok();
+    let slot = (latest_txn - 1) % 2;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(dir.path().join("data.tsubame"))?;
+    file.seek(SeekFrom::Start(slot * 4096 + 100))?;
+    file.write_all(&[0xff])?;
+
+    let env = options().open(dir.path())?;
+    assert_eq!(env.info().txn_id, latest_txn - 1);
+    let rtxn = env.read_txn()?;
+    let db = env.open_database::<Str, Str>(&rtxn, None)?;
+    assert_eq!(db.get(&rtxn, "key-000")?, Some("after-3"));
+    assert_eq!(db.get(&rtxn, "key-099")?, Some("after-3"));
+
+    Ok(())
+}
+
+#[test]
 fn page_reuse_waits_for_readers() -> Result<()> {
     let dir = tempdir()?;
     let env = options().open(dir.path())?;
