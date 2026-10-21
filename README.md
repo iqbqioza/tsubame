@@ -6,10 +6,9 @@
 inspired by [heed].
 
 > [!WARNING]
-> Tsubame is under construction. The environment format, B+tree, transactions,
-> typed operations, named databases, crash-safe commit records, and ordered
-> iteration (forward, reverse, ranges, and prefixes) work. APIs may still change
-> before 1.0.
+> Tsubame is pre-1.0. The 0.1.0 release includes the environment format,
+> B+tree, transactions, named databases, crash-safe commit records, ordered
+> iteration, and serde codecs. APIs may still change before 1.0.
 
 ## Why Tsubame
 
@@ -22,7 +21,7 @@ control.
 
 | Crate | Purpose |
 | --- | --- |
-| [`tsubame`](crates/tsubame) | Environments, typed databases, transactions, cursors, and iteration |
+| [`tsubame`](crates/tsubame) | Environments, typed databases, transactions, and iteration |
 | [`tsubame-traits`](crates/tsubame-traits) | `BytesEncode`, `BytesDecode`, and key comparison traits |
 | [`tsubame-types`](crates/tsubame-types) | Built-in codecs such as `Str`, `Bytes`, `Unit`, and byte-ordered integers |
 
@@ -66,7 +65,7 @@ tsubame = { version = "0.1", features = ["serde-bincode"] }
 Bincode is compact but not self-describing; take care when evolving stored
 schemas.
 
-## Target API
+## Quick start
 
 The following example uses a named database.
 
@@ -90,6 +89,22 @@ fn main() -> Result<()> {
 }
 ```
 
+## Examples
+
+```sh
+cargo run --example basic
+cargo run --example serde_json --features serde-json
+```
+
+The examples use a temporary directory and clean up after themselves.
+
+## Limitations
+
+- One process per environment; the file lock is exclusive.
+- Online compaction and cross-transaction page reuse are not implemented.
+- Custom key comparators are not exposed yet.
+- Performance is benchmarked rather than assumed; see [`benchmarks`](benchmarks).
+
 ## Development
 
 ```sh
@@ -104,10 +119,13 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 The crates are published in dependency order:
 
 ```sh
+cargo package --workspace
 cargo publish -p tsubame-traits
 cargo publish -p tsubame-types
 cargo publish -p tsubame
 ```
+
+See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## Benchmarks
 
