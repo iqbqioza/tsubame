@@ -7,9 +7,10 @@
 //!
 //! # Status
 //!
-//! This release lays out the public API and the built-in codecs. The storage
-//! engine is not implemented yet, so opening an environment currently returns
-//! an error. APIs may change while the engine is being built.
+//! The environment lifecycle and the on-disk meta format are implemented.
+//! Transactions and the B+tree are still under construction, so opening an
+//! environment works but read and write transactions currently return an
+//! error. APIs may change while the engine is being built.
 //!
 //! # Example
 //!
@@ -37,15 +38,18 @@
 //!
 //! [`heed`]: https://github.com/meilisearch/heed
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod cursor;
 pub mod database;
 pub mod env;
 pub mod error;
 pub mod iter;
+mod storage;
 pub mod txn;
 
 pub use self::database::Database;
-pub use self::env::{DEFAULT_MAP_SIZE, DEFAULT_MAX_DBS, Env, EnvOpenOptions};
+pub use self::env::{DEFAULT_MAP_SIZE, DEFAULT_MAX_DBS, Env, EnvInfo, EnvOpenOptions};
 pub use self::error::{Error, Result};
 pub use self::txn::{RoTxn, RwTxn};
 
