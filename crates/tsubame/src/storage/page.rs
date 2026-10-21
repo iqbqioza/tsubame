@@ -369,6 +369,98 @@ impl<'a> Page<'a> {
         Ok(page)
     }
 
+    /// Replaces a leaf value with a different encoded length.
+    ///
+    /// Cells are packed contiguously below the slot array. Changing one cell
+    /// shifts the cells for later slots as a single block, so the key and value
+    /// bytes of the other entries do not have to be rebuilt one by one.
+    pub(crate) fn replace_value_resized(
+        &self,
+        page_id: u64,
+        txn_id: u64,
+        index: usize,
+        value: &[u8],
+        flags: u8,
+    ) -> Result<[u8; PAGE_SIZE]> {
+        ensure!(
+            self.page_type == PageType::Leaf,
+            "cannot replace a value in a branch page"
+        );
+        ensure!(
+            flags & !FLAG_OVERFLOW == 0,
+            "unsupported slot flags {flags:#04x}"
+        );
+
+        let (offset, key_len, value_len, _) = self.slot(index)?;
+        let old_cell_len = key_len
+            .checked_add(value_len)
+            .context("cell size overflow")?;
+        let new_cell_len = key_len
+            .checked_add(value.len())
+            .context("cell size overflow")?;
+        let old_cell_end = offset
+            .checked_add(old_cell_len)
+            .context("cell end overflow")?;
+        let new_start = old_cell_end
+            .checked_sub(new_cell_len)
+            .context("cell start underflow")?;
+
+        let free_end = self.free_end();
+        let new_free_end = if value.len() >= value_len {
+            free_end.checked_sub(value.len() - value_len)
+        } else {
+            free_end.checked_add(value_len - value.len())
+        }
+        .context("leaf free area overflow")?;
+        let slot_end = HEADER_SIZE
+            .checked_add(self.slot_count * SLOT_SIZE)
+            .context("slot array overflow")?;
+        ensure!(
+            new_free_end >= slot_end,
+            "resized leaf cell overlaps the slot array"
+        );
+        ensure!(
+            new_start >= new_free_end && new_start + new_cell_len <= PAGE_SIZE,
+            "resized leaf cell is outside the page"
+        );
+
+        let mut page = [0u8; PAGE_SIZE];
+        page.copy_from_slice(self.bytes);
+        if new_free_end != free_end {
+            page.copy_within(free_end..offset, new_free_end);
+        }
+
+        page[new_start..new_start + key_len].copy_from_slice(&self.bytes[offset..offset + key_len]);
+        let value_start = new_start + key_len;
+        page[value_start..value_start + value.len()].copy_from_slice(value);
+
+        let slot = HEADER_SIZE + index * SLOT_SIZE;
+        LittleEndian::write_u16(&mut page[slot..slot + 2], new_start as u16);
+        LittleEndian::write_u32(
+            &mut page[slot + 4..slot + 8],
+            u32::try_from(value.len()).context("value is too large")?,
+        );
+        page[slot + 8] = flags;
+
+        if value.len() != value_len {
+            let delta = value.len() as isize - value_len as isize;
+            for later in index + 1..self.slot_count {
+                let later_slot = HEADER_SIZE + later * SLOT_SIZE;
+                let old_offset = LittleEndian::read_u16(&page[later_slot..later_slot + 2]) as isize;
+                let new_offset = old_offset - delta;
+                ensure!(
+                    new_offset >= slot_end as isize && new_offset <= PAGE_SIZE as isize,
+                    "resized leaf slot is outside the page"
+                );
+                LittleEndian::write_u16(&mut page[later_slot..later_slot + 2], new_offset as u16);
+            }
+        }
+
+        LittleEndian::write_u16(&mut page[26..28], new_free_end as u16);
+        reseal(&mut page, page_id, txn_id);
+        Ok(page)
+    }
+
     /// Replaces a branch child page ID.
     pub(crate) fn replace_child(
         &self,
@@ -614,24 +706,6 @@ where
 {
     let mut builder = PageBuilder::new(PageType::Leaf);
     for (key, value) in entries {
-        push_leaf_entry(&mut builder, key, &value)?;
-    }
-    builder.finish(page_id, txn_id)
-}
-
-/// Builds a leaf page by asking `entry` for each slot in order.
-pub(crate) fn build_leaf_entries_with<'a, F>(
-    page_id: u64,
-    txn_id: u64,
-    slot_count: usize,
-    mut entry: F,
-) -> Result<[u8; PAGE_SIZE]>
-where
-    F: FnMut(usize) -> Result<(&'a [u8], LeafValue<'a>)>,
-{
-    let mut builder = PageBuilder::new(PageType::Leaf);
-    for index in 0..slot_count {
-        let (key, value) = entry(index)?;
         push_leaf_entry(&mut builder, key, &value)?;
     }
     builder.finish(page_id, txn_id)
