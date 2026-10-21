@@ -132,7 +132,20 @@ impl Pending {
             }
         }
     }
+
+    fn iter(&self) -> PendingIter<'_> {
+        match self {
+            Self::Empty => Box::new(std::iter::empty()),
+            Self::One(key, value) => Box::new(std::iter::once((key.as_slice(), value.as_deref()))),
+            Self::Map(map) => Box::new(
+                map.iter()
+                    .map(|(key, value)| (key.as_slice(), value.as_deref())),
+            ),
+        }
+    }
 }
+
+pub(crate) type PendingIter<'a> = Box<dyn Iterator<Item = (&'a [u8], Option<&'a [u8]>)> + 'a>;
 
 /// A read-only transaction.
 ///
@@ -316,6 +329,30 @@ impl<'env> RwTxn<'env> {
 
     pub(crate) fn catalog_count(&self) -> u32 {
         self.database_count
+    }
+
+    pub(crate) fn read_root(&self, kind: &DatabaseKind) -> Result<u64> {
+        match kind {
+            DatabaseKind::Unnamed => Ok(self.root.unwrap_or(self.base.unnamed_root)),
+            DatabaseKind::Named(name) => {
+                if self.cleared_named.contains(name) {
+                    Ok(0)
+                } else {
+                    Ok(self.catalog_lookup(name)?.unwrap_or(0))
+                }
+            }
+        }
+    }
+
+    pub(crate) fn pending_for<'a>(&'a self, kind: &DatabaseKind) -> PendingIter<'a> {
+        match kind {
+            DatabaseKind::Unnamed => self.unnamed_pending.iter(),
+            DatabaseKind::Named(name) => self
+                .named_pending
+                .get(name.as_ref())
+                .map(Pending::iter)
+                .unwrap_or_else(|| Box::new(std::iter::empty())),
+        }
     }
 
     pub(crate) fn increment_database_count(&mut self) -> Result<()> {

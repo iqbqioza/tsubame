@@ -510,6 +510,67 @@ fn serde_bincode_codec_round_trips_in_a_database() -> Result<()> {
 }
 
 #[test]
+fn write_txn_iteration_includes_pending_changes() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, Some("pending"))?;
+    db.put(&mut wtxn, "a", "old-a")?;
+    db.put(&mut wtxn, "c", "old-c")?;
+    wtxn.commit()?;
+
+    let mut wtxn = env.write_txn()?;
+    let db = env.open_database::<Str, Str>(&env.read_txn()?, Some("pending"))?;
+    db.put(&mut wtxn, "a", "new-a")?;
+    db.put(&mut wtxn, "b", "new-b")?;
+    db.delete(&mut wtxn, "c")?;
+
+    let mut seen = Vec::new();
+    for item in db.iter_rw(&wtxn)? {
+        let (key, value) = item?;
+        seen.push((key.to_owned(), value.to_owned()));
+    }
+    assert_eq!(
+        seen,
+        [
+            ("a".to_owned(), "new-a".to_owned()),
+            ("b".to_owned(), "new-b".to_owned()),
+        ]
+    );
+
+    wtxn.abort()?;
+    let rtxn = env.read_txn()?;
+    assert_eq!(db.get(&rtxn, "a")?, Some("old-a"));
+    assert_eq!(db.get(&rtxn, "b")?, None);
+    assert_eq!(db.get(&rtxn, "c")?, Some("old-c"));
+
+    Ok(())
+}
+
+#[test]
+fn write_txn_iteration_after_clear() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+    db.put(&mut wtxn, "a", "1")?;
+    wtxn.commit()?;
+
+    let mut wtxn = env.write_txn()?;
+    db.clear(&mut wtxn)?;
+    db.put(&mut wtxn, "b", "2")?;
+    let seen: Vec<_> = db
+        .iter_rw(&wtxn)?
+        .map(|item| item.map(|(key, value)| (key.to_owned(), value.to_owned())))
+        .collect::<std::result::Result<_, _>>()?;
+    assert_eq!(seen, [("b".to_owned(), "2".to_owned())]);
+
+    drop(wtxn);
+
+    Ok(())
+}
+
+#[test]
 fn max_dbs_is_enforced() -> Result<()> {
     let dir = tempdir()?;
     let mut options = options();

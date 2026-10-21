@@ -1,5 +1,7 @@
 //! Ordered iteration over database snapshots.
 
+use std::cmp::Ordering;
+use std::iter::Peekable;
 use std::marker::PhantomData;
 use std::ops::Bound;
 
@@ -8,20 +10,20 @@ use anyhow::{Result, bail, ensure};
 use crate::storage::btree::PageSource;
 use crate::storage::page::{LeafValue, Page, PageType};
 use crate::traits::BytesDecode;
-use crate::txn::RoTxn;
+use crate::txn::{PendingIter, RoTxn, RwTxn};
 
 /// The maximum branch depth followed by a cursor.
 const MAX_DEPTH: usize = 64;
 
-struct Cursor<'txn, 'env> {
-    source: &'txn RoTxn<'env>,
+struct Cursor<'a, S: PageSource> {
+    source: &'a S,
     stack: Vec<(u64, usize)>,
     leaf: Option<u64>,
     slot: usize,
 }
 
-impl<'txn, 'env> Cursor<'txn, 'env> {
-    fn new(source: &'txn RoTxn<'env>) -> Self {
+impl<'a, S: PageSource> Cursor<'a, S> {
+    fn new(source: &'a S) -> Self {
         Self {
             source,
             stack: Vec::new(),
@@ -30,7 +32,7 @@ impl<'txn, 'env> Cursor<'txn, 'env> {
         }
     }
 
-    fn page(&self, page_id: u64) -> Result<Page<'txn>> {
+    fn page(&self, page_id: u64) -> Result<Page<'a>> {
         self.source.page(page_id)
     }
 
@@ -215,7 +217,7 @@ impl<'txn, 'env> Cursor<'txn, 'env> {
         }
     }
 
-    fn current(&self) -> Result<Option<(&'txn [u8], &'txn [u8])>> {
+    fn current(&self) -> Result<Option<(&'a [u8], &'a [u8])>> {
         let Some(leaf_id) = self.leaf else {
             return Ok(None);
         };
@@ -233,7 +235,7 @@ impl<'txn, 'env> Cursor<'txn, 'env> {
         Ok(Some((key, value)))
     }
 
-    fn current_key(&self) -> Result<Option<&'txn [u8]>> {
+    fn current_key(&self) -> Result<Option<&'a [u8]>> {
         let Some(leaf_id) = self.leaf else {
             return Ok(None);
         };
@@ -286,7 +288,7 @@ where
 ///
 /// Yields key/value pairs in ascending key order.
 pub struct RoIter<'txn, 'env, KC, DC> {
-    cursor: Cursor<'txn, 'env>,
+    cursor: Cursor<'txn, RoTxn<'env>>,
     _codecs: PhantomData<(KC, DC)>,
 }
 
@@ -331,7 +333,7 @@ where
 ///
 /// Yields key/value pairs in descending key order.
 pub struct RoRevIter<'txn, 'env, KC, DC> {
-    cursor: Cursor<'txn, 'env>,
+    cursor: Cursor<'txn, RoTxn<'env>>,
     _codecs: PhantomData<(KC, DC)>,
 }
 
@@ -372,9 +374,111 @@ where
     }
 }
 
+/// An ordered iterator over a write transaction, including staged writes.
+///
+/// The iterator merges the committed snapshot with the transaction's pending
+/// put/delete operations. It borrows the transaction immutably.
+pub struct RwIter<'txn, 'env, KC, DC> {
+    cursor: Cursor<'txn, RwTxn<'env>>,
+    pending: Peekable<PendingIter<'txn>>,
+    done: bool,
+    _codecs: PhantomData<(KC, DC)>,
+}
+
+impl<'txn, 'env, KC, DC> RwIter<'txn, 'env, KC, DC> {
+    pub(crate) fn new(
+        source: &'txn RwTxn<'env>,
+        root: u64,
+        pending: PendingIter<'txn>,
+    ) -> Result<Self> {
+        let mut cursor = Cursor::new(source);
+        cursor.seek_first(root)?;
+        Ok(Self {
+            cursor,
+            pending: pending.peekable(),
+            done: false,
+            _codecs: PhantomData,
+        })
+    }
+}
+
+impl<'txn, 'env, KC, DC> Iterator for RwIter<'txn, 'env, KC, DC>
+where
+    KC: BytesDecode<'txn>,
+    DC: BytesDecode<'txn>,
+{
+    type Item = Result<(KC::DItem, DC::DItem)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+
+        loop {
+            let base = match self.cursor.current() {
+                Ok(current) => current,
+                Err(error) => {
+                    self.done = true;
+                    return Some(Err(error));
+                }
+            };
+            let pending = self.pending.peek().copied();
+
+            match (base, pending) {
+                (None, None) => {
+                    self.done = true;
+                    return None;
+                }
+                (Some((key, value)), None) => {
+                    let item = decode::<KC, DC>(key, value);
+                    if let Err(error) = self.cursor.next() {
+                        self.done = true;
+                        return Some(Err(error));
+                    }
+                    return Some(item);
+                }
+                (None, Some((key, value))) => {
+                    self.pending.next();
+                    if let Some(value) = value {
+                        return Some(decode::<KC, DC>(key, value));
+                    }
+                }
+                (Some((base_key, base_value)), Some((pending_key, pending_value))) => {
+                    match pending_key.cmp(base_key) {
+                        Ordering::Less => {
+                            self.pending.next();
+                            if let Some(value) = pending_value {
+                                return Some(decode::<KC, DC>(pending_key, value));
+                            }
+                        }
+                        Ordering::Equal => {
+                            self.pending.next();
+                            if let Err(error) = self.cursor.next() {
+                                self.done = true;
+                                return Some(Err(error));
+                            }
+                            if let Some(value) = pending_value {
+                                return Some(decode::<KC, DC>(pending_key, value));
+                            }
+                        }
+                        Ordering::Greater => {
+                            let item = decode::<KC, DC>(base_key, base_value);
+                            if let Err(error) = self.cursor.next() {
+                                self.done = true;
+                                return Some(Err(error));
+                            }
+                            return Some(item);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// A forward range iterator.
 pub struct RoRange<'txn, 'env, KC, DC> {
-    cursor: Cursor<'txn, 'env>,
+    cursor: Cursor<'txn, RoTxn<'env>>,
     end: Bound<Vec<u8>>,
     done: bool,
     _codecs: PhantomData<(KC, DC)>,
@@ -464,7 +568,7 @@ where
 
 /// A reverse range iterator.
 pub struct RoRevRange<'txn, 'env, KC, DC> {
-    cursor: Cursor<'txn, 'env>,
+    cursor: Cursor<'txn, RoTxn<'env>>,
     start: Bound<Vec<u8>>,
     done: bool,
     _codecs: PhantomData<(KC, DC)>,
