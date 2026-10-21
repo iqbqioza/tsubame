@@ -15,6 +15,9 @@ All notable changes to this project are documented here.
 - `get_rw`, `range_rw`, `rev_iter_rw`, `rev_range_rw`, `prefix_rw`, and
   `rev_prefix_rw` on write transactions, including staged puts and deletes.
 - Clearing a database now releases its old tree pages for reuse.
+- Read-only environments and shared read locks. Multiple read-only processes
+  can share an environment while a writable environment holds the exclusive
+  lock.
 
 ### Performance
 

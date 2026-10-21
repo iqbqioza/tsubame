@@ -16,8 +16,9 @@ use memmap2::{Mmap, MmapOptions};
 /// aliasing rules. The storage engine upholds these invariants:
 ///
 /// - `EnvInner` keeps the mapped file open for as long as the map exists.
-/// - The environment holds an exclusive advisory lock, so another process
-///   cannot truncate the file.
+/// - The environment holds an advisory lock for as long as the map exists:
+///   exclusive for writable environments and shared for read-only ones, so
+///   another process cannot truncate the file.
 /// - The file is preallocated to `map_size` at open and is never shrunk while
 ///   the environment is alive.
 /// - The map is read-only. Pages are written with `pwrite` only after they
@@ -27,6 +28,12 @@ use memmap2::{Mmap, MmapOptions};
 pub(crate) fn map_data(file: &File, offset: u64, len: usize) -> io::Result<Mmap> {
     // SAFETY: see the function-level contract above.
     unsafe { MmapOptions::new().offset(offset).len(len).map(file) }
+}
+
+/// Returns a small read-only anonymous mapping for an environment whose data
+/// region is empty (only the two meta pages exist).
+pub(crate) fn map_empty() -> io::Result<Mmap> {
+    MmapOptions::new().len(1).map_anon()?.make_read_only()
 }
 
 #[cfg(test)]
