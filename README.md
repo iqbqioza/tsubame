@@ -49,6 +49,7 @@ added without changing the main API.
 - [x] Serde-based codecs behind features
 - [x] Cross-transaction page reuse within a process
 - [x] Lazy free-list reconstruction after reopening
+- [x] Read-only environments with shared locks
 - [x] Offline compaction
 
 ## Codec features
@@ -104,7 +105,9 @@ The examples use a temporary directory and clean up after themselves.
 
 ## Limitations
 
-- One process per environment; the file lock is exclusive.
+- A writable environment holds an exclusive file lock. Multiple read-only
+  environments use a shared lock and can share the same data file, but readers
+  and writers cannot be open in different processes at the same time.
 - Freed pages are reused across transactions once the two recoverable meta
   snapshots no longer reference them and no active reader can still observe
   them. This keeps long-running update workloads from growing the file

@@ -51,6 +51,11 @@ impl Env {
         &self.inner.path
     }
 
+    /// Returns whether this environment is read-only.
+    pub fn is_read_only(&self) -> bool {
+        self.inner.read_only
+    }
+
     /// Returns a consistent snapshot of the environment metadata.
     pub fn info(&self) -> EnvInfo {
         let committed = self.inner.read_committed();
@@ -62,6 +67,7 @@ impl Env {
             database_count: committed.meta.database_count,
             max_dbs: self.inner.max_dbs,
             format_version: meta::FORMAT_VERSION,
+            read_only: self.inner.read_only,
         }
     }
 
@@ -82,6 +88,11 @@ impl Env {
     /// write transaction after opening scans the reachable pages once to
     /// reconstruct the free list.
     pub fn write_txn(&self) -> Result<RwTxn<'_>> {
+        ensure!(
+            !self.inner.read_only,
+            "environment `{}` is read-only",
+            self.inner.path.display()
+        );
         self.inner.ensure_usable()?;
         let writer = self
             .inner
@@ -181,7 +192,7 @@ impl fmt::Debug for Env {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct EnvInfo {
-    /// The effective maximum size of the data file, in bytes.
+    /// The effective mapped size of the data file, in bytes.
     pub map_size: usize,
     /// The page size used by the on-disk format.
     pub page_size: usize,
@@ -195,6 +206,8 @@ pub struct EnvInfo {
     pub max_dbs: usize,
     /// The on-disk format version.
     pub format_version: u32,
+    /// Whether this environment was opened read-only.
+    pub read_only: bool,
 }
 
 /// A page or contiguous run that is no longer reachable from a committed meta.
@@ -398,6 +411,7 @@ pub(crate) struct EnvInner {
     pub(crate) max_dbs: usize,
     pub(crate) data: File,
     pub(crate) mmap: Mmap,
+    pub(crate) read_only: bool,
     pub(crate) committed: RwLock<Committed>,
     pub(crate) writer: Mutex<()>,
     pub(crate) readers: Mutex<BTreeMap<u64, usize>>,
@@ -670,6 +684,8 @@ pub struct EnvOpenOptions {
     pub map_size: usize,
     /// The maximum number of named databases that can be created.
     pub max_dbs: usize,
+    /// Whether the environment is opened read-only.
+    pub read_only: bool,
 }
 
 impl Default for EnvOpenOptions {
@@ -677,6 +693,7 @@ impl Default for EnvOpenOptions {
         Self {
             map_size: DEFAULT_MAP_SIZE,
             max_dbs: DEFAULT_MAX_DBS,
+            read_only: false,
         }
     }
 }
@@ -700,21 +717,43 @@ impl EnvOpenOptions {
         self
     }
 
-    /// Opens the environment in `path`, creating the directory if needed.
+    /// Opens the environment without write access.
+    ///
+    /// Read-only environments take a shared file lock. Multiple read-only
+    /// processes can share an environment, but no writable environment can be
+    /// open at the same time.
+    pub fn read_only(&mut self, read_only: bool) -> &mut Self {
+        self.read_only = read_only;
+        self
+    }
+
+    /// Opens the environment in `path`.
+    ///
+    /// A writable environment creates the directory and data file when needed.
+    /// A read-only environment requires an existing, initialized data file and
+    /// takes a shared lock.
     ///
     /// # Errors
     ///
-    /// Returns an error if the directory cannot be created, the environment is
-    /// already locked by another process, the on-disk format is invalid, or the
-    /// data file cannot be mapped.
+    /// Returns an error if the directory cannot be created or opened, the
+    /// environment is already locked by another process, the on-disk format is
+    /// invalid, or the data file cannot be mapped.
     pub fn open(&self, path: impl AsRef<Path>) -> Result<Env> {
         let path = path.as_ref();
-        fs::create_dir_all(path).with_context(|| {
-            format!(
-                "failed to create the environment directory `{}`",
+        if self.read_only {
+            ensure!(
+                path.is_dir(),
+                "environment `{}` does not exist",
                 path.display()
-            )
-        })?;
+            );
+        } else {
+            fs::create_dir_all(path).with_context(|| {
+                format!(
+                    "failed to create the environment directory `{}`",
+                    path.display()
+                )
+            })?;
+        }
 
         let lock = OpenOptions::new()
             .read(true)
@@ -729,10 +768,19 @@ impl EnvOpenOptions {
                 )
             })?;
 
-        match fs4::FileExt::try_lock(&lock) {
+        let lock_result = if self.read_only {
+            fs4::FileExt::try_lock_shared(&lock)
+        } else {
+            fs4::FileExt::try_lock(&lock)
+        };
+        match lock_result {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
-                bail!("environment `{}` is already locked", path.display())
+                if self.read_only {
+                    bail!("environment `{}` is open for writing", path.display())
+                } else {
+                    bail!("environment `{}` is already locked", path.display())
+                }
             }
             Err(TryLockError::Error(error)) => {
                 return Err(error).with_context(|| {
@@ -742,13 +790,20 @@ impl EnvOpenOptions {
         }
 
         let data_path = path.join(DATA_FILE);
-        let data = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&data_path)
-            .with_context(|| format!("failed to open `{}`", data_path.display()))?;
+        let data = if self.read_only {
+            OpenOptions::new()
+                .read(true)
+                .open(&data_path)
+                .with_context(|| format!("failed to open `{}`", data_path.display()))?
+        } else {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&data_path)
+                .with_context(|| format!("failed to open `{}`", data_path.display()))?
+        };
 
         let existing_len = data
             .metadata()
@@ -756,7 +811,24 @@ impl EnvOpenOptions {
             .len();
         let requested_map_size = normalize_map_size(self.map_size)?;
 
-        let (candidates, map_size, file_covers_newest) = if existing_len == 0 {
+        let (candidates, map_size, file_covers_newest) = if self.read_only {
+            ensure!(
+                existing_len >= (2 * PAGE_SIZE) as u64,
+                "environment `{}` is not initialized",
+                path.display()
+            );
+            let loaded = meta::load_all(&data, &data_path)?;
+            let newest = &loaded[0];
+            let minimum = pages_to_bytes(newest.meta.page_count)?;
+            ensure!(
+                existing_len >= minimum as u64,
+                "data file `{}` is truncated below the committed page count",
+                data_path.display()
+            );
+            let map_size =
+                usize::try_from(existing_len).context("data file is too large to map")?;
+            (loaded, map_size, true)
+        } else if existing_len == 0 {
             #[cfg(windows)]
             let initial_len = requested_map_size as u64;
             #[cfg(not(windows))]
@@ -801,9 +873,13 @@ impl EnvOpenOptions {
 
         let data_offset = (2 * PAGE_SIZE) as u64;
         let mapped_len = map_size - 2 * PAGE_SIZE;
-        let mmap = mmap::map_data(&data, data_offset, mapped_len)
-            .with_context(|| format!("failed to map `{}`", data_path.display()))?;
-        debug_assert_eq!(mmap.len(), mapped_len);
+        let mmap = if mapped_len == 0 {
+            mmap::map_empty().context("failed to map an empty data region")?
+        } else {
+            mmap::map_data(&data, data_offset, mapped_len)
+                .with_context(|| format!("failed to map `{}`", data_path.display()))?
+        };
+        debug_assert!(mmap.len() >= mapped_len.max(1));
 
         let mut chosen = None;
         let mut errors = Vec::new();
@@ -841,6 +917,7 @@ impl EnvOpenOptions {
             max_dbs: self.max_dbs,
             data,
             mmap,
+            read_only: self.read_only,
             committed: RwLock::new(Committed {
                 meta,
                 slot: meta_slot,
@@ -850,7 +927,7 @@ impl EnvOpenOptions {
             free_pool: Mutex::new(Vec::new()),
             free_pool_ready: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
-            clean_marker_on_drop: AtomicBool::new(true),
+            clean_marker_on_drop: AtomicBool::new(!self.read_only),
             verified,
             _lock: lock,
         };
@@ -913,15 +990,17 @@ mod tests {
 
         assert_eq!(options.map_size, DEFAULT_MAP_SIZE);
         assert_eq!(options.max_dbs, DEFAULT_MAX_DBS);
+        assert!(!options.read_only);
     }
 
     #[test]
     fn builder_updates_options() {
         let mut options = EnvOpenOptions::new();
-        options.map_size(4096 * 4).max_dbs(2);
+        options.map_size(4096 * 4).max_dbs(2).read_only(true);
 
         assert_eq!(options.map_size, 4096 * 4);
         assert_eq!(options.max_dbs, 2);
+        assert!(options.read_only);
     }
 
     #[test]
