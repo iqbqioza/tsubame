@@ -13,6 +13,7 @@ use anyhow::ensure;
 use crate::Result;
 use crate::env::EnvInner;
 use crate::storage::btree;
+use crate::storage::page::MAX_KEY_SIZE;
 use crate::traits::{BoxedError, BytesDecode, BytesEncode};
 use crate::txn::{RoTxn, RwTxn};
 
@@ -106,10 +107,12 @@ impl<KC, DC> Database<KC, DC> {
                 KC::bytes_encode(key).map_err(|error| codec_error("key encoding failed", error))?;
             let value = DC::bytes_encode(data)
                 .map_err(|error| codec_error("value encoding failed", error))?;
-            let root = txn.root_for(self.kind);
-            let txn_id = txn.txn_id();
-            let new_root = btree::insert(txn, root, &key, &value, txn_id)?;
-            txn.set_root(new_root);
+            ensure!(
+                key.len() <= MAX_KEY_SIZE,
+                "key is {} bytes, maximum is {MAX_KEY_SIZE}",
+                key.len()
+            );
+            txn.put_raw(key.into_owned(), value.into_owned());
             Ok(())
         })();
 
@@ -140,10 +143,12 @@ impl<KC, DC> Database<KC, DC> {
         let result = (|| {
             let key =
                 KC::bytes_encode(key).map_err(|error| codec_error("key encoding failed", error))?;
-            let root = txn.root_for(self.kind);
-            let txn_id = txn.txn_id();
-            let new_root = btree::delete(txn, root, &key, txn_id)?;
-            txn.set_root(new_root);
+            ensure!(
+                key.len() <= MAX_KEY_SIZE,
+                "key is {} bytes, maximum is {MAX_KEY_SIZE}",
+                key.len()
+            );
+            txn.delete_raw(key.into_owned());
             Ok(())
         })();
 
@@ -165,7 +170,7 @@ impl<KC, DC> Database<KC, DC> {
             txn.belongs_to(&self.env),
             "transaction belongs to a different environment"
         );
-        txn.set_root(0);
+        txn.clear_raw();
         Ok(())
     }
 }

@@ -1,0 +1,13 @@
+[package]
+name = "tsubame-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+heed = { version = "0.22", default-features = false }
+tempfile = "3"
+tsubame = { path = "../crates/tsubame" }

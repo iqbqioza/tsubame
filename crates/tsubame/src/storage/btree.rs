@@ -163,7 +163,7 @@ fn insert_into<S: PageStore>(
     );
 
     let bytes = store.read_page(page_id)?;
-    let page = Page::parse(&bytes, Some(page_id))?;
+    let page = Page::parse_trusted(&bytes, Some(page_id))?;
 
     match page.page_type() {
         PageType::Leaf => insert_leaf(store, page_id, &page, key, value, txn_id),
@@ -241,7 +241,7 @@ fn delete_into<S: PageStore>(
     );
 
     let bytes = store.read_page(page_id)?;
-    let page = Page::parse(&bytes, Some(page_id))?;
+    let page = Page::parse_trusted(&bytes, Some(page_id))?;
 
     match page.page_type() {
         PageType::Leaf => delete_leaf(store, page_id, &page, key, txn_id),
@@ -439,6 +439,127 @@ fn store_branch<S: PageStore>(
             right: right_page,
         }),
     })
+}
+
+/// Bulk-loads sorted entries into a new tree and returns its root.
+///
+/// This is used when a transaction writes a large number of entries into an
+/// empty database; building the tree bottom-up avoids rewriting the same
+/// pages for every insert.
+pub(crate) fn bulk_load<S: PageStore>(
+    store: &mut S,
+    entries: &[(Vec<u8>, Vec<u8>)],
+    txn_id: u64,
+) -> Result<u64> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    for pair in entries.windows(2) {
+        ensure!(
+            pair[0].0 < pair[1].0,
+            "bulk-load keys must be strictly ascending"
+        );
+    }
+
+    let mut leaves: Vec<(Vec<u8>, u64)> = Vec::new();
+    let mut leaf_entries: Vec<OwnedLeafEntry> = Vec::new();
+    let mut leaf_size = HEADER_SIZE;
+
+    for (key, value) in entries {
+        ensure!(
+            key.len() <= MAX_KEY_SIZE,
+            "key is {} bytes, maximum is {MAX_KEY_SIZE}",
+            key.len()
+        );
+        let value = make_value(store, key.len(), value)?;
+        let entry_size = SLOT_SIZE + key.len() + value.encoded_len();
+        ensure!(
+            HEADER_SIZE + entry_size <= PAGE_SIZE,
+            "entry is too large for a leaf page"
+        );
+
+        if !leaf_entries.is_empty() && leaf_size + entry_size > PAGE_SIZE {
+            flush_leaf(store, &mut leaves, &mut leaf_entries, txn_id)?;
+            leaf_size = HEADER_SIZE;
+        }
+
+        leaf_size += entry_size;
+        leaf_entries.push(OwnedLeafEntry {
+            key: key.clone(),
+            value,
+        });
+    }
+    flush_leaf(store, &mut leaves, &mut leaf_entries, txn_id)?;
+
+    let mut level = leaves;
+    while level.len() > 1 {
+        let mut next = Vec::new();
+        let mut group: Vec<(Vec<u8>, u64)> = Vec::new();
+        let mut group_size = HEADER_SIZE;
+        let mut group_separator = Vec::new();
+
+        for (separator, child) in level {
+            let entry_separator = separator;
+            if !group.is_empty() {
+                let candidate_size = SLOT_SIZE + entry_separator.len() + std::mem::size_of::<u64>();
+                if group_size + candidate_size > PAGE_SIZE {
+                    let page_id = allocate_branch(store, &group, txn_id)?;
+                    let separator = std::mem::take(&mut group_separator);
+                    next.push((separator, page_id));
+                    group.clear();
+                    group_size = HEADER_SIZE;
+                }
+            }
+
+            if group.is_empty() {
+                group_separator = entry_separator.clone();
+            }
+            let key = if group.is_empty() {
+                Vec::new()
+            } else {
+                entry_separator
+            };
+            let entry_size = SLOT_SIZE + key.len() + std::mem::size_of::<u64>();
+            ensure!(
+                HEADER_SIZE + entry_size <= PAGE_SIZE,
+                "entry is too large for a branch page"
+            );
+
+            group_size += entry_size;
+            group.push((key, child));
+        }
+
+        if !group.is_empty() {
+            let page_id = allocate_branch(store, &group, txn_id)?;
+            next.push((group_separator, page_id));
+        }
+
+        level = next;
+    }
+
+    Ok(level[0].1)
+}
+
+fn flush_leaf<S: PageStore>(
+    store: &mut S,
+    leaves: &mut Vec<(Vec<u8>, u64)>,
+    entries: &mut Vec<OwnedLeafEntry>,
+    txn_id: u64,
+) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let separator = if leaves.is_empty() {
+        Vec::new()
+    } else {
+        entries[0].key.clone()
+    };
+    let page_id = allocate_leaf(store, entries, txn_id)?;
+    leaves.push((separator, page_id));
+    entries.clear();
+
+    Ok(())
 }
 
 fn allocate_leaf<S: PageStore>(
