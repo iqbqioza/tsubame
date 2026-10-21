@@ -50,6 +50,7 @@ added without changing the main API.
 - [x] Cross-transaction page reuse within a process
 - [x] Lazy free-list reconstruction after reopening
 - [x] Read-only environments with shared locks
+- [x] Concurrent writer and read-only processes (`multi_process`)
 - [x] Offline compaction
 
 ## Codec features
@@ -105,9 +106,11 @@ The examples use a temporary directory and clean up after themselves.
 
 ## Limitations
 
-- A writable environment holds an exclusive file lock. Multiple read-only
-  environments use a shared lock and can share the same data file, but readers
-  and writers cannot be open in different processes at the same time.
+- A writable environment normally holds an exclusive file lock. Multiple
+  read-only environments use a shared lock and can share the same data file.
+  A writable environment can coexist with read-only processes when opened with
+  `multi_process(true)`; in that mode cross-transaction page reuse is disabled
+  so reader snapshots remain valid.
 - Freed pages are reused across transactions once the two recoverable meta
   snapshots no longer reference them and no active reader can still observe
   them. This keeps long-running update workloads from growing the file

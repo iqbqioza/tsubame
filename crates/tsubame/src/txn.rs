@@ -285,9 +285,13 @@ impl<'env> RwTxn<'env> {
             .txn_id
             .checked_add(1)
             .context("transaction ID overflow")?;
-        let oldest_reader = env.inner.oldest_reader_snapshot(committed.meta.txn_id);
-        let free_limit = committed.meta.txn_id.saturating_sub(1).min(oldest_reader);
-        let cross_free = env.inner.take_reusable_free(free_limit);
+        let cross_free = if env.inner.page_reuse {
+            let oldest_reader = env.inner.oldest_reader_snapshot(committed.meta.txn_id);
+            let free_limit = committed.meta.txn_id.saturating_sub(1).min(oldest_reader);
+            env.inner.take_reusable_free(free_limit)
+        } else {
+            Vec::new()
+        };
 
         Ok(Self {
             env,
@@ -551,6 +555,10 @@ impl<'env> RwTxn<'env> {
     }
 
     fn recycle_pages(&mut self) {
+        if !self.env.inner.page_reuse {
+            return;
+        }
+
         // The free pool uses commit generations to avoid overwriting pages
         // referenced by either of the two recoverable meta snapshots. A page
         // freed by commit N is referenced by the snapshot at N - 1, so it may

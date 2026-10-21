@@ -18,6 +18,9 @@ All notable changes to this project are documented here.
 - Read-only environments and shared read locks. Multiple read-only processes
   can share an environment while a writable environment holds the exclusive
   lock.
+- `multi_process(true)` lets a writable environment coexist with read-only
+  processes. Cross-transaction page reuse is disabled in this mode so external
+  snapshots remain valid.
 
 ### Performance
 
