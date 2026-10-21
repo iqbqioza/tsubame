@@ -1,0 +1,24 @@
+[package]
+name = "tsubame-types"
+description = "Built-in codecs for the Tsubame typed key-value store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/tsubame-types"
+keywords = ["database", "codec", "encoding", "serialization", "tsubame"]
+categories = ["database", "encoding", "serialization"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+byteorder.workspace = true
+tsubame-traits.workspace = true
+
+[lints]
+workspace = true

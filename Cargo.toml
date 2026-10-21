@@ -1,0 +1,29 @@
+[workspace]
+members = ["crates/tsubame", "crates/tsubame-traits", "crates/tsubame-types"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Takuya Okada <takuya@iqbqioza.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/iqbqioza/tsubame"
+homepage = "https://github.com/iqbqioza/tsubame"
+
+[workspace.dependencies]
+anyhow = "1.0"
+byteorder = { version = "1.5", default-features = false }
+tsubame-traits = { version = "0.1.0", path = "crates/tsubame-traits" }
+tsubame-types = { version = "0.1.0", path = "crates/tsubame-types" }
+
+[workspace.lints.rust]
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "deny"
+print_stderr = "deny"
+print_stdout = "deny"
+todo = "deny"
+unimplemented = "deny"

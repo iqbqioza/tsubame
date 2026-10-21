@@ -1,0 +1,20 @@
+[package]
+name = "tsubame-traits"
+description = "Encoding, decoding, and comparison traits for the Tsubame key-value store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/tsubame-traits"
+keywords = ["database", "encoding", "traits", "tsubame"]
+categories = ["database", "encoding"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true
