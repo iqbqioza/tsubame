@@ -7,6 +7,8 @@
 
 use std::collections::BTreeSet;
 
+use std::cmp::Ordering;
+
 use anyhow::{Context, Result, bail, ensure};
 
 use super::PAGE_SIZE;
@@ -15,6 +17,7 @@ use super::page::{
     self, HEADER_SIZE, INLINE_BUDGET, LeafValue, MAX_KEY_SIZE, Page, PageType, SLOT_SIZE,
 };
 use super::store::PageStore;
+use crate::comparator::KeyComparator;
 
 /// The maximum number of branch levels followed by a lookup.
 ///
@@ -28,6 +31,9 @@ pub(crate) trait PageSource {
 
     /// Returns the payload of an overflow extent.
     fn overflow(&self, reference: OverflowRef) -> Result<&[u8]>;
+
+    /// Returns the key order used by the source.
+    fn comparator(&self) -> &KeyComparator;
 }
 
 /// Looks up `key` in the tree rooted at `root`.
@@ -40,6 +46,15 @@ pub(crate) fn get<'a, S: PageSource>(
     root: u64,
     key: &[u8],
 ) -> Result<Option<&'a [u8]>> {
+    get_with(source, root, key, &KeyComparator::lexicographic())
+}
+
+pub(crate) fn get_with<'a, S: PageSource>(
+    source: &'a S,
+    root: u64,
+    key: &[u8],
+    comparator: &KeyComparator,
+) -> Result<Option<&'a [u8]>> {
     if root == 0 {
         return Ok(None);
     }
@@ -49,11 +64,11 @@ pub(crate) fn get<'a, S: PageSource>(
         let page = source.page(page_id)?;
         match page.page_type() {
             PageType::Branch => {
-                page_id = page.branch_child(key)?;
+                page_id = page.branch_child_with(key, comparator)?;
                 ensure!(page_id >= 2, "branch points at reserved page ID {page_id}");
             }
             PageType::Leaf => {
-                let Some(index) = page.leaf_index(key)? else {
+                let Some(index) = page.leaf_index_with(key, comparator)? else {
                     return Ok(None);
                 };
                 return match page.leaf_value(index)? {
@@ -127,6 +142,24 @@ pub(crate) fn insert<S: PageStore>(
     value: &[u8],
     txn_id: u64,
 ) -> Result<u64> {
+    insert_with(
+        store,
+        root,
+        key,
+        value,
+        txn_id,
+        &KeyComparator::lexicographic(),
+    )
+}
+
+pub(crate) fn insert_with<S: PageStore>(
+    store: &mut S,
+    root: u64,
+    key: &[u8],
+    value: &[u8],
+    txn_id: u64,
+    comparator: &KeyComparator,
+) -> Result<u64> {
     ensure!(
         key.len() <= MAX_KEY_SIZE,
         "key is {} bytes, maximum is {MAX_KEY_SIZE}",
@@ -142,7 +175,7 @@ pub(crate) fn insert<S: PageStore>(
         return allocate_leaf(store, &[entry], txn_id);
     }
 
-    let result = insert_into(store, root, key, value, txn_id, 0)?;
+    let result = insert_into(store, root, key, value, txn_id, 0, comparator)?;
     if let Some(split) = result.split {
         let entries = vec![(Vec::new(), result.page_id), (split.separator, split.right)];
         allocate_branch(store, &entries, txn_id)
@@ -158,11 +191,21 @@ pub(crate) fn delete<S: PageStore>(
     key: &[u8],
     txn_id: u64,
 ) -> Result<u64> {
+    delete_with(store, root, key, txn_id, &KeyComparator::lexicographic())
+}
+
+pub(crate) fn delete_with<S: PageStore>(
+    store: &mut S,
+    root: u64,
+    key: &[u8],
+    txn_id: u64,
+    comparator: &KeyComparator,
+) -> Result<u64> {
     if root == 0 {
         return Ok(0);
     }
 
-    let result = delete_into(store, root, key, txn_id, 0)?;
+    let result = delete_into(store, root, key, txn_id, 0, comparator)?;
     Ok(result.page_id)
 }
 
@@ -211,6 +254,7 @@ fn insert_into<S: PageStore>(
     value: &[u8],
     txn_id: u64,
     depth: usize,
+    comparator: &KeyComparator,
 ) -> Result<InsertResult> {
     ensure!(
         depth < MAX_DEPTH,
@@ -221,8 +265,10 @@ fn insert_into<S: PageStore>(
     let page = Page::parse_trusted(&bytes, Some(page_id))?;
 
     match page.page_type() {
-        PageType::Leaf => insert_leaf(store, page_id, &page, key, value, txn_id),
-        PageType::Branch => insert_branch(store, page_id, &page, key, value, txn_id, depth),
+        PageType::Leaf => insert_leaf(store, page_id, &page, key, value, txn_id, comparator),
+        PageType::Branch => {
+            insert_branch(store, page_id, &page, key, value, txn_id, depth, comparator)
+        }
     }
 }
 
@@ -233,8 +279,9 @@ fn insert_leaf<S: PageStore>(
     key: &[u8],
     value: &[u8],
     txn_id: u64,
+    comparator: &KeyComparator,
 ) -> Result<InsertResult> {
-    let position = page.lower_bound(key)?;
+    let position = page.lower_bound_with(key, comparator)?;
     let existing = position < page.slot_count() && page.key(position)? == key;
     let inline = SLOT_SIZE + key.len() + value.len() <= INLINE_BUDGET;
 
@@ -297,19 +344,20 @@ fn insert_leaf<S: PageStore>(
 
     let mut entries = collect_leaf(page)?;
     let new_value = make_value(store, key.len(), value, txn_id)?;
-    let replaced = match entries.binary_search_by(|entry| entry.key.as_slice().cmp(key)) {
-        Ok(index) => Some(std::mem::replace(&mut entries[index].value, new_value)),
-        Err(index) => {
-            entries.insert(
-                index,
-                OwnedLeafEntry {
-                    key: key.to_vec(),
-                    value: new_value,
-                },
-            );
-            None
-        }
-    };
+    let replaced =
+        match entries.binary_search_by(|entry| comparator.compare(entry.key.as_slice(), key)) {
+            Ok(index) => Some(std::mem::replace(&mut entries[index].value, new_value)),
+            Err(index) => {
+                entries.insert(
+                    index,
+                    OwnedLeafEntry {
+                        key: key.to_vec(),
+                        value: new_value,
+                    },
+                );
+                None
+            }
+        };
 
     let result = store_leaf(store, page_id, entries, txn_id)?;
     if let Some(old_value) = replaced {
@@ -319,6 +367,7 @@ fn insert_leaf<S: PageStore>(
     Ok(result)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_branch<S: PageStore>(
     store: &mut S,
     page_id: u64,
@@ -327,10 +376,11 @@ fn insert_branch<S: PageStore>(
     value: &[u8],
     txn_id: u64,
     depth: usize,
+    comparator: &KeyComparator,
 ) -> Result<InsertResult> {
-    let index = page.branch_child_index(key)?;
+    let index = page.branch_child_index_with(key, comparator)?;
     let child = page.child(index)?;
-    let result = insert_into(store, child, key, value, txn_id, depth + 1)?;
+    let result = insert_into(store, child, key, value, txn_id, depth + 1, comparator)?;
 
     if result.split.is_none() {
         let new_page_id = store.allocate_pages(1)?;
@@ -358,6 +408,7 @@ fn delete_into<S: PageStore>(
     key: &[u8],
     txn_id: u64,
     depth: usize,
+    comparator: &KeyComparator,
 ) -> Result<DeleteResult> {
     ensure!(
         depth < MAX_DEPTH,
@@ -368,8 +419,8 @@ fn delete_into<S: PageStore>(
     let page = Page::parse_trusted(&bytes, Some(page_id))?;
 
     match page.page_type() {
-        PageType::Leaf => delete_leaf(store, page_id, &page, key, txn_id),
-        PageType::Branch => delete_branch(store, page_id, &page, key, txn_id, depth),
+        PageType::Leaf => delete_leaf(store, page_id, &page, key, txn_id, comparator),
+        PageType::Branch => delete_branch(store, page_id, &page, key, txn_id, depth, comparator),
     }
 }
 
@@ -384,9 +435,11 @@ fn delete_leaf<S: PageStore>(
     page: &Page<'_>,
     key: &[u8],
     txn_id: u64,
+    comparator: &KeyComparator,
 ) -> Result<DeleteResult> {
     let mut entries = collect_leaf(page)?;
-    let Ok(index) = entries.binary_search_by(|entry| entry.key.as_slice().cmp(key)) else {
+    let Ok(index) = entries.binary_search_by(|entry| comparator.compare(entry.key.as_slice(), key))
+    else {
         return Ok(DeleteResult {
             page_id,
             changed: false,
@@ -420,10 +473,11 @@ fn delete_branch<S: PageStore>(
     key: &[u8],
     txn_id: u64,
     depth: usize,
+    comparator: &KeyComparator,
 ) -> Result<DeleteResult> {
-    let index = page.branch_child_index(key)?;
+    let index = page.branch_child_index_with(key, comparator)?;
     let child = page.child(index)?;
-    let result = delete_into(store, child, key, txn_id, depth + 1)?;
+    let result = delete_into(store, child, key, txn_id, depth + 1, comparator)?;
 
     if !result.changed {
         return Ok(DeleteResult {
@@ -594,14 +648,25 @@ pub(crate) fn bulk_load<S: PageStore>(
     entries: &[(Vec<u8>, Vec<u8>)],
     txn_id: u64,
 ) -> Result<u64> {
+    bulk_load_with(store, entries, txn_id, &KeyComparator::lexicographic())
+}
+
+pub(crate) fn bulk_load_with<S: PageStore>(
+    store: &mut S,
+    entries: &[(Vec<u8>, Vec<u8>)],
+    txn_id: u64,
+    comparator: &KeyComparator,
+) -> Result<u64> {
     if entries.is_empty() {
         return Ok(0);
     }
     for pair in entries.windows(2) {
-        ensure!(
-            pair[0].0 < pair[1].0,
-            "bulk-load keys must be strictly ascending"
-        );
+        let ordered = if comparator.is_lexicographic() {
+            pair[0].0 < pair[1].0
+        } else {
+            comparator.compare(&pair[0].0, &pair[1].0) == Ordering::Less
+        };
+        ensure!(ordered, "bulk-load keys must be strictly ascending");
     }
 
     let mut leaves: Vec<(Vec<u8>, u64)> = Vec::new();
@@ -795,7 +860,7 @@ fn allocate_branch<S: PageStore>(
         .iter()
         .map(|(key, child)| (key.as_slice(), *child))
         .collect();
-    let page = page::build_branch(page_id, txn_id, &refs)?;
+    let page = page::build_branch_sorted(page_id, txn_id, &refs)?;
     store.write_page(page_id, page)?;
     Ok(page_id)
 }

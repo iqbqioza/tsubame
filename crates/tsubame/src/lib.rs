@@ -10,8 +10,8 @@
 //! The environment lifecycle, the on-disk meta format, the B+tree read and
 //! write paths, transactions, typed database operations, named databases,
 //! ordered forward/reverse iteration, ranges, prefixes, write-transaction
-//! reads, in-process page reuse, and offline compaction are implemented.
-//! APIs may change while the engine is being built.
+//! reads, custom key order, in-process page reuse, and offline compaction are
+//! implemented. APIs may change while the engine is being built.
 //!
 //! # Example
 //!
@@ -40,6 +40,7 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod comparator;
 pub mod cursor;
 pub mod database;
 pub mod env;
@@ -48,6 +49,7 @@ pub mod iter;
 mod storage;
 pub mod txn;
 
+pub use self::comparator::KeyComparator;
 pub use self::database::Database;
 pub use self::env::{DEFAULT_MAP_SIZE, DEFAULT_MAX_DBS, Env, EnvInfo, EnvOpenOptions};
 pub use self::error::{Error, Result};

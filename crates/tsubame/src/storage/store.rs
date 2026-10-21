@@ -114,5 +114,9 @@ pub(crate) mod memory {
                 .with_context(|| format!("overflow extent {} not found", reference.start_page))?;
             overflow::validate_extent(bytes, reference)
         }
+
+        fn comparator(&self) -> &crate::comparator::KeyComparator {
+            &crate::comparator::LEXICOGRAPHIC
+        }
     }
 }

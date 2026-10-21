@@ -11,7 +11,7 @@ use std::thread;
 use tempfile::tempdir;
 use tsubame::byteorder::NativeEndian;
 use tsubame::types::{Bytes, Str, U32};
-use tsubame::{Env, EnvOpenOptions, Result};
+use tsubame::{Env, EnvOpenOptions, KeyComparator, Result};
 
 fn options() -> EnvOpenOptions {
     let mut options = EnvOpenOptions::new();
@@ -1809,6 +1809,134 @@ fn reuse_survives_mixed_updates_clear_and_readers() -> Result<()> {
             "reopened state diverged at key {key}"
         );
     }
+
+    Ok(())
+}
+
+fn reverse_bytes(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+    right.cmp(left)
+}
+
+#[test]
+fn custom_comparator_orders_reads_and_compaction() -> Result<()> {
+    let dir = tempdir()?;
+    let comparator = KeyComparator::custom(reverse_bytes);
+    let mut options = options();
+    options.comparator(comparator);
+
+    {
+        let env = options.open(dir.path())?;
+        let mut wtxn = env.write_txn()?;
+        let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+        let named = env.create_database::<Str, Str>(&mut wtxn, Some("named"))?;
+        for (key, value) in [("a", "1"), ("b", "2"), ("c", "3")] {
+            db.put(&mut wtxn, key, value)?;
+            named.put(&mut wtxn, key, value)?;
+        }
+        wtxn.commit()?;
+
+        let rtxn = env.read_txn()?;
+        let ordered: Vec<_> = db
+            .iter(&rtxn)?
+            .map(|item| item.map(|(key, _)| key.to_owned()))
+            .collect::<std::result::Result<_, _>>()?;
+        assert_eq!(ordered, ["c", "b", "a"]);
+        let reverse: Vec<_> = db
+            .rev_iter(&rtxn)?
+            .map(|item| item.map(|(key, _)| key.to_owned()))
+            .collect::<std::result::Result<_, _>>()?;
+        assert_eq!(reverse, ["a", "b", "c"]);
+
+        let range: Vec<_> = db
+            .range(&rtxn, Bound::Included("c"), Bound::Included("b"))?
+            .map(|item| item.map(|(key, _)| key.to_owned()))
+            .collect::<std::result::Result<_, _>>()?;
+        assert_eq!(range, ["c", "b"]);
+        assert!(db.prefix_iter(&rtxn, "a").is_err());
+        assert_eq!(db.get(&rtxn, "b")?, Some("2"));
+        assert_eq!(named.get(&rtxn, "a")?, Some("1"));
+
+        let mut wtxn = env.write_txn()?;
+        db.put(&mut wtxn, "d", "4")?;
+        db.delete(&mut wtxn, "b")?;
+        let pending: Vec<_> = db
+            .iter_rw(&wtxn)?
+            .map(|item| item.map(|(key, _)| key.to_owned()))
+            .collect::<std::result::Result<_, _>>()?;
+        assert_eq!(pending, ["d", "c", "a"]);
+        assert_eq!(db.get_rw(&wtxn, "d")?, Some("4"));
+        let reverse_pending: Vec<_> = db
+            .rev_iter_rw(&wtxn)?
+            .map(|item| item.map(|(key, _)| key.to_owned()))
+            .collect::<std::result::Result<_, _>>()?;
+        assert_eq!(reverse_pending, ["a", "c", "d"]);
+        assert!(db.prefix_rw(&wtxn, "a").is_err());
+        wtxn.commit()?;
+    }
+
+    Env::compact_with(dir.path(), comparator)?;
+    let env = options.open(dir.path())?;
+    let rtxn = env.read_txn()?;
+    let db = env.open_database::<Str, Str>(&rtxn, None)?;
+    let ordered: Vec<_> = db
+        .iter(&rtxn)?
+        .map(|item| item.map(|(key, _)| key.to_owned()))
+        .collect::<std::result::Result<_, _>>()?;
+    assert_eq!(ordered, ["d", "c", "a"]);
+    assert_eq!(db.get(&rtxn, "c")?, Some("3"));
+    let named = env.open_database::<Str, Str>(&rtxn, Some("named"))?;
+    let named_keys: Vec<_> = named
+        .iter(&rtxn)?
+        .map(|item| item.map(|(key, _)| key.to_owned()))
+        .collect::<std::result::Result<_, _>>()?;
+    assert_eq!(named_keys, ["c", "b", "a"]);
+
+    Ok(())
+}
+
+#[test]
+fn custom_comparator_bulk_load_and_write_ranges() -> Result<()> {
+    let dir = tempdir()?;
+    let mut options = options();
+    options.comparator(KeyComparator::custom(reverse_bytes));
+    let env = options.open(dir.path())?;
+
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+    for i in 0..2_000u32 {
+        db.put(&mut wtxn, &format!("key-{i:04}"), &format!("value-{i}"))?;
+    }
+    wtxn.commit()?;
+
+    let rtxn = env.read_txn()?;
+    let first = db
+        .iter(&rtxn)?
+        .next()
+        .transpose()?
+        .expect("missing first entry")
+        .0;
+    let last = db
+        .rev_iter(&rtxn)?
+        .next()
+        .transpose()?
+        .expect("missing last entry")
+        .0;
+    assert_eq!(first, "key-1999");
+    assert_eq!(last, "key-0000");
+
+    let mut wtxn = env.write_txn()?;
+    db.put(&mut wtxn, "key-0500x", "updated")?;
+    let range: Vec<_> = db
+        .range_rw(
+            &wtxn,
+            Bound::Included("key-0600"),
+            Bound::Included("key-0400"),
+        )?
+        .map(|item| item.map(|(key, _)| key.to_owned()))
+        .collect::<std::result::Result<_, _>>()?;
+    assert_eq!(range.first().map(String::as_str), Some("key-0600"));
+    assert_eq!(range.last().map(String::as_str), Some("key-0400"));
+    wtxn.abort()?;
 
     Ok(())
 }
