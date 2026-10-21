@@ -14,7 +14,7 @@ use anyhow::ensure;
 use crate::Result;
 use crate::env::EnvInner;
 use crate::iter::{
-    RoIter, RoPrefix, RoRange, RoRevIter, RoRevPrefix, RoRevRange, prefix_successor,
+    RoIter, RoPrefix, RoRange, RoRevIter, RoRevPrefix, RoRevRange, RwIter, prefix_successor,
 };
 use crate::storage::btree;
 use crate::storage::page::MAX_KEY_SIZE;
@@ -107,6 +107,27 @@ impl<KC, DC> Database<KC, DC> {
     {
         let root = self.resolve_root(txn)?;
         RoIter::new(txn, root)
+    }
+
+    /// Returns an iterator over the write transaction's view of the database.
+    ///
+    /// The iterator merges the committed snapshot with staged puts and deletes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be resolved in the transaction.
+    pub fn iter_rw<'txn, 'env>(&self, txn: &'txn RwTxn<'env>) -> Result<RwIter<'txn, 'env, KC, DC>>
+    where
+        KC: BytesDecode<'txn>,
+        DC: BytesDecode<'txn>,
+    {
+        ensure!(
+            txn.belongs_to(&self.env),
+            "transaction belongs to a different environment"
+        );
+        let root = txn.read_root(&self.kind)?;
+        let pending = txn.pending_for(&self.kind);
+        RwIter::new(txn, root, pending)
     }
 
     /// Returns a reverse iterator over all entries in descending key order.
