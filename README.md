@@ -6,9 +6,10 @@
 inspired by [heed].
 
 > [!WARNING]
-> Tsubame is at the scaffolding stage. The workspace layout, public API
-> surface, encoding traits, and built-in codecs exist, but the storage engine
-> is not implemented yet. `EnvOpenOptions::open` currently returns an error.
+> Tsubame is under construction. The workspace layout, public API surface,
+> encoding traits, built-in codecs, and environment format exist, but
+> transactions and the B+tree are not implemented yet. Opening an
+> environment works; starting a transaction currently returns an error.
 
 ## Why Tsubame
 
@@ -35,7 +36,8 @@ added without changing the main API.
 - [x] Encoding, decoding, and comparator traits
 - [x] `Bytes`, `Str`, `Unit`, and integer codecs
 - [x] Public API skeleton for environments, databases, and transactions
-- [ ] Storage engine
+- [x] On-disk meta format and environment lifecycle
+- [ ] B+tree and typed database operations
 - [ ] Read/write transactions and cursors
 - [ ] Ordered, range, prefix, and reverse iterators
 - [ ] Serde-based codecs behind features

@@ -19,8 +19,14 @@ all-features = true
 [dependencies]
 anyhow.workspace = true
 byteorder.workspace = true
+crc32c.workspace = true
+fs4.workspace = true
+memmap2.workspace = true
 tsubame-traits.workspace = true
 tsubame-types.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
