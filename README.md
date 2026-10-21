@@ -8,8 +8,8 @@ inspired by [heed].
 > [!WARNING]
 > Tsubame is under construction. The environment format, B+tree, transactions,
 > typed operations, named databases, crash-safe commit records, and ordered
-> forward iteration work. Range, prefix, and reverse iterators are not
-> implemented yet.
+> iteration (forward, reverse, ranges, and prefixes) work. APIs may still change
+> before 1.0.
 
 ## Why Tsubame
 
@@ -44,7 +44,7 @@ added without changing the main API.
 - [x] Typed database operations on the unnamed database
 - [x] Named databases and catalog
 - [x] Ordered forward iteration
-- [ ] Range, prefix, and reverse iterators
+- [x] Range, prefix, and reverse iterators
 - [ ] Serde-based codecs behind features
 
 ## Target API

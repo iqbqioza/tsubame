@@ -1,6 +1,7 @@
-//! Ordered iteration over databases.
+//! Ordered iteration over database snapshots.
 
 use std::marker::PhantomData;
+use std::ops::Bound;
 
 use anyhow::{Result, bail, ensure};
 
@@ -9,43 +10,117 @@ use crate::storage::page::{LeafValue, Page, PageType};
 use crate::traits::BytesDecode;
 use crate::txn::RoTxn;
 
-/// The maximum branch depth followed by the iterator.
+/// The maximum branch depth followed by a cursor.
 const MAX_DEPTH: usize = 64;
 
-/// An ordered iterator over a database snapshot.
-///
-/// Yields key/value pairs in ascending key order. Keys and values borrow from
-/// the read transaction's snapshot, so the iterator must be dropped before the
-/// transaction.
-pub struct RoIter<'txn, 'env, KC, DC> {
+struct Cursor<'txn, 'env> {
     source: &'txn RoTxn<'env>,
     stack: Vec<(u64, usize)>,
     leaf: Option<u64>,
     slot: usize,
-    done: bool,
-    _codecs: PhantomData<(KC, DC)>,
 }
 
-impl<'txn, 'env, KC, DC> RoIter<'txn, 'env, KC, DC> {
-    pub(crate) fn new(source: &'txn RoTxn<'env>, root: u64) -> Result<Self> {
-        let mut iterator = Self {
+impl<'txn, 'env> Cursor<'txn, 'env> {
+    fn new(source: &'txn RoTxn<'env>) -> Self {
+        Self {
             source,
             stack: Vec::new(),
             leaf: None,
             slot: 0,
-            done: root == 0,
-            _codecs: PhantomData,
-        };
-
-        if root != 0 {
-            iterator.descend_leftmost(root)?;
         }
-
-        Ok(iterator)
     }
 
     fn page(&self, page_id: u64) -> Result<Page<'txn>> {
         self.source.page(page_id)
+    }
+
+    fn seek_first(&mut self, root: u64) -> Result<()> {
+        self.stack.clear();
+        self.leaf = None;
+        if root != 0 {
+            self.descend_leftmost(root)?;
+        }
+        Ok(())
+    }
+
+    fn seek_last(&mut self, root: u64) -> Result<()> {
+        self.stack.clear();
+        self.leaf = None;
+        if root != 0 {
+            self.descend_rightmost(root)?;
+        }
+        Ok(())
+    }
+
+    fn seek_forward(&mut self, root: u64, key: &[u8]) -> Result<()> {
+        self.stack.clear();
+        self.leaf = None;
+        if root == 0 {
+            return Ok(());
+        }
+
+        let mut page_id = root;
+        for _ in 0..MAX_DEPTH {
+            let page = self.page(page_id)?;
+            match page.page_type() {
+                PageType::Branch => {
+                    ensure!(
+                        page.slot_count() > 0,
+                        "branch page {page_id} has no children"
+                    );
+                    let index = page.branch_child_index(key)?;
+                    self.stack.push((page_id, index));
+                    page_id = page.child(index)?;
+                }
+                PageType::Leaf => {
+                    let slot = page.lower_bound(key)?;
+                    self.leaf = Some(page_id);
+                    self.slot = slot;
+                    if slot >= page.slot_count() {
+                        self.advance_leaf()?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
+        bail!("B+tree depth exceeded {MAX_DEPTH} during range seek")
+    }
+
+    fn seek_reverse(&mut self, root: u64, key: &[u8]) -> Result<()> {
+        self.stack.clear();
+        self.leaf = None;
+        if root == 0 {
+            return Ok(());
+        }
+
+        let mut page_id = root;
+        for _ in 0..MAX_DEPTH {
+            let page = self.page(page_id)?;
+            match page.page_type() {
+                PageType::Branch => {
+                    ensure!(
+                        page.slot_count() > 0,
+                        "branch page {page_id} has no children"
+                    );
+                    let index = page.branch_child_index(key)?;
+                    self.stack.push((page_id, index));
+                    page_id = page.child(index)?;
+                }
+                PageType::Leaf => {
+                    let slot = page.upper_bound(key)?;
+                    self.leaf = Some(page_id);
+                    if slot > 0 {
+                        self.slot = slot - 1;
+                    } else {
+                        self.retreat_leaf()?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
+        bail!("B+tree depth exceeded {MAX_DEPTH} during reverse seek")
     }
 
     fn descend_leftmost(&mut self, mut page_id: u64) -> Result<()> {
@@ -71,13 +146,37 @@ impl<'txn, 'env, KC, DC> RoIter<'txn, 'env, KC, DC> {
         bail!("B+tree depth exceeded {MAX_DEPTH} during iteration")
     }
 
+    fn descend_rightmost(&mut self, mut page_id: u64) -> Result<()> {
+        for _ in 0..MAX_DEPTH {
+            let page = self.page(page_id)?;
+            match page.page_type() {
+                PageType::Branch => {
+                    ensure!(
+                        page.slot_count() > 0,
+                        "branch page {page_id} has no children"
+                    );
+                    let index = page.slot_count() - 1;
+                    self.stack.push((page_id, index));
+                    page_id = page.child(index)?;
+                }
+                PageType::Leaf => {
+                    ensure!(page.slot_count() > 0, "leaf page {page_id} is empty");
+                    self.leaf = Some(page_id);
+                    self.slot = page.slot_count() - 1;
+                    return Ok(());
+                }
+            }
+        }
+
+        bail!("B+tree depth exceeded {MAX_DEPTH} during reverse iteration")
+    }
+
     fn advance_leaf(&mut self) -> Result<()> {
         self.leaf = None;
 
         loop {
             let depth = self.stack.len();
             if depth == 0 {
-                self.done = true;
                 return Ok(());
             }
 
@@ -95,42 +194,110 @@ impl<'txn, 'env, KC, DC> RoIter<'txn, 'env, KC, DC> {
         }
     }
 
-    fn next_inner(&mut self) -> Result<Option<(KC::DItem, DC::DItem)>>
-    where
-        KC: BytesDecode<'txn>,
-        DC: BytesDecode<'txn>,
-    {
+    fn retreat_leaf(&mut self) -> Result<()> {
+        self.leaf = None;
+
         loop {
-            if self.done {
-                return Ok(None);
+            let depth = self.stack.len();
+            if depth == 0 {
+                return Ok(());
             }
 
-            let Some(leaf_id) = self.leaf else {
-                self.done = true;
-                return Ok(None);
-            };
-
-            let page = self.page(leaf_id)?;
-            if self.slot < page.slot_count() {
-                let index = self.slot;
-                self.slot += 1;
-
-                let key = page.key(index)?;
-                let value = match page.leaf_value(index)? {
-                    LeafValue::Inline(value) => value,
-                    LeafValue::Overflow(reference) => self.source.overflow(reference)?,
-                };
-
-                let key = KC::bytes_decode(key)
-                    .map_err(|error| anyhow::anyhow!("key decoding failed: {error}"))?;
-                let value = DC::bytes_decode(value)
-                    .map_err(|error| anyhow::anyhow!("value decoding failed: {error}"))?;
-
-                return Ok(Some((key, value)));
+            let (branch_page, index) = self.stack[depth - 1];
+            if index > 0 {
+                let page = self.page(branch_page)?;
+                self.stack[depth - 1].1 = index - 1;
+                let child = page.child(index - 1)?;
+                return self.descend_rightmost(child);
             }
 
-            self.advance_leaf()?;
+            self.stack.pop();
         }
+    }
+
+    fn current(&self) -> Result<Option<(&'txn [u8], &'txn [u8])>> {
+        let Some(leaf_id) = self.leaf else {
+            return Ok(None);
+        };
+        let page = self.page(leaf_id)?;
+        if self.slot >= page.slot_count() {
+            return Ok(None);
+        }
+
+        let key = page.key(self.slot)?;
+        let value = match page.leaf_value(self.slot)? {
+            LeafValue::Inline(value) => value,
+            LeafValue::Overflow(reference) => self.source.overflow(reference)?,
+        };
+
+        Ok(Some((key, value)))
+    }
+
+    fn current_key(&self) -> Result<Option<&'txn [u8]>> {
+        let Some(leaf_id) = self.leaf else {
+            return Ok(None);
+        };
+        let page = self.page(leaf_id)?;
+        if self.slot >= page.slot_count() {
+            return Ok(None);
+        }
+        Ok(Some(page.key(self.slot)?))
+    }
+
+    fn next(&mut self) -> Result<()> {
+        let Some(leaf_id) = self.leaf else {
+            return Ok(());
+        };
+        let page = self.page(leaf_id)?;
+        if self.slot + 1 < page.slot_count() {
+            self.slot += 1;
+            Ok(())
+        } else {
+            self.advance_leaf()
+        }
+    }
+
+    fn prev(&mut self) -> Result<()> {
+        if self.leaf.is_none() {
+            return Ok(());
+        }
+        if self.slot > 0 {
+            self.slot -= 1;
+            Ok(())
+        } else {
+            self.retreat_leaf()
+        }
+    }
+}
+
+fn decode<'txn, KC, DC>(key: &'txn [u8], value: &'txn [u8]) -> Result<(KC::DItem, DC::DItem)>
+where
+    KC: BytesDecode<'txn>,
+    DC: BytesDecode<'txn>,
+{
+    let key =
+        KC::bytes_decode(key).map_err(|error| anyhow::anyhow!("key decoding failed: {error}"))?;
+    let value = DC::bytes_decode(value)
+        .map_err(|error| anyhow::anyhow!("value decoding failed: {error}"))?;
+    Ok((key, value))
+}
+
+/// An ordered iterator over a database snapshot.
+///
+/// Yields key/value pairs in ascending key order.
+pub struct RoIter<'txn, 'env, KC, DC> {
+    cursor: Cursor<'txn, 'env>,
+    _codecs: PhantomData<(KC, DC)>,
+}
+
+impl<'txn, 'env, KC, DC> RoIter<'txn, 'env, KC, DC> {
+    pub(crate) fn new(source: &'txn RoTxn<'env>, root: u64) -> Result<Self> {
+        let mut cursor = Cursor::new(source);
+        cursor.seek_first(root)?;
+        Ok(Self {
+            cursor,
+            _codecs: PhantomData,
+        })
     }
 }
 
@@ -142,13 +309,264 @@ where
     type Item = Result<(KC::DItem, DC::DItem)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.next_inner() {
-            Ok(Some(item)) => Some(Ok(item)),
-            Ok(None) => None,
+        let current = match self.cursor.current() {
+            Ok(Some(current)) => current,
+            Ok(None) => return None,
             Err(error) => {
-                self.done = true;
-                Some(Err(error))
+                self.cursor.leaf = None;
+                return Some(Err(error));
+            }
+        };
+
+        let item = decode::<KC, DC>(current.0, current.1);
+        if let Err(error) = self.cursor.next() {
+            self.cursor.leaf = None;
+            return Some(Err(error));
+        }
+        Some(item)
+    }
+}
+
+/// An ordered reverse iterator over a database snapshot.
+///
+/// Yields key/value pairs in descending key order.
+pub struct RoRevIter<'txn, 'env, KC, DC> {
+    cursor: Cursor<'txn, 'env>,
+    _codecs: PhantomData<(KC, DC)>,
+}
+
+impl<'txn, 'env, KC, DC> RoRevIter<'txn, 'env, KC, DC> {
+    pub(crate) fn new(source: &'txn RoTxn<'env>, root: u64) -> Result<Self> {
+        let mut cursor = Cursor::new(source);
+        cursor.seek_last(root)?;
+        Ok(Self {
+            cursor,
+            _codecs: PhantomData,
+        })
+    }
+}
+
+impl<'txn, 'env, KC, DC> Iterator for RoRevIter<'txn, 'env, KC, DC>
+where
+    KC: BytesDecode<'txn>,
+    DC: BytesDecode<'txn>,
+{
+    type Item = Result<(KC::DItem, DC::DItem)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let current = match self.cursor.current() {
+            Ok(Some(current)) => current,
+            Ok(None) => return None,
+            Err(error) => {
+                self.cursor.leaf = None;
+                return Some(Err(error));
+            }
+        };
+
+        let item = decode::<KC, DC>(current.0, current.1);
+        if let Err(error) = self.cursor.prev() {
+            self.cursor.leaf = None;
+            return Some(Err(error));
+        }
+        Some(item)
+    }
+}
+
+/// A forward range iterator.
+pub struct RoRange<'txn, 'env, KC, DC> {
+    cursor: Cursor<'txn, 'env>,
+    end: Bound<Vec<u8>>,
+    done: bool,
+    _codecs: PhantomData<(KC, DC)>,
+}
+
+impl<'txn, 'env, KC, DC> RoRange<'txn, 'env, KC, DC> {
+    pub(crate) fn new(
+        source: &'txn RoTxn<'env>,
+        root: u64,
+        start: Bound<Vec<u8>>,
+        end: Bound<Vec<u8>>,
+    ) -> Result<Self> {
+        let mut cursor = Cursor::new(source);
+        match start {
+            Bound::Unbounded => cursor.seek_first(root)?,
+            Bound::Included(key) => cursor.seek_forward(root, &key)?,
+            Bound::Excluded(key) => {
+                cursor.seek_forward(root, &key)?;
+                if cursor.current_key()?.is_some_and(|current| current == key) {
+                    cursor.next()?;
+                }
             }
         }
+
+        Ok(Self {
+            cursor,
+            end,
+            done: false,
+            _codecs: PhantomData,
+        })
     }
+
+    fn past_end(&self, key: &[u8]) -> bool {
+        match &self.end {
+            Bound::Unbounded => false,
+            Bound::Included(end) => key > end.as_slice(),
+            Bound::Excluded(end) => key >= end.as_slice(),
+        }
+    }
+}
+
+impl<'txn, 'env, KC, DC> Iterator for RoRange<'txn, 'env, KC, DC>
+where
+    KC: BytesDecode<'txn>,
+    DC: BytesDecode<'txn>,
+{
+    type Item = Result<(KC::DItem, DC::DItem)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+
+        let key = match self.cursor.current_key() {
+            Ok(Some(key)) => key,
+            Ok(None) => return None,
+            Err(error) => {
+                self.done = true;
+                return Some(Err(error));
+            }
+        };
+
+        if self.past_end(key) {
+            self.done = true;
+            return None;
+        }
+
+        let Some((key, value)) = (match self.cursor.current() {
+            Ok(current) => current,
+            Err(error) => {
+                self.done = true;
+                return Some(Err(error));
+            }
+        }) else {
+            self.done = true;
+            return None;
+        };
+
+        let item = decode::<KC, DC>(key, value);
+        if let Err(error) = self.cursor.next() {
+            self.done = true;
+            return Some(Err(error));
+        }
+        Some(item)
+    }
+}
+
+/// A reverse range iterator.
+pub struct RoRevRange<'txn, 'env, KC, DC> {
+    cursor: Cursor<'txn, 'env>,
+    start: Bound<Vec<u8>>,
+    done: bool,
+    _codecs: PhantomData<(KC, DC)>,
+}
+
+impl<'txn, 'env, KC, DC> RoRevRange<'txn, 'env, KC, DC> {
+    pub(crate) fn new(
+        source: &'txn RoTxn<'env>,
+        root: u64,
+        start: Bound<Vec<u8>>,
+        end: Bound<Vec<u8>>,
+    ) -> Result<Self> {
+        let mut cursor = Cursor::new(source);
+        match end {
+            Bound::Unbounded => cursor.seek_last(root)?,
+            Bound::Included(key) => cursor.seek_reverse(root, &key)?,
+            Bound::Excluded(key) => {
+                cursor.seek_reverse(root, &key)?;
+                if cursor.current_key()?.is_some_and(|current| current == key) {
+                    cursor.prev()?;
+                }
+            }
+        }
+
+        Ok(Self {
+            cursor,
+            start,
+            done: false,
+            _codecs: PhantomData,
+        })
+    }
+
+    fn before_start(&self, key: &[u8]) -> bool {
+        match &self.start {
+            Bound::Unbounded => false,
+            Bound::Included(start) => key < start.as_slice(),
+            Bound::Excluded(start) => key <= start.as_slice(),
+        }
+    }
+}
+
+impl<'txn, 'env, KC, DC> Iterator for RoRevRange<'txn, 'env, KC, DC>
+where
+    KC: BytesDecode<'txn>,
+    DC: BytesDecode<'txn>,
+{
+    type Item = Result<(KC::DItem, DC::DItem)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+
+        let key = match self.cursor.current_key() {
+            Ok(Some(key)) => key,
+            Ok(None) => return None,
+            Err(error) => {
+                self.done = true;
+                return Some(Err(error));
+            }
+        };
+
+        if self.before_start(key) {
+            self.done = true;
+            return None;
+        }
+
+        let Some((key, value)) = (match self.cursor.current() {
+            Ok(current) => current,
+            Err(error) => {
+                self.done = true;
+                return Some(Err(error));
+            }
+        }) else {
+            self.done = true;
+            return None;
+        };
+
+        let item = decode::<KC, DC>(key, value);
+        if let Err(error) = self.cursor.prev() {
+            self.done = true;
+            return Some(Err(error));
+        }
+        Some(item)
+    }
+}
+
+/// A prefix iterator, implemented as a forward range.
+pub type RoPrefix<'txn, 'env, KC, DC> = RoRange<'txn, 'env, KC, DC>;
+
+/// A reverse prefix iterator, implemented as a reverse range.
+pub type RoRevPrefix<'txn, 'env, KC, DC> = RoRevRange<'txn, 'env, KC, DC>;
+
+/// Returns the exclusive upper bound for a byte prefix, if one exists.
+pub(crate) fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    for index in (0..end.len()).rev() {
+        if end[index] != 0xFF {
+            end[index] += 1;
+            end.truncate(index + 1);
+            return Some(end);
+        }
+    }
+    None
 }

@@ -6,13 +6,16 @@
 
 use std::fmt;
 use std::marker::PhantomData;
+use std::ops::Bound;
 use std::sync::Arc;
 
 use anyhow::ensure;
 
 use crate::Result;
 use crate::env::EnvInner;
-use crate::iter::RoIter;
+use crate::iter::{
+    RoIter, RoPrefix, RoRange, RoRevIter, RoRevPrefix, RoRevRange, prefix_successor,
+};
 use crate::storage::btree;
 use crate::storage::page::MAX_KEY_SIZE;
 use crate::traits::{BoxedError, BytesDecode, BytesEncode};
@@ -49,6 +52,14 @@ impl<KC, DC> Database<KC, DC> {
             kind,
             _codecs: PhantomData,
         }
+    }
+
+    fn resolve_root(&self, txn: &RoTxn<'_>) -> Result<u64> {
+        ensure!(
+            txn.belongs_to(&self.env),
+            "transaction belongs to a different environment"
+        );
+        txn.root_for(&self.kind)
     }
 
     /// Returns the value associated with `key`, if it exists.
@@ -94,12 +105,120 @@ impl<KC, DC> Database<KC, DC> {
         KC: BytesDecode<'txn>,
         DC: BytesDecode<'txn>,
     {
-        ensure!(
-            txn.belongs_to(&self.env),
-            "transaction belongs to a different environment"
-        );
-        let root = txn.root_for(&self.kind)?;
+        let root = self.resolve_root(txn)?;
         RoIter::new(txn, root)
+    }
+
+    /// Returns a reverse iterator over all entries in descending key order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be resolved in the transaction
+    /// snapshot.
+    pub fn rev_iter<'txn, 'env>(
+        &self,
+        txn: &'txn RoTxn<'env>,
+    ) -> Result<RoRevIter<'txn, 'env, KC, DC>>
+    where
+        KC: BytesDecode<'txn>,
+        DC: BytesDecode<'txn>,
+    {
+        let root = self.resolve_root(txn)?;
+        RoRevIter::new(txn, root)
+    }
+
+    /// Returns a forward iterator over the requested key range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a bound cannot be encoded, or if the database cannot
+    /// be resolved in the transaction snapshot.
+    pub fn range<'a, 'txn, 'env>(
+        &self,
+        txn: &'txn RoTxn<'env>,
+        start: Bound<&'a KC::EItem>,
+        end: Bound<&'a KC::EItem>,
+    ) -> Result<RoRange<'txn, 'env, KC, DC>>
+    where
+        KC: BytesEncode<'a> + BytesDecode<'txn>,
+        DC: BytesDecode<'txn>,
+    {
+        let root = self.resolve_root(txn)?;
+        let start = encode_bound::<KC>(start)?;
+        let end = encode_bound::<KC>(end)?;
+        RoRange::new(txn, root, start, end)
+    }
+
+    /// Returns a reverse iterator over the requested key range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a bound cannot be encoded, or if the database cannot
+    /// be resolved in the transaction snapshot.
+    pub fn rev_range<'a, 'txn, 'env>(
+        &self,
+        txn: &'txn RoTxn<'env>,
+        start: Bound<&'a KC::EItem>,
+        end: Bound<&'a KC::EItem>,
+    ) -> Result<RoRevRange<'txn, 'env, KC, DC>>
+    where
+        KC: BytesEncode<'a> + BytesDecode<'txn>,
+        DC: BytesDecode<'txn>,
+    {
+        let root = self.resolve_root(txn)?;
+        let start = encode_bound::<KC>(start)?;
+        let end = encode_bound::<KC>(end)?;
+        RoRevRange::new(txn, root, start, end)
+    }
+
+    /// Returns a forward iterator over all keys with the given prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the prefix cannot be encoded, or if the database
+    /// cannot be resolved in the transaction snapshot.
+    pub fn prefix_iter<'a, 'txn, 'env>(
+        &self,
+        txn: &'txn RoTxn<'env>,
+        prefix: &'a KC::EItem,
+    ) -> Result<RoPrefix<'txn, 'env, KC, DC>>
+    where
+        KC: BytesEncode<'a> + BytesDecode<'txn>,
+        DC: BytesDecode<'txn>,
+    {
+        let root = self.resolve_root(txn)?;
+        let start = KC::bytes_encode(prefix)
+            .map_err(|error| codec_error("prefix encoding failed", error))?
+            .into_owned();
+        let end = prefix_successor(&start)
+            .map(Bound::Excluded)
+            .unwrap_or(Bound::Unbounded);
+        RoRange::new(txn, root, Bound::Included(start), end)
+    }
+
+    /// Returns a reverse iterator over all keys with the given prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the prefix cannot be encoded, or if the database
+    /// cannot be resolved in the transaction snapshot.
+    pub fn rev_prefix_iter<'a, 'txn, 'env>(
+        &self,
+        txn: &'txn RoTxn<'env>,
+        prefix: &'a KC::EItem,
+    ) -> Result<RoRevPrefix<'txn, 'env, KC, DC>>
+    where
+        KC: BytesEncode<'a> + BytesDecode<'txn>,
+        DC: BytesDecode<'txn>,
+    {
+        let root = self.resolve_root(txn)?;
+        let start = KC::bytes_encode(prefix)
+            .map_err(|error| codec_error("prefix encoding failed", error))?
+            .into_owned();
+        let end = prefix_successor(&start)
+            .map(Bound::Excluded)
+            .unwrap_or(Bound::Unbounded);
+        RoRevRange::new(txn, root, Bound::Included(start), end)
     }
 
     /// Stores `data` under `key`.
@@ -215,5 +334,24 @@ impl<KC, DC> fmt::Debug for Database<KC, DC> {
             .field("key_codec", &std::any::type_name::<KC>())
             .field("data_codec", &std::any::type_name::<DC>())
             .finish()
+    }
+}
+
+fn encode_bound<'a, KC>(bound: Bound<&'a KC::EItem>) -> Result<Bound<Vec<u8>>>
+where
+    KC: BytesEncode<'a>,
+{
+    match bound {
+        Bound::Included(item) => Ok(Bound::Included(
+            KC::bytes_encode(item)
+                .map_err(|error| codec_error("range bound encoding failed", error))?
+                .into_owned(),
+        )),
+        Bound::Excluded(item) => Ok(Bound::Excluded(
+            KC::bytes_encode(item)
+                .map_err(|error| codec_error("range bound encoding failed", error))?
+                .into_owned(),
+        )),
+        Bound::Unbounded => Ok(Bound::Unbounded),
     }
 }
