@@ -69,6 +69,7 @@ impl<KC, DC> Database<KC, DC> {
     ///
     /// Returns an error if the key cannot be encoded or the stored value
     /// cannot be decoded.
+    #[inline]
     pub fn get<'a, 'txn>(
         &self,
         txn: &'txn RoTxn<'_>,

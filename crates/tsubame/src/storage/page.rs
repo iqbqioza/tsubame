@@ -81,6 +81,31 @@ impl<'a> Page<'a> {
         Self::parse_inner(bytes, expected_id, false, false)
     }
 
+    /// Parses a page whose complete contents were already validated.
+    ///
+    /// This reads only the page kind and slot count. The caller must have
+    /// validated this page with [`Page::parse`] in this process and must not
+    /// have observed external modifications to the mapped file.
+    #[inline]
+    pub(crate) fn parse_verified(bytes: &'a [u8]) -> Result<Self> {
+        ensure!(
+            bytes.len() == PAGE_SIZE,
+            "page has {} bytes, expected {PAGE_SIZE}",
+            bytes.len()
+        );
+        let page_type = PageType::from_byte(bytes[4])?;
+        let slot_count = LittleEndian::read_u16(&bytes[6..8]) as usize;
+        ensure!(
+            slot_count <= (PAGE_SIZE - HEADER_SIZE) / SLOT_SIZE,
+            "page has too many slots: {slot_count}"
+        );
+        Ok(Self {
+            bytes,
+            page_type,
+            slot_count,
+        })
+    }
+
     fn parse_inner(
         bytes: &'a [u8],
         expected_id: Option<u64>,
@@ -219,6 +244,7 @@ impl<'a> Page<'a> {
     }
 
     /// Returns the page type.
+    #[inline]
     pub(crate) fn page_type(&self) -> PageType {
         self.page_type
     }
@@ -371,17 +397,20 @@ impl<'a> Page<'a> {
     }
 
     /// Returns the number of slots in the page.
+    #[inline]
     pub(crate) fn slot_count(&self) -> usize {
         self.slot_count
     }
 
     /// Returns the key stored in a slot.
+    #[inline]
     pub(crate) fn key(&self, index: usize) -> Result<&'a [u8]> {
         let (offset, key_len, _, _) = self.slot(index)?;
         Ok(&self.bytes[offset..offset + key_len])
     }
 
     /// Returns the value stored in a leaf slot.
+    #[inline]
     pub(crate) fn value(&self, index: usize) -> Result<&'a [u8]> {
         let (offset, key_len, value_len, _) = self.slot(index)?;
         let start = offset + key_len;
@@ -389,6 +418,7 @@ impl<'a> Page<'a> {
     }
 
     /// Returns the child page ID stored in a branch slot.
+    #[inline]
     pub(crate) fn child(&self, index: usize) -> Result<u64> {
         let (offset, key_len, value_len, _) = self.slot(index)?;
         ensure!(
@@ -400,12 +430,14 @@ impl<'a> Page<'a> {
     }
 
     /// Returns whether a leaf slot points to an overflow extent.
+    #[inline]
     pub(crate) fn is_overflow(&self, index: usize) -> Result<bool> {
         let (_, _, _, flags) = self.slot(index)?;
         Ok(flags & FLAG_OVERFLOW != 0)
     }
 
     /// Returns the slot index containing `key`, if it exists.
+    #[inline]
     pub(crate) fn leaf_index(&self, key: &[u8]) -> Result<Option<usize>> {
         ensure!(
             self.page_type == PageType::Leaf,
@@ -420,7 +452,23 @@ impl<'a> Page<'a> {
         }
     }
 
+    /// Returns the key and value of a leaf slot with one slot walk.
+    #[inline]
+    pub(crate) fn leaf_entry(&self, index: usize) -> Result<(&'a [u8], LeafValue<'a>)> {
+        let (offset, key_len, value_len, flags) = self.slot(index)?;
+        let key = &self.bytes[offset..offset + key_len];
+        let value_start = offset + key_len;
+        let value_bytes = &self.bytes[value_start..value_start + value_len];
+        let value = if flags & FLAG_OVERFLOW != 0 {
+            LeafValue::Overflow(OverflowRef::decode(value_bytes)?)
+        } else {
+            LeafValue::Inline(value_bytes)
+        };
+        Ok((key, value))
+    }
+
     /// Returns the value stored in a leaf slot.
+    #[inline]
     pub(crate) fn leaf_value(&self, index: usize) -> Result<LeafValue<'a>> {
         if self.is_overflow(index)? {
             Ok(LeafValue::Overflow(OverflowRef::decode(
@@ -432,12 +480,14 @@ impl<'a> Page<'a> {
     }
 
     /// Returns the child to follow for `key` in a branch page.
+    #[inline]
     pub(crate) fn branch_child(&self, key: &[u8]) -> Result<u64> {
         let index = self.branch_child_index(key)?;
         self.child(index)
     }
 
     /// Returns the child slot index to follow for `key` in a branch page.
+    #[inline]
     pub(crate) fn branch_child_index(&self, key: &[u8]) -> Result<usize> {
         ensure!(
             self.page_type == PageType::Branch,
@@ -461,6 +511,7 @@ impl<'a> Page<'a> {
     }
 
     /// Returns the first slot whose key is `>= key`.
+    #[inline]
     pub(crate) fn lower_bound(&self, key: &[u8]) -> Result<usize> {
         let mut left = 0;
         let mut right = self.slot_count;
@@ -491,6 +542,7 @@ impl<'a> Page<'a> {
     }
 
     /// Reads the raw slot fields.
+    #[inline]
     fn slot(&self, index: usize) -> Result<(usize, usize, usize, u8)> {
         ensure!(
             index < self.slot_count,

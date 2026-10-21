@@ -24,6 +24,9 @@ use crate::storage::{PAGE_SIZE, io};
 /// build the tree bottom-up instead of inserting one path at a time.
 const BULK_LOAD_THRESHOLD: usize = 1024;
 
+/// Maximum number of contiguous overlay pages combined into one write.
+const WRITE_BATCH_PAGES: u64 = 256;
+
 /// Keep small page overlays in a vector to avoid a B-tree node per page.
 const SMALL_OVERLAY_CAPACITY: usize = 8;
 
@@ -184,6 +187,7 @@ impl<'env> RoTxn<'env> {
         Self { env, meta }
     }
 
+    #[inline]
     pub(crate) fn root_for(&self, kind: &DatabaseKind) -> Result<u64> {
         match kind {
             DatabaseKind::Unnamed => Ok(self.meta.unnamed_root),
@@ -222,6 +226,7 @@ impl Drop for RoTxn<'_> {
 }
 
 impl PageSource for RoTxn<'_> {
+    #[inline]
     fn page(&self, page_id: u64) -> Result<Page<'_>> {
         self.env.inner.read_page(page_id, &self.meta)
     }
@@ -644,16 +649,42 @@ impl<'env> RwTxn<'env> {
     fn write_and_sync(&self, new_meta: &Meta) -> Result<()> {
         let data = &self.env.inner.data;
 
-        for (page_id, page) in self.overlay.iter() {
+        let mut pages = self.overlay.iter().peekable();
+        while let Some((&start_page, first)) = pages.next() {
             ensure!(
-                *page_id >= 2 && *page_id < self.next_page,
-                "page {page_id} is outside the transaction allocation range"
+                start_page >= 2 && start_page < self.next_page,
+                "page {start_page} is outside the transaction allocation range"
             );
-            let offset = page_id
+
+            let offset = start_page
                 .checked_mul(PAGE_SIZE as u64)
                 .context("page offset overflow")?;
-            io::write_all_at(data, page, offset)
-                .with_context(|| format!("failed to write page {page_id}"))?;
+            let mut end_page = start_page;
+            let mut batch = None;
+            while end_page - start_page + 1 < WRITE_BATCH_PAGES {
+                let Some(&(next_page, next)) = pages.peek() else {
+                    break;
+                };
+                if *next_page != end_page + 1 {
+                    break;
+                }
+                let buffer = batch.get_or_insert_with(|| {
+                    let mut buffer = Vec::with_capacity(PAGE_SIZE * 2);
+                    buffer.extend_from_slice(first);
+                    buffer
+                });
+                buffer.extend_from_slice(next);
+                pages.next();
+                end_page = *next_page;
+            }
+
+            if let Some(batch) = batch {
+                io::write_all_at(data, &batch, offset)
+                    .with_context(|| format!("failed to write pages {start_page}..={end_page}"))?;
+            } else {
+                io::write_all_at(data, first, offset)
+                    .with_context(|| format!("failed to write page {start_page}"))?;
+            }
         }
 
         for (start_page, bytes) in &self.extents {

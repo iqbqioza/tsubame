@@ -65,6 +65,7 @@ macro_rules! define_integer {
         impl<O: ByteOrder> BytesEncode<'_> for $name<O> {
             type EItem = $native;
 
+            #[inline]
             fn bytes_encode(item: &Self::EItem) -> Result<Cow<'_, [u8]>, BoxedError> {
                 let mut buf = [0u8; $size];
                 O::$write(&mut buf, *item);
@@ -75,6 +76,7 @@ macro_rules! define_integer {
         impl<O: ByteOrder> BytesDecode<'_> for $name<O> {
             type DItem = $native;
 
+            #[inline]
             fn bytes_decode(bytes: &[u8]) -> Result<Self::DItem, BoxedError> {
                 if bytes.len() != $size {
                     return Err(invalid_length($size, bytes.len()).into());
