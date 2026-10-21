@@ -25,6 +25,11 @@ memmap2.workspace = true
 tsubame-traits.workspace = true
 tsubame-types.workspace = true
 
+[features]
+default = []
+serde-bincode = ["tsubame-types/serde-bincode"]
+serde-json = ["tsubame-types/serde-json"]
+
 [dev-dependencies]
 tempfile.workspace = true
 

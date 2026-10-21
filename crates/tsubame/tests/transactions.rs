@@ -473,6 +473,42 @@ fn reverse_iterates_many_leaves() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "serde-json")]
+#[test]
+fn serde_json_codec_round_trips_in_a_database() -> Result<()> {
+    use tsubame::types::SerdeJson;
+
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, SerdeJson<String>>(&mut wtxn, None)?;
+    db.put(&mut wtxn, "key", &"value".to_owned())?;
+    wtxn.commit()?;
+
+    let rtxn = env.read_txn()?;
+    assert_eq!(db.get(&rtxn, "key")?, Some("value".to_owned()));
+
+    Ok(())
+}
+
+#[cfg(feature = "serde-bincode")]
+#[test]
+fn serde_bincode_codec_round_trips_in_a_database() -> Result<()> {
+    use tsubame::types::SerdeBincode;
+
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, SerdeBincode<String>>(&mut wtxn, None)?;
+    db.put(&mut wtxn, "key", &"value".to_owned())?;
+    wtxn.commit()?;
+
+    let rtxn = env.read_txn()?;
+    assert_eq!(db.get(&rtxn, "key")?, Some("value".to_owned()));
+
+    Ok(())
+}
+
 #[test]
 fn max_dbs_is_enforced() -> Result<()> {
     let dir = tempdir()?;
