@@ -14,7 +14,7 @@ use crate::env::{Committed, Env, EnvInner};
 use crate::storage::btree;
 use crate::storage::btree::PageSource;
 use crate::storage::commit::{self, CommitEntry, Descriptor};
-use crate::storage::meta::{self, Meta};
+use crate::storage::meta::{self, InlineCommit, Meta};
 use crate::storage::overflow::{self, OverflowRef};
 use crate::storage::page::Page;
 use crate::storage::store::PageStore;
@@ -167,10 +167,29 @@ impl<'env> RwTxn<'env> {
             .collect();
         let txn_id = self.txn_id;
         let descriptor = commit::build(&mut self, txn_id, &entries)?;
-        let (commit_record, commit_page) = match descriptor {
-            Descriptor::None => (0, 0),
-            Descriptor::Page(page_id) => (0, page_id),
-            Descriptor::Chain(page_id) => (page_id, 0),
+        let mut inline = [InlineCommit::default(); meta::INLINE_COMMIT_CAPACITY];
+        let (commit_record, commit_page, inline_count) = match descriptor {
+            Descriptor::None => (0, 0, 0),
+            Descriptor::Page(page_id) => (0, page_id, 0),
+            Descriptor::Inline(entries) => {
+                for (slot, entry) in entries.iter().enumerate() {
+                    inline[slot] = match *entry {
+                        CommitEntry::Page(page_id) => InlineCommit {
+                            page_id,
+                            page_count: 0,
+                        },
+                        CommitEntry::Extent {
+                            start_page,
+                            page_count,
+                        } => InlineCommit {
+                            page_id: start_page,
+                            page_count,
+                        },
+                    };
+                }
+                (0, 0, entries.len() as u32)
+            }
+            Descriptor::Chain(page_id) => (page_id, 0, 0),
         };
 
         let new_meta = Meta {
@@ -182,6 +201,8 @@ impl<'env> RwTxn<'env> {
             flags: 0,
             commit_record,
             commit_page,
+            inline_count,
+            inline,
         };
         new_meta.validate()?;
 
