@@ -2,6 +2,7 @@
 
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
+use std::ops::Bound;
 use std::sync::Arc;
 use std::thread;
 
@@ -356,6 +357,118 @@ fn iteration_keeps_the_snapshot() -> Result<()> {
     let (key, value) = iter.next().unwrap()?;
     assert_eq!((key, value), ("key", "old"));
     assert!(iter.next().is_none());
+
+    Ok(())
+}
+
+#[test]
+fn ranges_respect_bounds() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+    for key in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+        db.put(&mut wtxn, key, key)?;
+    }
+    wtxn.commit()?;
+
+    let rtxn = env.read_txn()?;
+    let mut seen = Vec::new();
+    for item in db.range(&rtxn, Bound::Included("c"), Bound::Excluded("g"))? {
+        seen.push(item?.0.to_owned());
+    }
+    assert_eq!(seen, ["c", "d", "e", "f"]);
+
+    seen.clear();
+    for item in db.range(&rtxn, Bound::Excluded("c"), Bound::Included("f"))? {
+        seen.push(item?.0.to_owned());
+    }
+    assert_eq!(seen, ["d", "e", "f"]);
+
+    seen.clear();
+    for item in db.range(&rtxn, Bound::Unbounded, Bound::Excluded("c"))? {
+        seen.push(item?.0.to_owned());
+    }
+    assert_eq!(seen, ["a", "b"]);
+
+    Ok(())
+}
+
+#[test]
+fn prefix_iteration_filters_keys() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+    for key in ["a", "aa", "ab", "ac", "b", "ba"] {
+        db.put(&mut wtxn, key, key)?;
+    }
+    wtxn.commit()?;
+
+    let rtxn = env.read_txn()?;
+    let mut seen = Vec::new();
+    for item in db.prefix_iter(&rtxn, "a")? {
+        seen.push(item?.0.to_owned());
+    }
+    assert_eq!(seen, ["a", "aa", "ab", "ac"]);
+
+    seen.clear();
+    for item in db.rev_prefix_iter(&rtxn, "a")? {
+        seen.push(item?.0.to_owned());
+    }
+    assert_eq!(seen, ["ac", "ab", "aa", "a"]);
+
+    Ok(())
+}
+
+#[test]
+fn reverse_iteration_and_ranges() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+    for key in ["a", "b", "c", "d", "e", "f"] {
+        db.put(&mut wtxn, key, key)?;
+    }
+    wtxn.commit()?;
+
+    let rtxn = env.read_txn()?;
+    let mut seen = Vec::new();
+    for item in db.rev_iter(&rtxn)? {
+        seen.push(item?.0.to_owned());
+    }
+    assert_eq!(seen, ["f", "e", "d", "c", "b", "a"]);
+
+    seen.clear();
+    for item in db.rev_range(&rtxn, Bound::Included("b"), Bound::Excluded("f"))? {
+        seen.push(item?.0.to_owned());
+    }
+    assert_eq!(seen, ["e", "d", "c", "b"]);
+
+    Ok(())
+}
+
+#[test]
+fn reverse_iterates_many_leaves() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+    for i in 0..1_000u32 {
+        let key = format!("key-{i:04}");
+        db.put(&mut wtxn, &key, &key)?;
+    }
+    wtxn.commit()?;
+
+    let rtxn = env.read_txn()?;
+    let mut expected = 999i32;
+    for item in db.rev_iter(&rtxn)? {
+        let (key, value) = item?;
+        assert_eq!(key, format!("key-{expected:04}"));
+        assert_eq!(value, key);
+        expected -= 1;
+    }
+    assert_eq!(expected, -1);
 
     Ok(())
 }

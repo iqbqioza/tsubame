@@ -475,6 +475,21 @@ impl<'a> Page<'a> {
         Ok(left)
     }
 
+    /// Returns the first slot whose key is `> key`.
+    pub(crate) fn upper_bound(&self, key: &[u8]) -> Result<usize> {
+        let mut left = 0;
+        let mut right = self.slot_count;
+        while left < right {
+            let mid = (left + right) / 2;
+            if self.key(mid)? <= key {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        Ok(left)
+    }
+
     /// Reads the raw slot fields.
     fn slot(&self, index: usize) -> Result<(usize, usize, usize, u8)> {
         ensure!(
