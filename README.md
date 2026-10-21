@@ -48,6 +48,7 @@ added without changing the main API.
 - [x] Write transaction iteration with pending writes
 - [x] Serde-based codecs behind features
 - [x] Cross-transaction page reuse within a process
+- [x] Lazy free-list reconstruction after reopening
 - [x] Offline compaction
 
 ## Codec features
@@ -109,9 +110,11 @@ The examples use a temporary directory and clean up after themselves.
   them. This keeps long-running update workloads from growing the file
   indefinitely. Commit-record pages are recycled with one additional
   generation of delay.
-- The free list is in memory. After reopening, pages that were free in the
-  previous process are not reused automatically; offline compaction reclaims
-  them:
+- The free list is in memory. The first write transaction after reopening
+  rebuilds it by scanning pages reachable from the latest commit, so pages
+  freed by a previous process become reusable without waiting for compaction.
+  Read-only reopening does not scan the tree. Offline compaction is still
+  available:
   ```rust
   Env::compact("/path/to/env")?;
   ```

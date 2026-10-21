@@ -10,6 +10,8 @@ All notable changes to this project are documented here.
   commit become reusable after both recoverable meta snapshots no longer
   reference them and no older reader can observe them. Commit-record pages are
   recycled as well.
+- Lazy free-list reconstruction on the first write after reopening, so pages
+  freed by a previous process become reusable without a compaction.
 - Clearing a database now releases its old tree pages for reuse.
 
 ### Fixed
@@ -19,9 +21,9 @@ All notable changes to this project are documented here.
 
 ### Notes
 
-- The free list is maintained in memory. Reopening an environment starts with
-  an empty free list; run `Env::compact` to reclaim pages left free by a
-  previous process.
+- The free list is maintained in memory. Read-only reopening does not scan the
+  tree; the first write transaction reconstructs the free list from the latest
+  reachable state.
 
 ## [0.1.0] - 2026-10-21
 

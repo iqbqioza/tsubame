@@ -4,7 +4,7 @@
 //! database belongs to exactly one environment, and transactions are created
 //! from the environment.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -20,7 +20,7 @@ use crate::database::{Database, DatabaseKind};
 use crate::storage::commit;
 use crate::storage::meta::{self, Meta};
 use crate::storage::overflow::{self, OverflowRef};
-use crate::storage::page::Page;
+use crate::storage::page::{LeafValue, Page, PageType};
 use crate::storage::{PAGE_SIZE, io, mmap};
 use crate::txn::{RoTxn, RwTxn};
 
@@ -78,7 +78,9 @@ impl Env {
 
     /// Starts a read-write transaction.
     ///
-    /// Only one read-write transaction can be active at a time.
+    /// Only one read-write transaction can be active at a time. The first
+    /// write transaction after opening scans the reachable pages once to
+    /// reconstruct the free list.
     pub fn write_txn(&self) -> Result<RwTxn<'_>> {
         self.inner.ensure_usable()?;
         let writer = self
@@ -87,6 +89,7 @@ impl Env {
             .lock()
             .map_err(|_| anyhow::anyhow!("transaction lock is poisoned"))?;
         let committed = self.inner.read_committed();
+        self.inner.ensure_free_pool();
         RwTxn::new(self, writer, committed)
     }
 
@@ -208,6 +211,179 @@ pub(crate) struct FreeExtent {
     pub(crate) freed_txn: u64,
 }
 
+const RECONSTRUCT_MAX_DEPTH: usize = 64;
+
+/// Rebuilds the in-memory free list from the pages reachable in a snapshot.
+///
+/// The reconstruction deliberately does not mark commit-record pages as live:
+/// they are unreachable from the B+tree and are returned to the pool with the
+/// snapshot generation plus one, which is late enough for both recoverable
+/// meta pages to have stopped referring to them.
+struct FreeListReconstructor<'a> {
+    mmap: &'a [u8],
+    meta: &'a Meta,
+    visited: BTreeSet<u64>,
+    live: Vec<(u64, u64)>,
+    named_roots: Vec<u64>,
+}
+
+impl FreeListReconstructor<'_> {
+    fn page(&self, page_id: u64) -> Result<Page<'_>> {
+        ensure!(
+            page_id >= 2 && page_id < self.meta.page_count,
+            "page {page_id} is outside snapshot {}..{}",
+            2,
+            self.meta.page_count
+        );
+        let index = usize::try_from(page_id - 2).context("page ID is too large")?;
+        let start = index
+            .checked_mul(PAGE_SIZE)
+            .context("page offset overflow")?;
+        let end = start
+            .checked_add(PAGE_SIZE)
+            .context("page offset overflow")?;
+        ensure!(
+            end <= self.mmap.len(),
+            "page {page_id} is outside the mapped region"
+        );
+        Page::parse(&self.mmap[start..end], Some(page_id))
+    }
+
+    fn walk(&mut self, root: u64, catalog: bool, depth: usize) -> Result<()> {
+        if root == 0 {
+            return Ok(());
+        }
+        ensure!(
+            depth < RECONSTRUCT_MAX_DEPTH,
+            "tree exceeds the maximum depth during free-list reconstruction"
+        );
+        ensure!(
+            self.visited.insert(root),
+            "tree references page {root} more than once"
+        );
+
+        let mut children = Vec::new();
+        let mut overflows = Vec::new();
+        let mut roots = Vec::new();
+
+        {
+            let page = self.page(root)?;
+            match page.page_type() {
+                PageType::Branch => {
+                    for index in 0..page.slot_count() {
+                        children.push(page.child(index)?);
+                    }
+                }
+                PageType::Leaf => {
+                    for index in 0..page.slot_count() {
+                        match page.leaf_value(index)? {
+                            LeafValue::Overflow(reference) => {
+                                ensure!(!catalog, "catalog value is stored in an overflow extent");
+                                overflows.push((reference.start_page, reference.page_count));
+                            }
+                            LeafValue::Inline(value) if catalog => {
+                                ensure!(
+                                    value.len() == 8,
+                                    "catalog entry has {} bytes, expected 8",
+                                    value.len()
+                                );
+                                let mut root = [0u8; 8];
+                                root.copy_from_slice(value);
+                                let root = u64::from_le_bytes(root);
+                                if root != 0 {
+                                    roots.push(root);
+                                }
+                            }
+                            LeafValue::Inline(_) => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        self.live.push((root, root + 1));
+
+        for child in children {
+            self.walk(child, catalog, depth + 1)?;
+        }
+        for (start_page, pages) in overflows {
+            ensure!(pages > 0, "overflow extent has zero pages");
+            let end = start_page
+                .checked_add(pages)
+                .context("overflow extent page overflow")?;
+            ensure!(
+                start_page >= 2 && end <= self.meta.page_count,
+                "overflow extent {start_page}..{end} is outside snapshot {}..{}",
+                2,
+                self.meta.page_count
+            );
+            self.live.push((start_page, end));
+        }
+        self.named_roots.extend(roots);
+
+        Ok(())
+    }
+}
+
+fn reconstruct_free_list(mmap: &[u8], meta: &Meta) -> Result<Vec<FreeExtent>> {
+    let mut reconstructor = FreeListReconstructor {
+        mmap,
+        meta,
+        visited: BTreeSet::new(),
+        live: Vec::new(),
+        named_roots: Vec::new(),
+    };
+
+    reconstructor.walk(meta.unnamed_root, false, 0)?;
+    reconstructor.walk(meta.catalog_root, true, 0)?;
+    let named_roots = std::mem::take(&mut reconstructor.named_roots);
+    for root in named_roots {
+        reconstructor.walk(root, false, 0)?;
+    }
+
+    let mut live = reconstructor.live;
+    live.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(live.len());
+    for (start, end) in live {
+        ensure!(
+            start >= 2 && start < end && end <= meta.page_count,
+            "live range {start}..{end} is outside snapshot {}..{}",
+            2,
+            meta.page_count
+        );
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+
+    let freed_txn = meta.txn_id.saturating_add(1);
+    let mut free = Vec::new();
+    let mut cursor = 2;
+    for (start, end) in merged {
+        if start > cursor {
+            free.push(FreeExtent {
+                start_page: cursor,
+                pages: start - cursor,
+                freed_txn,
+            });
+        }
+        cursor = cursor.max(end);
+    }
+    if cursor < meta.page_count {
+        free.push(FreeExtent {
+            start_page: cursor,
+            pages: meta.page_count - cursor,
+            freed_txn,
+        });
+    }
+
+    Ok(free)
+}
+
 /// The committed meta state and the slot that contains it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Committed {
@@ -229,6 +405,7 @@ pub(crate) struct EnvInner {
     /// with the generation that released them. The writer moves reusable
     /// extents into its transaction and returns the unused ones.
     pub(crate) free_pool: Mutex<Vec<FreeExtent>>,
+    free_pool_ready: AtomicBool,
     pub(crate) poisoned: AtomicBool,
     clean_marker_on_drop: AtomicBool,
     verified: Vec<AtomicU64>,
@@ -330,6 +507,23 @@ impl EnvInner {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         pool.extend(extents);
+    }
+
+    /// Reconstructs the free list on the first write after opening.
+    ///
+    /// Reconstruction scans the reachable tree, so doing it eagerly would make
+    /// read-only reopen latency proportional to the database size. The writer
+    /// lock is already held when this is called, so the scan runs once.
+    pub(crate) fn ensure_free_pool(&self) {
+        if self.free_pool_ready.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let committed = self.read_committed();
+        // A malformed reachable tree already fails reads. Do not turn that
+        // into an open error; leave the pool empty if reconstruction cannot
+        // complete.
+        let free = reconstruct_free_list(&self.mmap, &committed.meta).unwrap_or_default();
+        self.return_free(free);
     }
 
     pub(crate) fn read_page(&self, page_id: u64, snapshot: &Meta) -> Result<Page<'_>> {
@@ -651,6 +845,7 @@ impl EnvOpenOptions {
             writer: Mutex::new(()),
             readers: Mutex::new(BTreeMap::new()),
             free_pool: Mutex::new(Vec::new()),
+            free_pool_ready: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
             clean_marker_on_drop: AtomicBool::new(true),
             verified,
