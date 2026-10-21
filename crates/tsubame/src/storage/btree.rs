@@ -79,7 +79,7 @@ pub(crate) fn insert<S: PageStore>(
     );
 
     if root == 0 {
-        let value = make_value(store, key.len(), value)?;
+        let value = make_value(store, key.len(), value, txn_id)?;
         let entry = OwnedLeafEntry {
             key: key.to_vec(),
             value,
@@ -215,10 +215,10 @@ fn insert_leaf<S: PageStore>(
         .unwrap_or_else(|index| index);
 
     let replaced = if index < entries.len() {
-        let new_value = make_value(store, key.len(), value)?;
+        let new_value = make_value(store, key.len(), value, txn_id)?;
         Some(std::mem::replace(&mut entries[index].value, new_value))
     } else {
-        let new_value = make_value(store, key.len(), value)?;
+        let new_value = make_value(store, key.len(), value, txn_id)?;
         entries.insert(
             index,
             OwnedLeafEntry {
@@ -529,7 +529,7 @@ pub(crate) fn bulk_load<S: PageStore>(
             "key is {} bytes, maximum is {MAX_KEY_SIZE}",
             key.len()
         );
-        let value = make_value(store, key.len(), value)?;
+        let value = make_value(store, key.len(), value, txn_id)?;
         let entry_size = SLOT_SIZE + key.len() + value.encoded_len();
         ensure!(
             HEADER_SIZE + entry_size <= PAGE_SIZE,
@@ -658,7 +658,12 @@ fn allocate_branch<S: PageStore>(
     Ok(page_id)
 }
 
-fn make_value<S: PageStore>(store: &mut S, key_len: usize, value: &[u8]) -> Result<OwnedValue> {
+fn make_value<S: PageStore>(
+    store: &mut S,
+    key_len: usize,
+    value: &[u8],
+    txn_id: u64,
+) -> Result<OwnedValue> {
     if SLOT_SIZE + key_len + value.len() <= INLINE_BUDGET {
         return Ok(OwnedValue::Inline(value.to_vec()));
     }
@@ -671,7 +676,7 @@ fn make_value<S: PageStore>(store: &mut S, key_len: usize, value: &[u8]) -> Resu
         start_page,
         page_count: pages,
     };
-    let bytes = overflow::encode_extent(reference, value)?;
+    let bytes = overflow::encode_extent(reference, value, txn_id)?;
     store.write_extent(start_page, &bytes)?;
 
     Ok(OwnedValue::Overflow(reference))

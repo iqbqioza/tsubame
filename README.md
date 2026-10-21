@@ -39,6 +39,7 @@ added without changing the main API.
 - [x] B+tree page format and read path
 - [x] B+tree writes, splits, deletes, and overflow extents
 - [x] Read/write transactions and crash-safe commits
+- [x] Single-fsync durable commits with validated commit records
 - [x] Typed database operations on the unnamed database
 - [ ] Named databases and catalog
 - [ ] Cursors and iterators

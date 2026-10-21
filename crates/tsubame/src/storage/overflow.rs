@@ -84,7 +84,11 @@ pub(crate) fn pages_for(value_len: usize) -> Result<u64> {
 }
 
 /// Builds the complete bytes of an overflow extent.
-pub(crate) fn encode_extent(reference: OverflowRef, value: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn encode_extent(reference: OverflowRef, value: &[u8], txn_id: u64) -> Result<Vec<u8>> {
+    ensure!(
+        txn_id > 0,
+        "overflow extent transaction ID must be non-zero"
+    );
     ensure!(
         value.len() <= u32::MAX as usize,
         "overflow value is larger than 4 GiB"
@@ -112,7 +116,7 @@ pub(crate) fn encode_extent(reference: OverflowRef, value: &[u8]) -> Result<Vec<
     LittleEndian::write_u32(&mut bytes[4..8], reference.total_len);
     LittleEndian::write_u64(&mut bytes[8..16], reference.start_page);
     LittleEndian::write_u64(&mut bytes[16..24], reference.page_count);
-    LittleEndian::write_u64(&mut bytes[24..32], 0);
+    LittleEndian::write_u64(&mut bytes[24..32], txn_id);
     bytes[EXTENT_HEADER_SIZE..EXTENT_HEADER_SIZE + value.len()].copy_from_slice(value);
 
     let checksum = checksum(&bytes);
@@ -162,8 +166,8 @@ pub(crate) fn validate_extent_unchecked(bytes: &[u8], reference: OverflowRef) ->
         "overflow page count does not match its reference"
     );
     ensure!(
-        LittleEndian::read_u64(&bytes[24..32]) == 0,
-        "overflow extent has unsupported flags"
+        LittleEndian::read_u64(&bytes[24..32]) > 0,
+        "overflow extent transaction ID must be non-zero"
     );
 
     let total_len = reference.total_len as usize;
@@ -174,6 +178,20 @@ pub(crate) fn validate_extent_unchecked(bytes: &[u8], reference: OverflowRef) ->
     );
 
     Ok(payload)
+}
+
+/// Returns the transaction ID stored in an extent header.
+pub(crate) fn txn_id(bytes: &[u8]) -> Result<u64> {
+    ensure!(
+        bytes.len() >= EXTENT_HEADER_SIZE,
+        "overflow extent is truncated"
+    );
+    let txn_id = LittleEndian::read_u64(&bytes[24..32]);
+    ensure!(
+        txn_id > 0,
+        "overflow extent transaction ID must be non-zero"
+    );
+    Ok(txn_id)
 }
 
 /// Returns the full byte length of an extent.
@@ -211,7 +229,7 @@ mod tests {
     fn extent_round_trip() {
         let value = vec![0x5a; 10_000];
         let reference = reference(value.len()).unwrap();
-        let bytes = encode_extent(reference, &value).unwrap();
+        let bytes = encode_extent(reference, &value, 7).unwrap();
 
         assert_eq!(validate_extent(&bytes, reference).unwrap(), value);
     }
@@ -231,7 +249,7 @@ mod tests {
     fn rejects_corrupt_extent() {
         let value = vec![0x5a; 5_000];
         let reference = reference(value.len()).unwrap();
-        let mut bytes = encode_extent(reference, &value).unwrap();
+        let mut bytes = encode_extent(reference, &value, 7).unwrap();
         bytes[100] ^= 0xff;
 
         assert!(validate_extent(&bytes, reference).is_err());
