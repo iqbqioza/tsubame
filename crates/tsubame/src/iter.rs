@@ -226,8 +226,8 @@ impl<'a, S: PageSource> Cursor<'a, S> {
             return Ok(None);
         }
 
-        let key = page.key(self.slot)?;
-        let value = match page.leaf_value(self.slot)? {
+        let (key, value) = page.leaf_entry(self.slot)?;
+        let value = match value {
             LeafValue::Inline(value) => value,
             LeafValue::Overflow(reference) => self.source.overflow(reference)?,
         };

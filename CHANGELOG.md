@@ -16,6 +16,15 @@ All notable changes to this project are documented here.
   `rev_prefix_rw` on write transactions, including staged puts and deletes.
 - Clearing a database now releases its old tree pages for reuse.
 
+### Performance
+
+- Bulk loading builds leaf pages from borrowed entries instead of cloning
+  every key and value.
+- Verified page reads skip redundant validation, and hot page/btree accessors
+  are inlined.
+- Leaves with changed-length values are rebuilt from borrowed slots, and
+  adjacent dirty pages are written in batches.
+
 ### Fixed
 
 - Inserting a key that sorts before an existing leaf entry replaced the

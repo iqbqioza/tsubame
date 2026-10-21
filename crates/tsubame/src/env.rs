@@ -434,6 +434,7 @@ impl EnvInner {
         self.poisoned.store(true, Ordering::Release);
     }
 
+    #[inline]
     fn is_verified(&self, page_id: u64) -> bool {
         let index = (page_id / 64) as usize;
         let bit = 1u64 << (page_id % 64);
@@ -442,6 +443,7 @@ impl EnvInner {
             .is_some_and(|word| word.load(Ordering::Relaxed) & bit != 0)
     }
 
+    #[inline]
     fn mark_verified(&self, page_id: u64) {
         let index = (page_id / 64) as usize;
         let bit = 1u64 << (page_id % 64);
@@ -526,6 +528,7 @@ impl EnvInner {
         self.return_free(free);
     }
 
+    #[inline]
     pub(crate) fn read_page(&self, page_id: u64, snapshot: &Meta) -> Result<Page<'_>> {
         ensure!(
             page_id >= 2 && page_id < snapshot.page_count,
@@ -547,7 +550,7 @@ impl EnvInner {
 
         let page = &self.mmap[start..end];
         if self.is_verified(page_id) {
-            Page::parse_trusted(page, Some(page_id))
+            Page::parse_verified(page)
         } else {
             let parsed = Page::parse(page, Some(page_id))?;
             self.mark_verified(page_id);

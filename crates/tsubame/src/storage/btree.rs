@@ -34,6 +34,7 @@ pub(crate) trait PageSource {
 ///
 /// A root of 0 represents an empty tree. Values are returned as a slice into
 /// the page source, so they keep the source's lifetime.
+#[inline]
 pub(crate) fn get<'a, S: PageSource>(
     source: &'a S,
     root: u64,
@@ -239,7 +240,8 @@ fn insert_leaf<S: PageStore>(
 
     if inline {
         if existing {
-            if let LeafValue::Inline(old) = page.leaf_value(position)? {
+            let old_value = page.leaf_value(position)?;
+            if let LeafValue::Inline(old) = old_value {
                 if old.len() == value.len() {
                     let new_page_id = store.allocate_pages(1)?;
                     let new_page = page.replace_value(new_page_id, txn_id, position, value, 0)?;
@@ -250,6 +252,45 @@ fn insert_leaf<S: PageStore>(
                         split: None,
                     });
                 }
+            }
+
+            // Rebuild from borrowed slots when an updated inline value fits.
+            // This avoids cloning every key and value in the leaf before
+            // replacing a single entry.
+            let old_value_len = match old_value {
+                LeafValue::Inline(value) => value.len(),
+                LeafValue::Overflow(_) => overflow::OVERFLOW_REF_SIZE,
+            };
+            let used = HEADER_SIZE
+                .checked_add(page.slot_count() * SLOT_SIZE)
+                .and_then(|size| size.checked_add(PAGE_SIZE - page.free_end()))
+                .context("leaf size overflow")?;
+            let size = used
+                .checked_sub(old_value_len)
+                .and_then(|size| size.checked_add(value.len()))
+                .context("leaf size overflow")?;
+            if size <= PAGE_SIZE {
+                let new_page_id = store.allocate_pages(1)?;
+                let mut refs: Vec<(&[u8], LeafValue<'_>)> = Vec::with_capacity(page.slot_count());
+                for index in 0..page.slot_count() {
+                    let (key, existing) = page.leaf_entry(index)?;
+                    let value = if index == position {
+                        LeafValue::Inline(value)
+                    } else {
+                        existing
+                    };
+                    refs.push((key, value));
+                }
+                let new_page = page::build_leaf_entries(new_page_id, txn_id, &refs)?;
+                store.write_page(new_page_id, new_page)?;
+                store.free_pages(page_id, 1)?;
+                if let LeafValue::Overflow(reference) = old_value {
+                    store.free_pages(reference.start_page, reference.page_count)?;
+                }
+                return Ok(InsertResult {
+                    page_id: new_page_id,
+                    split: None,
+                });
             }
         } else if position == page.slot_count() && page.can_append(key.len(), value.len()) {
             let new_page_id = store.allocate_pages(1)?;
@@ -453,12 +494,15 @@ fn delete_branch<S: PageStore>(
 fn collect_leaf(page: &Page<'_>) -> Result<Vec<OwnedLeafEntry>> {
     let mut entries = Vec::with_capacity(page.slot_count());
     for index in 0..page.slot_count() {
-        let key = page.key(index)?.to_vec();
-        let value = match page.leaf_value(index)? {
+        let (key, value) = page.leaf_entry(index)?;
+        let value = match value {
             LeafValue::Inline(value) => OwnedValue::Inline(value.to_vec()),
             LeafValue::Overflow(reference) => OwnedValue::Overflow(reference),
         };
-        entries.push(OwnedLeafEntry { key, value });
+        entries.push(OwnedLeafEntry {
+            key: key.to_vec(),
+            value,
+        });
     }
     Ok(entries)
 }
@@ -570,34 +614,55 @@ pub(crate) fn bulk_load<S: PageStore>(
     }
 
     let mut leaves: Vec<(Vec<u8>, u64)> = Vec::new();
-    let mut leaf_entries: Vec<OwnedLeafEntry> = Vec::new();
+    let mut page_start = 0;
     let mut leaf_size = HEADER_SIZE;
+    let mut page_values: Vec<LeafValue<'_>> = Vec::new();
 
-    for (key, value) in entries {
+    for (index, (key, value)) in entries.iter().enumerate() {
         ensure!(
             key.len() <= MAX_KEY_SIZE,
             "key is {} bytes, maximum is {MAX_KEY_SIZE}",
             key.len()
         );
-        let value = make_value(store, key.len(), value, txn_id)?;
-        let entry_size = SLOT_SIZE + key.len() + value.encoded_len();
+        let inline = SLOT_SIZE + key.len() + value.len() <= INLINE_BUDGET;
+        let value_len = if inline {
+            value.len()
+        } else {
+            overflow::OVERFLOW_REF_SIZE
+        };
+        let entry_size = SLOT_SIZE + key.len() + value_len;
         ensure!(
             HEADER_SIZE + entry_size <= PAGE_SIZE,
             "entry is too large for a leaf page"
         );
 
-        if !leaf_entries.is_empty() && leaf_size + entry_size > PAGE_SIZE {
-            flush_leaf(store, &mut leaves, &mut leaf_entries, txn_id)?;
+        if !page_values.is_empty() && leaf_size + entry_size > PAGE_SIZE {
+            flush_bulk_leaf(
+                store,
+                &entries[page_start..index],
+                &page_values,
+                &mut leaves,
+                txn_id,
+            )?;
+            page_start = index;
             leaf_size = HEADER_SIZE;
+            page_values.clear();
         }
 
         leaf_size += entry_size;
-        leaf_entries.push(OwnedLeafEntry {
-            key: key.clone(),
-            value,
+        page_values.push(if inline {
+            LeafValue::Inline(value)
+        } else {
+            LeafValue::Overflow(make_overflow(store, value, txn_id)?)
         });
     }
-    flush_leaf(store, &mut leaves, &mut leaf_entries, txn_id)?;
+    flush_bulk_leaf(
+        store,
+        &entries[page_start..],
+        &page_values,
+        &mut leaves,
+        txn_id,
+    )?;
 
     let mut level = leaves;
     while level.len() > 1 {
@@ -670,6 +735,38 @@ fn flush_leaf<S: PageStore>(
     Ok(())
 }
 
+fn flush_bulk_leaf<S: PageStore>(
+    store: &mut S,
+    entries: &[(Vec<u8>, Vec<u8>)],
+    values: &[LeafValue<'_>],
+    leaves: &mut Vec<(Vec<u8>, u64)>,
+    txn_id: u64,
+) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    ensure!(
+        entries.len() == values.len(),
+        "bulk-load page has mismatched entry and value counts"
+    );
+
+    let separator = if leaves.is_empty() {
+        Vec::new()
+    } else {
+        entries[0].0.clone()
+    };
+    let page_id = store.allocate_pages(1)?;
+    let refs: Vec<(&[u8], LeafValue<'_>)> = entries
+        .iter()
+        .zip(values)
+        .map(|((key, _), value)| (key.as_slice(), *value))
+        .collect();
+    let page = page::build_leaf_entries(page_id, txn_id, &refs)?;
+    store.write_page(page_id, page)?;
+    leaves.push((separator, page_id));
+    Ok(())
+}
+
 fn allocate_leaf<S: PageStore>(
     store: &mut S,
     entries: &[OwnedLeafEntry],
@@ -718,6 +815,10 @@ fn make_value<S: PageStore>(
         return Ok(OwnedValue::Inline(value.to_vec()));
     }
 
+    Ok(OwnedValue::Overflow(make_overflow(store, value, txn_id)?))
+}
+
+fn make_overflow<S: PageStore>(store: &mut S, value: &[u8], txn_id: u64) -> Result<OverflowRef> {
     let total_len = u32::try_from(value.len()).context("value is larger than 4 GiB")?;
     let pages = overflow::pages_for(value.len())?;
     let start_page = store.allocate_pages(pages)?;
@@ -728,8 +829,7 @@ fn make_value<S: PageStore>(
     };
     let bytes = overflow::encode_extent(reference, value, txn_id)?;
     store.write_extent(start_page, &bytes)?;
-
-    Ok(OwnedValue::Overflow(reference))
+    Ok(reference)
 }
 
 fn free_value<S: PageStore>(store: &mut S, value: &OwnedValue) -> Result<()> {
@@ -822,6 +922,67 @@ mod tests {
 
         assert_eq!(get(&store, root, b"key-007").unwrap(), Some(&b"v"[..]));
         assert_eq!(get(&store, root, b"key-012").unwrap(), Some(&b"base"[..]));
+    }
+
+    #[test]
+    fn bulk_load_handles_inline_and_overflow_values() {
+        let mut store = MemoryStore::new();
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..1_500u32)
+            .map(|index| {
+                let value = if index % 100 == 0 {
+                    vec![b'x'; 10_000]
+                } else {
+                    format!("value-{index}").into_bytes()
+                };
+                (index.to_be_bytes().to_vec(), value)
+            })
+            .collect();
+
+        let root = bulk_load(&mut store, &entries, 1).unwrap();
+        for (key, value) in &entries {
+            assert_eq!(get(&store, root, key).unwrap(), Some(value.as_slice()));
+        }
+    }
+
+    #[test]
+    fn updates_leaf_values_with_changed_lengths() {
+        let mut store = MemoryStore::new();
+        let mut root = 0;
+        for index in 0..100u32 {
+            root = insert(
+                &mut store,
+                root,
+                &index.to_be_bytes(),
+                format!("value-{index}").as_bytes(),
+                1,
+            )
+            .unwrap();
+        }
+
+        root = insert(&mut store, root, &50u32.to_be_bytes(), b"short", 2).unwrap();
+        for index in 0..100u32 {
+            let expected = if index == 50 {
+                "short".to_owned()
+            } else {
+                format!("value-{index}")
+            };
+            assert_eq!(
+                get(&store, root, &index.to_be_bytes()).unwrap(),
+                Some(expected.as_bytes())
+            );
+        }
+
+        let large = vec![b'y'; 10_000];
+        root = insert(&mut store, root, &10u32.to_be_bytes(), &large, 3).unwrap();
+        assert_eq!(
+            get(&store, root, &10u32.to_be_bytes()).unwrap(),
+            Some(large.as_slice())
+        );
+        root = insert(&mut store, root, &10u32.to_be_bytes(), b"small", 4).unwrap();
+        assert_eq!(
+            get(&store, root, &10u32.to_be_bytes()).unwrap(),
+            Some(&b"small"[..])
+        );
     }
 
     #[test]
