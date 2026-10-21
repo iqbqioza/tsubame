@@ -447,12 +447,11 @@ impl<'env> RwTxn<'env> {
                 self.root = Some(0);
             }
             DatabaseKind::Named(name) => {
-                if !self.cleared_named.contains(&name) {
-                    if let Some(root) = self.catalog_lookup(&name)? {
-                        if root != 0 {
-                            btree::free_tree(self, root)?;
-                        }
-                    }
+                if !self.cleared_named.contains(&name)
+                    && let Some(root) = self.catalog_lookup(&name)?
+                    && root != 0
+                {
+                    btree::free_tree(self, root)?;
                 }
                 self.named_pending.remove(&name);
                 self.cleared_named.insert(name);
@@ -819,7 +818,7 @@ impl<'env> RwTxn<'env> {
 
         for (start_page, bytes) in &self.extents {
             ensure!(
-                bytes.len() % PAGE_SIZE == 0,
+                bytes.len().is_multiple_of(PAGE_SIZE),
                 "overflow extent is not page-aligned"
             );
             let offset = start_page
@@ -969,7 +968,7 @@ impl PageStore for RwTxn<'_> {
             "extent start {start_page} is outside the transaction allocation range"
         );
         ensure!(
-            bytes.len() % PAGE_SIZE == 0,
+            bytes.len().is_multiple_of(PAGE_SIZE),
             "overflow extent is not page-aligned"
         );
         let pages =

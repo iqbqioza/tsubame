@@ -34,6 +34,10 @@ All notable changes to this project are documented here.
 
 ### Performance
 
+- CRC32C checksums are computed over the page and metadata buffers without
+  copying the full page first, and write paths use a faster hardware-backed
+  CRC32C implementation. Single-key commit CPU time drops substantially while
+  the on-disk checksum algorithm and format remain unchanged.
 - Bulk loading builds leaf pages from borrowed entries instead of cloning
   every key and value.
 - Verified page reads bypass redundant header checks, and binary-search slot
@@ -50,6 +54,7 @@ All notable changes to this project are documented here.
 
 ### Notes
 
+- The minimum supported Rust version is now 1.88.
 - The free list is maintained in memory. Read-only reopening does not scan the
   tree; the first write transaction reconstructs the free list from the latest
   reachable state.

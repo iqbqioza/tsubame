@@ -65,7 +65,7 @@ impl CommitPage {
             LittleEndian::write_u64(&mut page[offset + 8..offset + 16], page_count);
         }
 
-        let checksum = checksum(&page);
+        let checksum = crc32c_fast::crc32c(&page);
         LittleEndian::write_u32(&mut page[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4], checksum);
 
         Ok(page)
@@ -328,10 +328,9 @@ fn page_slice(data: &[u8], page_id: u64) -> Result<&[u8]> {
 }
 
 fn checksum(page: &[u8]) -> u32 {
-    let mut copy = [0u8; PAGE_SIZE];
-    copy.copy_from_slice(page);
-    copy[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].fill(0);
-    crc32c::crc32c(&copy)
+    let checksum = crc32c::crc32c(&page[..CHECKSUM_OFFSET]);
+    let checksum = crc32c::crc32c_append(checksum, &[0u8; 4]);
+    crc32c::crc32c_append(checksum, &page[CHECKSUM_OFFSET + 4..])
 }
 
 #[cfg(test)]

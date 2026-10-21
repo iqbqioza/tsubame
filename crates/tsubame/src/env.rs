@@ -593,11 +593,11 @@ fn reconstruct_free_list(mmap: &[u8], meta: &Meta) -> Result<Vec<FreeExtent>> {
             2,
             meta.page_count
         );
-        if let Some(last) = merged.last_mut() {
-            if start <= last.1 {
-                last.1 = last.1.max(end);
-                continue;
-            }
+        if let Some(last) = merged.last_mut()
+            && start <= last.1
+        {
+            last.1 = last.1.max(end);
+            continue;
         }
         merged.push((start, end));
     }

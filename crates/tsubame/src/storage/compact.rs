@@ -363,7 +363,7 @@ impl PageStore for CompactStore {
             "extent start is outside the allocation range"
         );
         ensure!(
-            bytes.len() % PAGE_SIZE == 0,
+            bytes.len().is_multiple_of(PAGE_SIZE),
             "overflow extent is not page-aligned"
         );
         let pages =

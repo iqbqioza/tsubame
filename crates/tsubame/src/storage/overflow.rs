@@ -119,7 +119,7 @@ pub(crate) fn encode_extent(reference: OverflowRef, value: &[u8], txn_id: u64) -
     LittleEndian::write_u64(&mut bytes[24..32], txn_id);
     bytes[EXTENT_HEADER_SIZE..EXTENT_HEADER_SIZE + value.len()].copy_from_slice(value);
 
-    let checksum = checksum(&bytes);
+    let checksum = crc32c_fast::crc32c(&bytes);
     LittleEndian::write_u32(&mut bytes[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4], checksum);
 
     Ok(bytes)

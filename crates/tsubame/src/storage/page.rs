@@ -104,6 +104,15 @@ impl<'a> Page<'a> {
         }
     }
 
+    /// Copies the validated page into an owned buffer without first zeroing it.
+    fn copy_page(&self) -> Result<[u8; PAGE_SIZE]> {
+        let bytes: &[u8; PAGE_SIZE] = self
+            .bytes
+            .try_into()
+            .context("page has an unexpected size")?;
+        Ok(*bytes)
+    }
+
     fn parse_inner(
         bytes: &'a [u8],
         expected_id: Option<u64>,
@@ -118,10 +127,7 @@ impl<'a> Page<'a> {
 
         if verify_checksum {
             let stored = LittleEndian::read_u32(&bytes[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4]);
-            let mut copy = [0u8; PAGE_SIZE];
-            copy.copy_from_slice(bytes);
-            copy[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].fill(0);
-            let actual = crc32c::crc32c(&copy);
+            let actual = page_checksum(bytes);
             ensure!(
                 stored == actual,
                 "page checksum mismatch (stored {stored:#010x}, computed {actual:#010x})"
@@ -314,8 +320,7 @@ impl<'a> Page<'a> {
             "page does not have room for another slot"
         );
 
-        let mut page = [0u8; PAGE_SIZE];
-        page.copy_from_slice(self.bytes);
+        let mut page = self.copy_page()?;
         page[cell_start..cell_start + key.len()].copy_from_slice(key);
         let value_start = cell_start + key.len();
         page[value_start..value_start + value.len()].copy_from_slice(value);
@@ -357,8 +362,7 @@ impl<'a> Page<'a> {
             "unsupported slot flags {flags:#04x}"
         );
 
-        let mut page = [0u8; PAGE_SIZE];
-        page.copy_from_slice(self.bytes);
+        let mut page = self.copy_page()?;
         let start = offset + key_len;
         page[start..start + value_len].copy_from_slice(value);
         page[HEADER_SIZE + index * SLOT_SIZE + 8] = flags;
@@ -422,8 +426,7 @@ impl<'a> Page<'a> {
             "resized leaf cell is outside the page"
         );
 
-        let mut page = [0u8; PAGE_SIZE];
-        page.copy_from_slice(self.bytes);
+        let mut page = self.copy_page()?;
         if new_free_end != free_end {
             page.copy_within(free_end..offset, new_free_end);
         }
@@ -477,8 +480,7 @@ impl<'a> Page<'a> {
             "branch child slot has {value_len} bytes"
         );
 
-        let mut page = [0u8; PAGE_SIZE];
-        page.copy_from_slice(self.bytes);
+        let mut page = self.copy_page()?;
         let start = offset + key_len;
         LittleEndian::write_u64(&mut page[start..start + 8], child);
 
@@ -875,7 +877,7 @@ impl PageBuilder {
         LittleEndian::write_u16(&mut self.page[24..26], free_start as u16);
         LittleEndian::write_u16(&mut self.page[26..28], self.cell_end as u16);
 
-        let checksum = page_checksum(&self.page);
+        let checksum = page_checksum_for_write(&mut self.page);
         LittleEndian::write_u32(
             &mut self.page[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4],
             checksum,
@@ -885,18 +887,25 @@ impl PageBuilder {
     }
 }
 
-/// Computes the CRC32C of a page with its checksum field zeroed.
-fn page_checksum(page: &[u8; PAGE_SIZE]) -> u32 {
-    let mut copy = *page;
-    copy[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].fill(0);
-    crc32c::crc32c(&copy)
+/// Computes the CRC32C of a page with its checksum field treated as zero.
+fn page_checksum(page: &[u8]) -> u32 {
+    let checksum = crc32c::crc32c(&page[..CHECKSUM_OFFSET]);
+    let checksum = crc32c::crc32c_append(checksum, &[0u8; 4]);
+    crc32c::crc32c_append(checksum, &page[CHECKSUM_OFFSET + 4..])
+}
+
+/// Computes a page checksum when the caller owns the page and can zero the
+/// checksum field before hashing. This uses the faster full-buffer CRC path.
+fn page_checksum_for_write(page: &mut [u8; PAGE_SIZE]) -> u32 {
+    page[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].fill(0);
+    crc32c_fast::crc32c(page)
 }
 
 /// Updates the page identity and checksum after an in-place edit.
 fn reseal(page: &mut [u8; PAGE_SIZE], page_id: u64, txn_id: u64) {
     LittleEndian::write_u64(&mut page[8..16], page_id);
     LittleEndian::write_u64(&mut page[16..24], txn_id);
-    let checksum = page_checksum(page);
+    let checksum = page_checksum_for_write(page);
     LittleEndian::write_u32(&mut page[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4], checksum);
 }
 
@@ -972,6 +981,15 @@ mod tests {
     }
 
     #[test]
+    fn fast_checksum_matches_reference_implementation() {
+        let mut page = leaf();
+        let fast = page_checksum_for_write(&mut page);
+        let mut reference = page;
+        reference[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].fill(0);
+        assert_eq!(fast, crc32c::crc32c(&reference));
+    }
+
+    #[test]
     fn rejects_unsorted_keys() {
         assert!(build_leaf(2, 7, &[(b"b", b"1"), (b"a", b"2")]).is_err());
     }
@@ -982,7 +1000,7 @@ mod tests {
         // Point the first slot at the end of the page, then make the checksum
         // valid again so that bounds validation is what rejects the page.
         LittleEndian::write_u16(&mut page[HEADER_SIZE..HEADER_SIZE + 2], PAGE_SIZE as u16);
-        let checksum = page_checksum(&page);
+        let checksum = page_checksum_for_write(&mut page);
         LittleEndian::write_u32(&mut page[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4], checksum);
 
         assert!(Page::parse(&page, Some(2)).is_err());

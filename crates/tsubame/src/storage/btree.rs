@@ -288,17 +288,17 @@ fn insert_leaf<S: PageStore>(
     if inline {
         if existing {
             let old_value = page.leaf_value(position)?;
-            if let LeafValue::Inline(old) = old_value {
-                if old.len() == value.len() {
-                    let new_page_id = store.allocate_pages(1)?;
-                    let new_page = page.replace_value(new_page_id, txn_id, position, value, 0)?;
-                    store.write_page(new_page_id, new_page)?;
-                    store.free_pages(page_id, 1)?;
-                    return Ok(InsertResult {
-                        page_id: new_page_id,
-                        split: None,
-                    });
-                }
+            if let LeafValue::Inline(old) = old_value
+                && old.len() == value.len()
+            {
+                let new_page_id = store.allocate_pages(1)?;
+                let new_page = page.replace_value(new_page_id, txn_id, position, value, 0)?;
+                store.write_page(new_page_id, new_page)?;
+                store.free_pages(page_id, 1)?;
+                return Ok(InsertResult {
+                    page_id: new_page_id,
+                    split: None,
+                });
             }
 
             // Rebuild from borrowed slots when an updated inline value fits.

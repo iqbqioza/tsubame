@@ -20,6 +20,7 @@ all-features = true
 anyhow.workspace = true
 byteorder.workspace = true
 crc32c.workspace = true
+crc32c-fast.workspace = true
 fs4.workspace = true
 memmap2.workspace = true
 tsubame-traits.workspace = true
