@@ -8,7 +8,8 @@ inspired by [heed].
 > [!WARNING]
 > Tsubame is pre-1.0. The 0.1.0 release includes the environment format,
 > B+tree, transactions, named databases, crash-safe commit records, ordered
-> iteration, and serde codecs. APIs may still change before 1.0.
+> iteration, serde codecs, and offline compaction. APIs may still change
+> before 1.0.
 
 ## Why Tsubame
 
@@ -46,6 +47,7 @@ added without changing the main API.
 - [x] Range, prefix, and reverse iterators
 - [x] Write transaction iteration with pending writes
 - [x] Serde-based codecs behind features
+- [x] Offline compaction
 
 ## Codec features
 
@@ -101,7 +103,12 @@ The examples use a temporary directory and clean up after themselves.
 ## Limitations
 
 - One process per environment; the file lock is exclusive.
-- Online compaction and cross-transaction page reuse are not implemented.
+- Cross-transaction page reuse is not implemented. Use offline compaction to
+  reclaim space:
+  ```rust
+  Env::compact("/path/to/env")?;
+  ```
+  The environment must be closed while compaction runs.
 - Custom key comparators are not exposed yet.
 - Performance is benchmarked rather than assumed; see [`benchmarks`](benchmarks).
 

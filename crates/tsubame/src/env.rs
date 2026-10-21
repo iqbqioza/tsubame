@@ -150,6 +150,20 @@ impl Env {
 
         Ok(Database::new(Arc::clone(&self.inner), kind))
     }
+
+    /// Compacts the environment at `path` into a fresh data file.
+    ///
+    /// The environment must be closed; if it is open, this returns an error.
+    /// Compaction removes pages that are no longer reachable, including pages
+    /// left behind by updates and deletes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the environment is open, its commit cannot be
+    /// validated, or the replacement file cannot be written.
+    pub fn compact(path: impl AsRef<Path>) -> Result<()> {
+        crate::storage::compact::compact(path.as_ref())
+    }
 }
 
 impl fmt::Debug for Env {

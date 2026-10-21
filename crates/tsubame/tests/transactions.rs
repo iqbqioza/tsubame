@@ -1,5 +1,6 @@
 //! End-to-end tests for snapshots, commits, and persistence.
 
+use std::fs;
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::ops::Bound;
@@ -9,7 +10,7 @@ use std::thread;
 use tempfile::tempdir;
 use tsubame::byteorder::NativeEndian;
 use tsubame::types::{Bytes, Str, U32};
-use tsubame::{EnvOpenOptions, Result};
+use tsubame::{Env, EnvOpenOptions, Result};
 
 fn options() -> EnvOpenOptions {
     let mut options = EnvOpenOptions::new();
@@ -566,6 +567,104 @@ fn write_txn_iteration_after_clear() -> Result<()> {
     assert_eq!(seen, [("b".to_owned(), "2".to_owned())]);
 
     drop(wtxn);
+
+    Ok(())
+}
+
+#[test]
+fn compaction_reclaims_space_and_preserves_data() -> Result<()> {
+    let dir = tempdir()?;
+    let before_pages;
+    let before_len;
+    {
+        let env = options().open(dir.path())?;
+        let mut wtxn = env.write_txn()?;
+        let unnamed = env.create_database::<Str, Str>(&mut wtxn, None)?;
+        let named = env.create_database::<Str, Str>(&mut wtxn, Some("named"))?;
+
+        for i in 0..1_000u32 {
+            let key = format!("key-{i:04}");
+            let value = format!("value-{i:04}");
+            unnamed.put(&mut wtxn, &key, &value)?;
+            if i < 200 {
+                named.put(&mut wtxn, &key, &value)?;
+            }
+        }
+        wtxn.commit()?;
+
+        let mut wtxn = env.write_txn()?;
+        for i in 0..500u32 {
+            let key = format!("key-{i:04}");
+            let value = format!("updated-{i:04}");
+            unnamed.put(&mut wtxn, &key, &value)?;
+        }
+        for i in 500..750u32 {
+            unnamed.delete(&mut wtxn, &format!("key-{i:04}"))?;
+        }
+        for i in 0..50u32 {
+            named.delete(&mut wtxn, &format!("key-{i:04}"))?;
+        }
+        wtxn.commit()?;
+
+        before_pages = env.info().page_count;
+        before_len = fs::metadata(dir.path().join("data.tsubame"))?.len();
+        drop(named);
+        drop(unnamed);
+    }
+
+    Env::compact(dir.path())?;
+
+    let env = options().open(dir.path())?;
+    let rtxn = env.read_txn()?;
+    let unnamed = env.open_database::<Str, Str>(&rtxn, None)?;
+    let named = env.open_database::<Str, Str>(&rtxn, Some("named"))?;
+    assert_eq!(unnamed.get(&rtxn, "key-0000")?, Some("updated-0000"));
+    assert_eq!(unnamed.get(&rtxn, "key-0499")?, Some("updated-0499"));
+    assert_eq!(unnamed.get(&rtxn, "key-0500")?, None);
+    assert_eq!(unnamed.get(&rtxn, "key-0750")?, Some("value-0750"));
+    assert_eq!(named.get(&rtxn, "key-0100")?, Some("value-0100"));
+    assert_eq!(named.get(&rtxn, "key-0010")?, None);
+
+    let after = env.info();
+    assert!(after.page_count < before_pages);
+    let after_len = fs::metadata(dir.path().join("data.tsubame"))?.len();
+    assert!(after_len <= before_len);
+
+    Ok(())
+}
+
+#[test]
+fn compaction_preserves_overflow_values() -> Result<()> {
+    let dir = tempdir()?;
+    let value = vec![0x5a; 10_000];
+    {
+        let env = options().open(dir.path())?;
+        let mut wtxn = env.write_txn()?;
+        let db = env.create_database::<Str, Bytes>(&mut wtxn, None)?;
+        db.put(&mut wtxn, "blob", value.as_slice())?;
+        wtxn.commit()?;
+    }
+
+    Env::compact(dir.path())?;
+
+    let env = options().open(dir.path())?;
+    let rtxn = env.read_txn()?;
+    let db = env.open_database::<Str, Bytes>(&rtxn, None)?;
+    assert_eq!(db.get(&rtxn, "blob")?, Some(value.as_slice()));
+
+    Ok(())
+}
+
+#[test]
+fn compaction_requires_the_environment_to_be_closed() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+
+    let error = Env::compact(dir.path()).unwrap_err();
+    assert!(error.to_string().contains("open"));
+
+    drop(env);
+    Env::compact(dir.path())?;
 
     Ok(())
 }

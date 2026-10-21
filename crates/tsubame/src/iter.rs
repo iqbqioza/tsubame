@@ -15,7 +15,7 @@ use crate::txn::{PendingIter, RoTxn, RwTxn};
 /// The maximum branch depth followed by a cursor.
 const MAX_DEPTH: usize = 64;
 
-struct Cursor<'a, S: PageSource> {
+pub(crate) struct Cursor<'a, S: PageSource> {
     source: &'a S,
     stack: Vec<(u64, usize)>,
     leaf: Option<u64>,
@@ -23,7 +23,7 @@ struct Cursor<'a, S: PageSource> {
 }
 
 impl<'a, S: PageSource> Cursor<'a, S> {
-    fn new(source: &'a S) -> Self {
+    pub(crate) fn new(source: &'a S) -> Self {
         Self {
             source,
             stack: Vec::new(),
@@ -36,7 +36,7 @@ impl<'a, S: PageSource> Cursor<'a, S> {
         self.source.page(page_id)
     }
 
-    fn seek_first(&mut self, root: u64) -> Result<()> {
+    pub(crate) fn seek_first(&mut self, root: u64) -> Result<()> {
         self.stack.clear();
         self.leaf = None;
         if root != 0 {
@@ -217,7 +217,7 @@ impl<'a, S: PageSource> Cursor<'a, S> {
         }
     }
 
-    fn current(&self) -> Result<Option<(&'a [u8], &'a [u8])>> {
+    pub(crate) fn current(&self) -> Result<Option<(&'a [u8], &'a [u8])>> {
         let Some(leaf_id) = self.leaf else {
             return Ok(None);
         };
@@ -246,7 +246,7 @@ impl<'a, S: PageSource> Cursor<'a, S> {
         Ok(Some(page.key(self.slot)?))
     }
 
-    fn next(&mut self) -> Result<()> {
+    pub(crate) fn next(&mut self) -> Result<()> {
         let Some(leaf_id) = self.leaf else {
             return Ok(());
         };
