@@ -148,10 +148,30 @@ impl<'env> RoTxn<'env> {
         Self { env, meta }
     }
 
-    pub(crate) fn root_for(&self, kind: DatabaseKind) -> u64 {
+    pub(crate) fn root_for(&self, kind: &DatabaseKind) -> Result<u64> {
         match kind {
-            DatabaseKind::Unnamed => self.meta.unnamed_root,
+            DatabaseKind::Unnamed => Ok(self.meta.unnamed_root),
+            DatabaseKind::Named(name) => {
+                let Some(root) = self.catalog_lookup(name)? else {
+                    bail!("database `{name}` does not exist");
+                };
+                Ok(root)
+            }
         }
+    }
+
+    pub(crate) fn catalog_lookup(&self, name: &str) -> Result<Option<u64>> {
+        let Some(bytes) = btree::get(self, self.meta.catalog_root, name.as_bytes())? else {
+            return Ok(None);
+        };
+        ensure!(
+            bytes.len() == 8,
+            "catalog entry for `{name}` has {} bytes, expected 8",
+            bytes.len()
+        );
+        let mut root = [0u8; 8];
+        root.copy_from_slice(bytes);
+        Ok(Some(u64::from_le_bytes(root)))
     }
 
     pub(crate) fn belongs_to(&self, env: &Arc<EnvInner>) -> bool {
@@ -189,7 +209,11 @@ pub struct RwTxn<'env> {
     next_page: u64,
     free_single: BTreeSet<u64>,
     free_runs: BTreeMap<u64, u64>,
-    pending: Pending,
+    unnamed_pending: Pending,
+    named_pending: BTreeMap<Arc<str>, Pending>,
+    cleared_named: BTreeSet<Arc<str>>,
+    catalog_root: u64,
+    database_count: u32,
     root: Option<u64>,
     failed: bool,
     _writer: MutexGuard<'env, ()>,
@@ -217,7 +241,11 @@ impl<'env> RwTxn<'env> {
             next_page: committed.meta.page_count,
             free_single: BTreeSet::new(),
             free_runs: BTreeMap::new(),
-            pending: Pending::new(),
+            unnamed_pending: Pending::new(),
+            named_pending: BTreeMap::new(),
+            cleared_named: BTreeSet::new(),
+            catalog_root: committed.meta.catalog_root,
+            database_count: committed.meta.database_count,
             root: None,
             failed: false,
             _writer: writer,
@@ -228,17 +256,74 @@ impl<'env> RwTxn<'env> {
         Arc::ptr_eq(&self.env.inner, env)
     }
 
-    pub(crate) fn put_raw(&mut self, key: Vec<u8>, value: Vec<u8>) {
-        self.pending.insert(key, Some(value));
+    pub(crate) fn put_raw(&mut self, kind: DatabaseKind, key: Vec<u8>, value: Vec<u8>) {
+        match kind {
+            DatabaseKind::Unnamed => self.unnamed_pending.insert(key, Some(value)),
+            DatabaseKind::Named(name) => self
+                .named_pending
+                .entry(name)
+                .or_insert_with(Pending::new)
+                .insert(key, Some(value)),
+        }
     }
 
-    pub(crate) fn delete_raw(&mut self, key: Vec<u8>) {
-        self.pending.insert(key, None);
+    pub(crate) fn delete_raw(&mut self, kind: DatabaseKind, key: Vec<u8>) {
+        match kind {
+            DatabaseKind::Unnamed => self.unnamed_pending.insert(key, None),
+            DatabaseKind::Named(name) => self
+                .named_pending
+                .entry(name)
+                .or_insert_with(Pending::new)
+                .insert(key, None),
+        }
     }
 
-    pub(crate) fn clear_raw(&mut self) {
-        self.pending = Pending::new();
-        self.root = Some(0);
+    pub(crate) fn clear_raw(&mut self, kind: DatabaseKind) -> Result<()> {
+        match kind {
+            DatabaseKind::Unnamed => {
+                self.unnamed_pending = Pending::new();
+                self.root = Some(0);
+            }
+            DatabaseKind::Named(name) => {
+                self.named_pending.remove(&name);
+                self.cleared_named.insert(name);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn catalog_lookup(&self, name: &str) -> Result<Option<u64>> {
+        let Some(bytes) = btree::get(self, self.catalog_root, name.as_bytes())? else {
+            return Ok(None);
+        };
+        ensure!(
+            bytes.len() == 8,
+            "catalog entry for `{name}` has {} bytes, expected 8",
+            bytes.len()
+        );
+        let mut root = [0u8; 8];
+        root.copy_from_slice(bytes);
+        Ok(Some(u64::from_le_bytes(root)))
+    }
+
+    pub(crate) fn catalog_put(&mut self, name: &str, root: u64) -> Result<()> {
+        let bytes = root.to_le_bytes();
+        let catalog_root = self.catalog_root;
+        let new_root = btree::insert(self, catalog_root, name.as_bytes(), &bytes, self.txn_id)?;
+        self.catalog_root = new_root;
+        Ok(())
+    }
+
+    pub(crate) fn catalog_count(&self) -> u32 {
+        self.database_count
+    }
+
+    pub(crate) fn increment_database_count(&mut self) -> Result<()> {
+        self.database_count = self
+            .database_count
+            .checked_add(1)
+            .context("database count overflow")?;
+        Ok(())
     }
 
     pub(crate) fn mark_failed(&mut self) {
@@ -303,9 +388,9 @@ impl<'env> RwTxn<'env> {
         let new_meta = Meta {
             txn_id,
             unnamed_root: root,
-            catalog_root: self.base.catalog_root,
+            catalog_root: self.catalog_root,
             page_count: self.next_page,
-            database_count: self.base.database_count,
+            database_count: self.database_count,
             flags: 0,
             commit_record,
             commit_page,
@@ -323,7 +408,33 @@ impl<'env> RwTxn<'env> {
     }
 
     fn apply_pending(&mut self, root: &mut u64) -> Result<()> {
-        match std::mem::replace(&mut self.pending, Pending::Empty) {
+        let unnamed = std::mem::replace(&mut self.unnamed_pending, Pending::Empty);
+        self.apply_pending_to(root, unnamed)?;
+
+        let mut named = std::mem::take(&mut self.named_pending);
+        let cleared = std::mem::take(&mut self.cleared_named);
+
+        for name in cleared {
+            let mut named_root = 0;
+            if let Some(pending) = named.remove(&name) {
+                self.apply_pending_to(&mut named_root, pending)?;
+            }
+            self.catalog_put(&name, named_root)?;
+        }
+
+        for (name, pending) in named {
+            let mut named_root = self
+                .catalog_lookup(&name)?
+                .with_context(|| format!("catalog entry for `{name}` disappeared during commit"))?;
+            self.apply_pending_to(&mut named_root, pending)?;
+            self.catalog_put(&name, named_root)?;
+        }
+
+        Ok(())
+    }
+
+    fn apply_pending_to(&mut self, root: &mut u64, pending: Pending) -> Result<()> {
+        match pending {
             Pending::Empty => Ok(()),
             Pending::One(key, value) => self.apply_one(root, key, value),
             Pending::Map(pending) => {

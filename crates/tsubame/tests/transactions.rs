@@ -194,16 +194,90 @@ fn batch_insert_reuses_transaction_pages() -> Result<()> {
 }
 
 #[test]
-fn named_databases_are_rejected_until_implemented() -> Result<()> {
+fn named_databases_are_independent() -> Result<()> {
+    let dir = tempdir()?;
+    {
+        let env = options().open(dir.path())?;
+        let mut wtxn = env.write_txn()?;
+        let first = env.create_database::<Str, Str>(&mut wtxn, Some("first"))?;
+        let second = env.create_database::<Str, Str>(&mut wtxn, Some("second"))?;
+        let unnamed = env.create_database::<Str, Str>(&mut wtxn, None)?;
+
+        first.put(&mut wtxn, "key", "first-value")?;
+        second.put(&mut wtxn, "key", "second-value")?;
+        unnamed.put(&mut wtxn, "key", "unnamed-value")?;
+        wtxn.commit()?;
+
+        let rtxn = env.read_txn()?;
+        assert_eq!(first.get(&rtxn, "key")?, Some("first-value"));
+        assert_eq!(second.get(&rtxn, "key")?, Some("second-value"));
+        assert_eq!(unnamed.get(&rtxn, "key")?, Some("unnamed-value"));
+        assert_eq!(env.info().database_count, 2);
+    }
+
+    let env = options().open(dir.path())?;
+    let rtxn = env.read_txn()?;
+    let first = env.open_database::<Str, Str>(&rtxn, Some("first"))?;
+    let second = env.open_database::<Str, Str>(&rtxn, Some("second"))?;
+    let unnamed = env.open_database::<Str, Str>(&rtxn, None)?;
+    assert_eq!(first.get(&rtxn, "key")?, Some("first-value"));
+    assert_eq!(second.get(&rtxn, "key")?, Some("second-value"));
+    assert_eq!(unnamed.get(&rtxn, "key")?, Some("unnamed-value"));
+    assert!(
+        env.open_database::<Str, Str>(&rtxn, Some("missing"))
+            .is_err()
+    );
+
+    Ok(())
+}
+
+#[test]
+fn named_database_delete_and_clear() -> Result<()> {
     let dir = tempdir()?;
     let env = options().open(dir.path())?;
     let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, Some("named"))?;
+    db.put(&mut wtxn, "a", "1")?;
+    db.put(&mut wtxn, "b", "2")?;
+    wtxn.commit()?;
 
+    let mut wtxn = env.write_txn()?;
+    db.delete(&mut wtxn, "a")?;
+    wtxn.commit()?;
+
+    let rtxn = env.read_txn()?;
+    assert_eq!(db.get(&rtxn, "a")?, None);
+    assert_eq!(db.get(&rtxn, "b")?, Some("2"));
+
+    let mut wtxn = env.write_txn()?;
+    db.clear(&mut wtxn)?;
+    wtxn.commit()?;
+
+    let rtxn = env.read_txn()?;
+    assert_eq!(db.get(&rtxn, "b")?, None);
+    assert_eq!(
+        env.open_database::<Str, Str>(&rtxn, Some("named"))?
+            .get(&rtxn, "a")?,
+        None
+    );
+
+    Ok(())
+}
+
+#[test]
+fn max_dbs_is_enforced() -> Result<()> {
+    let dir = tempdir()?;
+    let mut options = options();
+    options.max_dbs(1);
+    let env = options.open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+
+    env.create_database::<Str, Str>(&mut wtxn, Some("first"))?;
     let error = env
-        .create_database::<Str, Str>(&mut wtxn, Some("named"))
+        .create_database::<Str, Str>(&mut wtxn, Some("second"))
         .unwrap_err();
 
-    assert!(error.to_string().contains("named databases"));
+    assert!(error.to_string().contains("maximum number"));
     wtxn.abort()?;
 
     Ok(())

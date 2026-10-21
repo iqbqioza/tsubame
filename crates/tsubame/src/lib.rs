@@ -8,14 +8,13 @@
 //! # Status
 //!
 //! The environment lifecycle, the on-disk meta format, the B+tree read and
-//! write paths, transactions, and typed database operations are implemented.
-//! Named databases, cursors, and iteration are still under construction. APIs
+//! write paths, transactions, typed database operations, and named databases
+//! are implemented. Cursors and iteration are still under construction. APIs
 //! may change while the engine is being built.
 //!
 //! # Example
 //!
-//! The following example shows the intended API. It compiles, but does not run
-//! until the storage engine lands.
+//! The following example opens a named database.
 //!
 //! ```no_run
 //! use tsubame::byteorder::NativeEndian;
@@ -26,7 +25,7 @@
 //! let env = EnvOpenOptions::new().open("/tmp/tsubame")?;
 //!
 //! let mut wtxn = env.write_txn()?;
-//! let db = env.create_database::<Str, U32<NativeEndian>>(&mut wtxn, None)?;
+//! let db = env.create_database::<Str, U32<NativeEndian>>(&mut wtxn, Some("scores"))?;
 //! db.put(&mut wtxn, "alice", &42)?;
 //! wtxn.commit()?;
 //!
