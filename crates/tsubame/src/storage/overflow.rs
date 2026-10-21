@@ -122,12 +122,8 @@ pub(crate) fn encode_extent(reference: OverflowRef, value: &[u8]) -> Result<Vec<
 }
 
 /// Validates an extent and returns its payload.
-#[allow(dead_code)] // Wired into the mmap page source with transactions.
 pub(crate) fn validate_extent(bytes: &[u8], reference: OverflowRef) -> Result<&[u8]> {
-    let expected = usize::try_from(reference.page_count)
-        .context("overflow extent is too large for this platform")?
-        .checked_mul(PAGE_SIZE)
-        .context("overflow extent size overflow")?;
+    let expected = extent_len(reference)?;
     ensure!(
         bytes.len() == expected,
         "overflow extent has {} bytes, expected {expected}",
@@ -139,6 +135,18 @@ pub(crate) fn validate_extent(bytes: &[u8], reference: OverflowRef) -> Result<&[
     ensure!(
         stored == actual,
         "overflow checksum mismatch (stored {stored:#010x}, computed {actual:#010x})"
+    );
+
+    validate_extent_unchecked(bytes, reference)
+}
+
+/// Validates an extent whose checksum has already been verified.
+pub(crate) fn validate_extent_unchecked(bytes: &[u8], reference: OverflowRef) -> Result<&[u8]> {
+    let expected = extent_len(reference)?;
+    ensure!(
+        bytes.len() == expected,
+        "overflow extent has {} bytes, expected {expected}",
+        bytes.len()
     );
 
     ensure!(
@@ -166,6 +174,14 @@ pub(crate) fn validate_extent(bytes: &[u8], reference: OverflowRef) -> Result<&[
     );
 
     Ok(payload)
+}
+
+/// Returns the full byte length of an extent.
+fn extent_len(reference: OverflowRef) -> Result<usize> {
+    usize::try_from(reference.page_count)
+        .context("overflow extent is too large for this platform")?
+        .checked_mul(PAGE_SIZE)
+        .context("overflow extent size overflow")
 }
 
 /// Computes the extent checksum with the checksum field zeroed.

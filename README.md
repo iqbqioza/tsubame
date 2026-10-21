@@ -6,11 +6,9 @@
 inspired by [heed].
 
 > [!WARNING]
-> Tsubame is under construction. The workspace layout, public API surface,
-> encoding traits, built-in codecs, environment format, and B+tree internals
-> exist, but transactions and the public database write path are not
-> implemented yet. Opening an environment works; starting a transaction
-> currently returns an error.
+> Tsubame is under construction. The environment format, B+tree, transactions,
+> and typed operations on the unnamed database work. Named databases, cursors,
+> and iteration are not implemented yet.
 
 ## Why Tsubame
 
@@ -40,15 +38,17 @@ added without changing the main API.
 - [x] On-disk meta format and environment lifecycle
 - [x] B+tree page format and read path
 - [x] B+tree writes, splits, deletes, and overflow extents
-- [ ] Transactions and typed database operations
-- [ ] Read/write transactions and cursors
+- [x] Read/write transactions and crash-safe commits
+- [x] Typed database operations on the unnamed database
+- [ ] Named databases and catalog
+- [ ] Cursors and iterators
 - [ ] Ordered, range, prefix, and reverse iterators
 - [ ] Serde-based codecs behind features
 
 ## Target API
 
-The following is the intended shape of the API. It does not run until the
-storage engine lands.
+The following example uses the unnamed database. Named databases are not
+implemented yet.
 
 ```rust
 use tsubame::byteorder::NativeEndian;
@@ -59,7 +59,7 @@ fn main() -> Result<()> {
     let env = EnvOpenOptions::new().open("/tmp/tsubame")?;
 
     let mut wtxn = env.write_txn()?;
-    let db = env.create_database::<Str, U32<NativeEndian>>(&mut wtxn, Some("scores"))?;
+    let db = env.create_database::<Str, U32<NativeEndian>>(&mut wtxn, None)?;
     db.put(&mut wtxn, "alice", &42)?;
     wtxn.commit()?;
 

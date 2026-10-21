@@ -113,7 +113,7 @@ impl Meta {
     }
 
     /// Checks invariants that every committed meta page must satisfy.
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         ensure!(self.txn_id > 0, "meta transaction ID must be non-zero");
         ensure!(
             self.page_count >= META_SLOTS as u64,
@@ -190,8 +190,15 @@ pub(crate) fn initialize(file: &File) -> Result<Meta> {
     Ok(meta)
 }
 
+/// A loaded meta page and the slot it came from.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LoadedMeta {
+    pub(crate) meta: Meta,
+    pub(crate) slot: u8,
+}
+
 /// Reads both meta slots and returns the newest valid state.
-pub(crate) fn load(file: &File, path: &Path) -> Result<Meta> {
+pub(crate) fn load(file: &File, path: &Path) -> Result<LoadedMeta> {
     let len = file
         .metadata()
         .with_context(|| format!("failed to inspect `{}`", path.display()))?
@@ -225,7 +232,10 @@ pub(crate) fn load(file: &File, path: &Path) -> Result<Meta> {
     }
 
     match best {
-        Some((_, meta)) => Ok(meta),
+        Some((slot, meta)) => Ok(LoadedMeta {
+            meta,
+            slot: slot as u8,
+        }),
         None => bail!(
             "no valid meta page in `{}`: {}",
             path.display(),
@@ -315,7 +325,8 @@ mod tests {
         write_slot(&file, 1, &meta(2, 3)).unwrap();
 
         let loaded = load(&file, Path::new("test")).unwrap();
-        assert_eq!(loaded.txn_id, 2);
+        assert_eq!(loaded.meta.txn_id, 2);
+        assert_eq!(loaded.slot, 1);
     }
 
     #[test]
@@ -330,7 +341,7 @@ mod tests {
         io::write_all_at(&file, &byte, PAGE_SIZE as u64 + 100).unwrap();
 
         let loaded = load(&file, Path::new("test")).unwrap();
-        assert_eq!(loaded.txn_id, 1);
+        assert_eq!(loaded.meta.txn_id, 1);
     }
 
     #[test]
@@ -346,6 +357,6 @@ mod tests {
         let initialized = initialize(&file).unwrap();
 
         let loaded = load(&file, Path::new("test")).unwrap();
-        assert_eq!(loaded, initialized);
+        assert_eq!(loaded.meta, initialized);
     }
 }

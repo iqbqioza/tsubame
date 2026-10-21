@@ -7,11 +7,10 @@
 //!
 //! # Status
 //!
-//! The environment lifecycle, the on-disk meta format, and the B+tree read and
-//! write paths are implemented. Transactions and the public typed database
-//! operations are still under construction, so opening an environment works
-//! but read and write transactions currently return an error. APIs may change
-//! while the engine is being built.
+//! The environment lifecycle, the on-disk meta format, the B+tree read and
+//! write paths, transactions, and typed database operations are implemented.
+//! Named databases, cursors, and iteration are still under construction. APIs
+//! may change while the engine is being built.
 //!
 //! # Example
 //!
@@ -27,7 +26,7 @@
 //! let env = EnvOpenOptions::new().open("/tmp/tsubame")?;
 //!
 //! let mut wtxn = env.write_txn()?;
-//! let db = env.create_database::<Str, U32<NativeEndian>>(&mut wtxn, Some("scores"))?;
+//! let db = env.create_database::<Str, U32<NativeEndian>>(&mut wtxn, None)?;
 //! db.put(&mut wtxn, "alice", &42)?;
 //! wtxn.commit()?;
 //!

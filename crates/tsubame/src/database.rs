@@ -2,63 +2,49 @@
 //!
 //! A [`Database`] is parameterized by a key codec and a data codec. The codecs
 //! determine how keys and values are stored and in which type they are
-//! returned. Database handles are lightweight and can be copied freely.
+//! returned. Database handles are lightweight and can be cloned freely.
 
 use std::fmt;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
-use anyhow::bail;
+use anyhow::ensure;
 
 use crate::Result;
-use crate::traits::{BytesDecode, BytesEncode};
+use crate::env::EnvInner;
+use crate::storage::btree;
+use crate::traits::{BoxedError, BytesDecode, BytesEncode};
 use crate::txn::{RoTxn, RwTxn};
+
+/// Converts a codec error into an `anyhow` error with context.
+fn codec_error(context: &str, error: BoxedError) -> anyhow::Error {
+    anyhow::anyhow!("{context}: {error}")
+}
+
+/// The identity of a database inside an environment.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DatabaseKind {
+    /// The unnamed database whose root lives in the meta page.
+    Unnamed,
+}
 
 /// A typed database.
 ///
 /// `KC` is the key codec and `DC` is the data codec. Both codecs are marker
-/// types such as [`crate::types::Str`] or
-/// [`crate::types::U32`]. Creating a database with the wrong codecs does not
-/// corrupt data, but reads and writes will fail to decode.
+/// types such as [`crate::types::Str`] or [`crate::types::U32`].
 pub struct Database<KC, DC> {
+    pub(crate) env: Arc<EnvInner>,
+    pub(crate) kind: DatabaseKind,
     _codecs: PhantomData<(KC, DC)>,
 }
 
-impl<KC, DC> Clone for Database<KC, DC> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<KC, DC> Copy for Database<KC, DC> {}
-
-impl<KC, DC> fmt::Debug for Database<KC, DC> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Database")
-            .field("key_codec", &std::any::type_name::<KC>())
-            .field("data_codec", &std::any::type_name::<DC>())
-            .finish()
-    }
-}
-
 impl<KC, DC> Database<KC, DC> {
-    /// Stores `data` under `key`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the key or value cannot be encoded, or if the
-    /// transaction is no longer usable. The storage engine is not implemented
-    /// yet, so this currently always returns an error.
-    pub fn put<'a>(
-        &self,
-        _txn: &mut RwTxn<'_>,
-        _key: &'a KC::EItem,
-        _data: &'a DC::EItem,
-    ) -> Result<()>
-    where
-        KC: BytesEncode<'a>,
-        DC: BytesEncode<'a>,
-    {
-        bail!("database writes are not implemented yet")
+    pub(crate) fn new(env: Arc<EnvInner>, kind: DatabaseKind) -> Self {
+        Self {
+            env,
+            kind,
+            _codecs: PhantomData,
+        }
     }
 
     /// Returns the value associated with `key`, if it exists.
@@ -66,18 +52,71 @@ impl<KC, DC> Database<KC, DC> {
     /// # Errors
     ///
     /// Returns an error if the key cannot be encoded or the stored value
-    /// cannot be decoded. The storage engine is not implemented yet, so this
-    /// currently always returns an error.
+    /// cannot be decoded.
     pub fn get<'a, 'txn>(
         &self,
-        _txn: &'txn RoTxn<'_>,
-        _key: &'a KC::EItem,
+        txn: &'txn RoTxn<'_>,
+        key: &'a KC::EItem,
     ) -> Result<Option<DC::DItem>>
     where
         KC: BytesEncode<'a>,
         DC: BytesDecode<'txn>,
     {
-        bail!("database reads are not implemented yet")
+        ensure!(
+            txn.belongs_to(&self.env),
+            "transaction belongs to a different environment"
+        );
+
+        let key =
+            KC::bytes_encode(key).map_err(|error| codec_error("key encoding failed", error))?;
+        let root = txn.root_for(self.kind);
+        let Some(value) = btree::get(txn, root, &key)? else {
+            return Ok(None);
+        };
+
+        Ok(Some(DC::bytes_decode(value).map_err(|error| {
+            codec_error("value decoding failed", error)
+        })?))
+    }
+
+    /// Stores `data` under `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key or value cannot be encoded, or if the
+    /// transaction cannot stage the write. A failed write marks the
+    /// transaction as failed; it can only be aborted.
+    pub fn put<'a>(
+        &self,
+        txn: &mut RwTxn<'_>,
+        key: &'a KC::EItem,
+        data: &'a DC::EItem,
+    ) -> Result<()>
+    where
+        KC: BytesEncode<'a>,
+        DC: BytesEncode<'a>,
+    {
+        ensure!(
+            txn.belongs_to(&self.env),
+            "transaction belongs to a different environment"
+        );
+
+        let result = (|| {
+            let key =
+                KC::bytes_encode(key).map_err(|error| codec_error("key encoding failed", error))?;
+            let value = DC::bytes_encode(data)
+                .map_err(|error| codec_error("value encoding failed", error))?;
+            let root = txn.root_for(self.kind);
+            let txn_id = txn.txn_id();
+            let new_root = btree::insert(txn, root, &key, &value, txn_id)?;
+            txn.set_root(new_root);
+            Ok(())
+        })();
+
+        if result.is_err() {
+            txn.mark_failed();
+        }
+        result
     }
 
     /// Deletes the entry stored under `key`.
@@ -86,44 +125,68 @@ impl<KC, DC> Database<KC, DC> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the key cannot be encoded. The storage engine is not
-    /// implemented yet, so this currently always returns an error.
-    pub fn delete<'a>(&self, _txn: &mut RwTxn<'_>, _key: &'a KC::EItem) -> Result<()>
+    /// Returns an error if the key cannot be encoded, or if the transaction
+    /// cannot stage the write. A failed delete marks the transaction as
+    /// failed; it can only be aborted.
+    pub fn delete<'a>(&self, txn: &mut RwTxn<'_>, key: &'a KC::EItem) -> Result<()>
     where
         KC: BytesEncode<'a>,
     {
-        bail!("database deletes are not implemented yet")
+        ensure!(
+            txn.belongs_to(&self.env),
+            "transaction belongs to a different environment"
+        );
+
+        let result = (|| {
+            let key =
+                KC::bytes_encode(key).map_err(|error| codec_error("key encoding failed", error))?;
+            let root = txn.root_for(self.kind);
+            let txn_id = txn.txn_id();
+            let new_root = btree::delete(txn, root, &key, txn_id)?;
+            txn.set_root(new_root);
+            Ok(())
+        })();
+
+        if result.is_err() {
+            txn.mark_failed();
+        }
+        result
     }
 
-    /// Removes every entry in the database.
+    /// Removes every entry from the database.
+    ///
+    /// The old tree becomes unreachable and is reclaimed by compaction.
     ///
     /// # Errors
     ///
-    /// Returns an error if the transaction is no longer usable. The storage
-    /// engine is not implemented yet, so this currently always returns an
-    /// error.
-    pub fn clear(&self, _txn: &mut RwTxn<'_>) -> Result<()> {
-        bail!("database clears are not implemented yet")
+    /// Returns an error if the transaction belongs to a different environment.
+    pub fn clear(&self, txn: &mut RwTxn<'_>) -> Result<()> {
+        ensure!(
+            txn.belongs_to(&self.env),
+            "transaction belongs to a different environment"
+        );
+        txn.set_root(0);
+        Ok(())
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::byteorder::NativeEndian;
-    use crate::types::{Str, U32};
-
-    fn database() -> Database<Str, U32<NativeEndian>> {
-        Database {
+impl<KC, DC> Clone for Database<KC, DC> {
+    fn clone(&self) -> Self {
+        Self {
+            env: Arc::clone(&self.env),
+            kind: self.kind,
             _codecs: PhantomData,
         }
     }
+}
 
-    #[test]
-    fn database_handles_are_copy() {
-        let database = database();
-        let copy = database;
-
-        assert_eq!(format!("{database:?}"), format!("{copy:?}"));
+impl<KC, DC> fmt::Debug for Database<KC, DC> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Database")
+            .field("path", &self.env.path)
+            .field("kind", &self.kind)
+            .field("key_codec", &std::any::type_name::<KC>())
+            .field("data_codec", &std::any::type_name::<DC>())
+            .finish()
     }
 }

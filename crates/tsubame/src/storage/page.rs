@@ -65,25 +65,43 @@ pub(crate) struct Page<'a> {
 }
 
 impl<'a> Page<'a> {
-    /// Validates and parses a page.
+    /// Validates and parses a page, including its checksum.
     ///
     /// When `expected_id` is provided, the page ID in the header must match it.
     pub(crate) fn parse(bytes: &'a [u8], expected_id: Option<u64>) -> Result<Self> {
+        Self::parse_inner(bytes, expected_id, true)
+    }
+
+    /// Validates and parses a page whose checksum has already been verified.
+    ///
+    /// This still validates every structural invariant; it only skips the
+    /// expensive CRC32C pass.
+    pub(crate) fn parse_unchecked(bytes: &'a [u8], expected_id: Option<u64>) -> Result<Self> {
+        Self::parse_inner(bytes, expected_id, false)
+    }
+
+    fn parse_inner(
+        bytes: &'a [u8],
+        expected_id: Option<u64>,
+        verify_checksum: bool,
+    ) -> Result<Self> {
         ensure!(
             bytes.len() == PAGE_SIZE,
             "page has {} bytes, expected {PAGE_SIZE}",
             bytes.len()
         );
 
-        let stored = LittleEndian::read_u32(&bytes[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4]);
-        let mut copy = [0u8; PAGE_SIZE];
-        copy.copy_from_slice(bytes);
-        copy[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].fill(0);
-        let actual = crc32c::crc32c(&copy);
-        ensure!(
-            stored == actual,
-            "page checksum mismatch (stored {stored:#010x}, computed {actual:#010x})"
-        );
+        if verify_checksum {
+            let stored = LittleEndian::read_u32(&bytes[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4]);
+            let mut copy = [0u8; PAGE_SIZE];
+            copy.copy_from_slice(bytes);
+            copy[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].fill(0);
+            let actual = crc32c::crc32c(&copy);
+            ensure!(
+                stored == actual,
+                "page checksum mismatch (stored {stored:#010x}, computed {actual:#010x})"
+            );
+        }
 
         let page_type = PageType::from_byte(bytes[4])?;
         ensure!(bytes[5] == 0, "unsupported page flags {:#04x}", bytes[5]);
@@ -195,6 +213,11 @@ impl<'a> Page<'a> {
     /// Returns the page type.
     pub(crate) fn page_type(&self) -> PageType {
         self.page_type
+    }
+
+    /// Returns the raw page bytes.
+    pub(crate) fn bytes(&self) -> &'a [u8] {
+        self.bytes
     }
 
     /// Returns the number of slots in the page.
