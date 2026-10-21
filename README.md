@@ -45,7 +45,25 @@ added without changing the main API.
 - [x] Named databases and catalog
 - [x] Ordered forward iteration
 - [x] Range, prefix, and reverse iterators
-- [ ] Serde-based codecs behind features
+- [x] Serde-based codecs behind features
+
+## Codec features
+
+`tsubame` and `tsubame-types` expose optional serde codecs:
+
+```toml
+tsubame = { version = "0.1", features = ["serde-json"] }
+# or
+tsubame = { version = "0.1", features = ["serde-bincode"] }
+```
+
+| Feature | Codec |
+| --- | --- |
+| `serde-json` | `types::SerdeJson<T>` |
+| `serde-bincode` | `types::SerdeBincode<T>` |
+
+Bincode is compact but not self-describing; take care when evolving stored
+schemas.
 
 ## Target API
 
