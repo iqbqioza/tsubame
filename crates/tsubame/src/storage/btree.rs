@@ -271,22 +271,8 @@ fn insert_leaf<S: PageStore>(
                 .context("leaf size overflow")?;
             if size <= PAGE_SIZE {
                 let new_page_id = store.allocate_pages(1)?;
-                let new_page = page::build_leaf_entries_with(
-                    new_page_id,
-                    txn_id,
-                    page.slot_count(),
-                    |index| {
-                        let (key, existing) = page.leaf_entry(index)?;
-                        Ok((
-                            key,
-                            if index == position {
-                                LeafValue::Inline(value)
-                            } else {
-                                existing
-                            },
-                        ))
-                    },
-                )?;
+                let new_page =
+                    page.replace_value_resized(new_page_id, txn_id, position, value, 0)?;
                 store.write_page(new_page_id, new_page)?;
                 store.free_pages(page_id, 1)?;
                 if let LeafValue::Overflow(reference) = old_value {
