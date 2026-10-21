@@ -18,7 +18,7 @@ all-features = true
 
 [dependencies]
 byteorder.workspace = true
-bincode = { workspace = true, optional = true }
+bincode = { workspace = true, optional = true, features = ["serde"] }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 tsubame-traits.workspace = true

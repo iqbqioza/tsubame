@@ -17,7 +17,10 @@ where
     type EItem = T;
 
     fn bytes_encode(item: &'a Self::EItem) -> Result<Cow<'a, [u8]>, BoxedError> {
-        Ok(Cow::Owned(bincode::serialize(item)?))
+        Ok(Cow::Owned(bincode::serde::encode_to_vec(
+            item,
+            bincode::config::legacy(),
+        )?))
     }
 }
 
@@ -28,7 +31,8 @@ where
     type DItem = T;
 
     fn bytes_decode(bytes: &[u8]) -> Result<Self::DItem, BoxedError> {
-        Ok(bincode::deserialize(bytes)?)
+        let (item, _) = bincode::serde::decode_from_slice(bytes, bincode::config::legacy())?;
+        Ok(item)
     }
 }
 
