@@ -584,26 +584,39 @@ impl<'env> RwTxn<'env> {
         let mut root = self.root.unwrap_or(self.base.unnamed_root);
         self.apply_pending(&mut root)?;
 
-        let entries: Vec<CommitEntry> = self
-            .overlay
-            .iter()
-            .map(|(page_id, _)| CommitEntry::Page(*page_id))
-            .chain(
-                self.extents
-                    .iter()
-                    .map(|(start_page, bytes)| CommitEntry::Extent {
+        let txn_id = self.txn_id;
+        let mut single_page = None;
+        let mut entries = Vec::new();
+        if self.extents.is_empty() {
+            let mut overlay = self.overlay.iter();
+            if let Some((page_id, _)) = overlay.next()
+                && overlay.next().is_none()
+            {
+                single_page = Some(*page_id);
+            }
+        }
+        let descriptor =
+            if let Some(page_id) = single_page {
+                Descriptor::Page(page_id)
+            } else {
+                entries.extend(
+                    self.overlay
+                        .iter()
+                        .map(|(page_id, _)| CommitEntry::Page(*page_id)),
+                );
+                entries.extend(self.extents.iter().map(|(start_page, bytes)| {
+                    CommitEntry::Extent {
                         start_page: *start_page,
                         page_count: (bytes.len() / PAGE_SIZE) as u64,
-                    }),
-            )
-            .collect();
-        let txn_id = self.txn_id;
-        let descriptor = commit::build(&mut self, txn_id, &entries)?;
-        let mut inline = [InlineCommit::default(); meta::INLINE_COMMIT_CAPACITY];
-        let (commit_record, commit_page, inline_count) = match descriptor {
-            Descriptor::None => (0, 0, 0),
-            Descriptor::Page(page_id) => (0, page_id, 0),
+                    }
+                }));
+                commit::build(&mut self, txn_id, &entries)?
+            };
+        let (commit_record, commit_page, inline, inline_count) = match descriptor {
+            Descriptor::None => (0, 0, None, 0),
+            Descriptor::Page(page_id) => (0, page_id, None, 0),
             Descriptor::Inline(entries) => {
+                let mut inline = [InlineCommit::default(); meta::INLINE_COMMIT_CAPACITY];
                 for (slot, entry) in entries.iter().enumerate() {
                     inline[slot] = match *entry {
                         CommitEntry::Page(page_id) => InlineCommit {
@@ -619,7 +632,7 @@ impl<'env> RwTxn<'env> {
                         },
                     };
                 }
-                (0, 0, entries.len() as u32)
+                (0, 0, Some(inline), entries.len() as u32)
             }
             Descriptor::Chain(page_id) => {
                 let pages = commit::chain_page_count(entries.len())?;
@@ -631,7 +644,7 @@ impl<'env> RwTxn<'env> {
                     // recoverable meta snapshots.
                     freed_txn: self.txn_id.saturating_add(1),
                 });
-                (page_id, 0, 0)
+                (page_id, 0, None, 0)
             }
         };
 
@@ -645,7 +658,7 @@ impl<'env> RwTxn<'env> {
             commit_record,
             commit_page,
             inline_count,
-            inline,
+            inline: inline.unwrap_or_default(),
         };
         new_meta.validate()?;
 
@@ -829,7 +842,16 @@ impl<'env> RwTxn<'env> {
         }
 
         let slot = 1 - self.base_slot;
-        meta::write_slot(data, slot as usize, new_meta)?;
+        {
+            let mut page = self
+                .env
+                .inner
+                .meta_buffer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            new_meta.encode_into(&mut page);
+            meta::write_slot_page(data, slot as usize, &page)?;
+        }
         data.sync_data().context("failed to sync the commit")?;
 
         let mut committed = self
