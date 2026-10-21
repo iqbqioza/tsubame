@@ -179,6 +179,36 @@ fn insert_leaf<S: PageStore>(
     value: &[u8],
     txn_id: u64,
 ) -> Result<InsertResult> {
+    let position = page.lower_bound(key)?;
+    let existing = position < page.slot_count() && page.key(position)? == key;
+    let inline = SLOT_SIZE + key.len() + value.len() <= INLINE_BUDGET;
+
+    if inline {
+        if existing {
+            if let LeafValue::Inline(old) = page.leaf_value(position)? {
+                if old.len() == value.len() {
+                    let new_page_id = store.allocate_pages(1)?;
+                    let new_page = page.replace_value(new_page_id, txn_id, position, value, 0)?;
+                    store.write_page(new_page_id, new_page)?;
+                    store.free_pages(page_id, 1)?;
+                    return Ok(InsertResult {
+                        page_id: new_page_id,
+                        split: None,
+                    });
+                }
+            }
+        } else if position == page.slot_count() && page.can_append(key.len(), value.len()) {
+            let new_page_id = store.allocate_pages(1)?;
+            let new_page = page.append_entry(new_page_id, txn_id, key, value, 0)?;
+            store.write_page(new_page_id, new_page)?;
+            store.free_pages(page_id, 1)?;
+            return Ok(InsertResult {
+                page_id: new_page_id,
+                split: None,
+            });
+        }
+    }
+
     let mut entries = collect_leaf(page)?;
     let index = entries
         .binary_search_by(|entry| entry.key.as_slice().cmp(key))
@@ -216,10 +246,22 @@ fn insert_branch<S: PageStore>(
     txn_id: u64,
     depth: usize,
 ) -> Result<InsertResult> {
-    let mut entries = collect_branch(page)?;
     let index = page.branch_child_index(key)?;
-    let result = insert_into(store, entries[index].1, key, value, txn_id, depth + 1)?;
+    let child = page.child(index)?;
+    let result = insert_into(store, child, key, value, txn_id, depth + 1)?;
 
+    if result.split.is_none() {
+        let new_page_id = store.allocate_pages(1)?;
+        let new_page = page.replace_child(new_page_id, txn_id, index, result.page_id)?;
+        store.write_page(new_page_id, new_page)?;
+        store.free_pages(page_id, 1)?;
+        return Ok(InsertResult {
+            page_id: new_page_id,
+            split: None,
+        });
+    }
+
+    let mut entries = collect_branch(page)?;
     entries[index].1 = result.page_id;
     if let Some(split) = result.split {
         entries.insert(index + 1, (split.separator, split.right));
@@ -297,9 +339,9 @@ fn delete_branch<S: PageStore>(
     txn_id: u64,
     depth: usize,
 ) -> Result<DeleteResult> {
-    let mut entries = collect_branch(page)?;
     let index = page.branch_child_index(key)?;
-    let result = delete_into(store, entries[index].1, key, txn_id, depth + 1)?;
+    let child = page.child(index)?;
+    let result = delete_into(store, child, key, txn_id, depth + 1)?;
 
     if !result.changed {
         return Ok(DeleteResult {
@@ -308,11 +350,27 @@ fn delete_branch<S: PageStore>(
         });
     }
 
-    if result.page_id == 0 {
-        entries.remove(index);
-    } else {
-        entries[index].1 = result.page_id;
+    if result.page_id != 0 {
+        if page.slot_count() > 1 {
+            let new_page_id = store.allocate_pages(1)?;
+            let new_page = page.replace_child(new_page_id, txn_id, index, result.page_id)?;
+            store.write_page(new_page_id, new_page)?;
+            store.free_pages(page_id, 1)?;
+            return Ok(DeleteResult {
+                page_id: new_page_id,
+                changed: true,
+            });
+        }
+
+        store.free_pages(page_id, 1)?;
+        return Ok(DeleteResult {
+            page_id: result.page_id,
+            changed: true,
+        });
     }
+
+    let mut entries = collect_branch(page)?;
+    entries.remove(index);
 
     if entries.is_empty() {
         store.free_pages(page_id, 1)?;
