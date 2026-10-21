@@ -1,0 +1,26 @@
+[package]
+name = "tsubame"
+description = "A typed embedded key-value store inspired by heed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/tsubame"
+keywords = ["database", "embedded", "key-value", "storage", "typed"]
+categories = ["database", "data-structures"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+anyhow.workspace = true
+byteorder.workspace = true
+tsubame-traits.workspace = true
+tsubame-types.workspace = true
+
+[lints]
+workspace = true
