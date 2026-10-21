@@ -23,10 +23,12 @@ fn codec_error(context: &str, error: BoxedError) -> anyhow::Error {
 }
 
 /// The identity of a database inside an environment.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DatabaseKind {
     /// The unnamed database whose root lives in the meta page.
     Unnamed,
+    /// A named database whose root lives in the catalog.
+    Named(Arc<str>),
 }
 
 /// A typed database.
@@ -70,7 +72,7 @@ impl<KC, DC> Database<KC, DC> {
 
         let key =
             KC::bytes_encode(key).map_err(|error| codec_error("key encoding failed", error))?;
-        let root = txn.root_for(self.kind);
+        let root = txn.root_for(&self.kind)?;
         let Some(value) = btree::get(txn, root, &key)? else {
             return Ok(None);
         };
@@ -112,7 +114,7 @@ impl<KC, DC> Database<KC, DC> {
                 "key is {} bytes, maximum is {MAX_KEY_SIZE}",
                 key.len()
             );
-            txn.put_raw(key.into_owned(), value.into_owned());
+            txn.put_raw(self.kind.clone(), key.into_owned(), value.into_owned());
             Ok(())
         })();
 
@@ -148,7 +150,7 @@ impl<KC, DC> Database<KC, DC> {
                 "key is {} bytes, maximum is {MAX_KEY_SIZE}",
                 key.len()
             );
-            txn.delete_raw(key.into_owned());
+            txn.delete_raw(self.kind.clone(), key.into_owned());
             Ok(())
         })();
 
@@ -170,7 +172,7 @@ impl<KC, DC> Database<KC, DC> {
             txn.belongs_to(&self.env),
             "transaction belongs to a different environment"
         );
-        txn.clear_raw();
+        txn.clear_raw(self.kind.clone())?;
         Ok(())
     }
 }
@@ -179,7 +181,7 @@ impl<KC, DC> Clone for Database<KC, DC> {
     fn clone(&self) -> Self {
         Self {
             env: Arc::clone(&self.env),
-            kind: self.kind,
+            kind: self.kind.clone(),
             _codecs: PhantomData,
         }
     }

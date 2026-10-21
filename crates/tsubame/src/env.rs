@@ -90,9 +90,7 @@ impl Env {
         RwTxn::new(self, writer, committed)
     }
 
-    /// Opens the unnamed default database.
-    ///
-    /// Named databases are not implemented yet; `name` must be `None`.
+    /// Opens the unnamed default database or a named database.
     pub fn open_database<KC, DC>(
         &self,
         txn: &RoTxn<'_>,
@@ -102,19 +100,25 @@ impl Env {
             txn.belongs_to(&self.inner),
             "transaction belongs to a different environment"
         );
-        if name.is_some() {
-            bail!("named databases are not implemented yet");
-        }
 
-        Ok(Database::new(
-            Arc::clone(&self.inner),
-            DatabaseKind::Unnamed,
-        ))
+        let kind = match name {
+            None => DatabaseKind::Unnamed,
+            Some(name) => {
+                validate_database_name(name)?;
+                ensure!(
+                    txn.catalog_lookup(name)?.is_some(),
+                    "database `{name}` does not exist"
+                );
+                DatabaseKind::Named(Arc::from(name))
+            }
+        };
+
+        Ok(Database::new(Arc::clone(&self.inner), kind))
     }
 
-    /// Opens the unnamed default database, creating it if needed.
+    /// Creates a named database, or opens it if it already exists.
     ///
-    /// Named databases are not implemented yet; `name` must be `None`.
+    /// Pass `None` to use the unnamed default database.
     pub fn create_database<KC, DC>(
         &self,
         txn: &mut RwTxn<'_>,
@@ -124,14 +128,27 @@ impl Env {
             txn.belongs_to(&self.inner),
             "transaction belongs to a different environment"
         );
-        if name.is_some() {
-            bail!("named databases are not implemented yet");
-        }
 
-        Ok(Database::new(
-            Arc::clone(&self.inner),
-            DatabaseKind::Unnamed,
-        ))
+        let kind = match name {
+            None => DatabaseKind::Unnamed,
+            Some(name) => {
+                validate_database_name(name)?;
+                if txn.catalog_lookup(name)?.is_none() {
+                    let count = usize::try_from(txn.catalog_count())
+                        .context("database count is too large")?;
+                    ensure!(
+                        count < self.inner.max_dbs,
+                        "maximum number of named databases ({}) reached",
+                        self.inner.max_dbs
+                    );
+                    txn.catalog_put(name, 0)?;
+                    txn.increment_database_count()?;
+                }
+                DatabaseKind::Named(Arc::from(name))
+            }
+        };
+
+        Ok(Database::new(Arc::clone(&self.inner), kind))
     }
 }
 
@@ -573,6 +590,17 @@ impl EnvOpenOptions {
             inner: Arc::new(inner),
         })
     }
+}
+
+/// Validates a user-provided named database name.
+fn validate_database_name(name: &str) -> Result<()> {
+    ensure!(!name.is_empty(), "database name must not be empty");
+    ensure!(
+        name.len() <= 255,
+        "database name is {} bytes, maximum is 255",
+        name.len()
+    );
+    Ok(())
 }
 
 /// Rounds `map_size` up to a page boundary and enforces the minimum size.
