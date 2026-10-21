@@ -5,6 +5,8 @@
 
 #![allow(dead_code)]
 
+use std::collections::BTreeSet;
+
 use anyhow::{Context, Result, bail, ensure};
 
 use super::PAGE_SIZE;
@@ -62,6 +64,58 @@ pub(crate) fn get<'a, S: PageSource>(
     }
 
     bail!("B+tree depth exceeded {MAX_DEPTH}; the page chain may contain a cycle")
+}
+
+/// Frees every page and overflow extent reachable from `root`.
+///
+/// The tree is only read; the caller decides whether the transaction commits.
+/// Aborting a transaction that called this function discards the recorded frees,
+/// leaving the committed tree intact.
+pub(crate) fn free_tree<S: PageStore>(store: &mut S, root: u64) -> Result<()> {
+    if root == 0 {
+        return Ok(());
+    }
+
+    let mut visited = BTreeSet::new();
+    free_tree_inner(store, root, 0, &mut visited)
+}
+
+fn free_tree_inner<S: PageStore>(
+    store: &mut S,
+    page_id: u64,
+    depth: usize,
+    visited: &mut BTreeSet<u64>,
+) -> Result<()> {
+    ensure!(depth < MAX_DEPTH, "tree exceeds the maximum depth");
+    ensure!(
+        page_id >= 2,
+        "cannot free reserved page {page_id} as part of a tree"
+    );
+    ensure!(
+        visited.insert(page_id),
+        "tree references page {page_id} more than once"
+    );
+
+    let bytes = store.read_page(page_id)?;
+    let page = Page::parse(&bytes, Some(page_id))?;
+
+    match page.page_type() {
+        PageType::Branch => {
+            for index in 0..page.slot_count() {
+                let child = page.child(index)?;
+                free_tree_inner(store, child, depth + 1, visited)?;
+            }
+        }
+        PageType::Leaf => {
+            for index in 0..page.slot_count() {
+                if let LeafValue::Overflow(reference) = page.leaf_value(index)? {
+                    store.free_pages(reference.start_page, reference.page_count)?;
+                }
+            }
+        }
+    }
+
+    store.free_pages(page_id, 1)
 }
 
 /// Inserts or replaces `key` and returns the new root page ID.
@@ -210,23 +264,19 @@ fn insert_leaf<S: PageStore>(
     }
 
     let mut entries = collect_leaf(page)?;
-    let index = entries
-        .binary_search_by(|entry| entry.key.as_slice().cmp(key))
-        .unwrap_or_else(|index| index);
-
-    let replaced = if index < entries.len() {
-        let new_value = make_value(store, key.len(), value, txn_id)?;
-        Some(std::mem::replace(&mut entries[index].value, new_value))
-    } else {
-        let new_value = make_value(store, key.len(), value, txn_id)?;
-        entries.insert(
-            index,
-            OwnedLeafEntry {
-                key: key.to_vec(),
-                value: new_value,
-            },
-        );
-        None
+    let new_value = make_value(store, key.len(), value, txn_id)?;
+    let replaced = match entries.binary_search_by(|entry| entry.key.as_slice().cmp(key)) {
+        Ok(index) => Some(std::mem::replace(&mut entries[index].value, new_value)),
+        Err(index) => {
+            entries.insert(
+                index,
+                OwnedLeafEntry {
+                    key: key.to_vec(),
+                    value: new_value,
+                },
+            );
+            None
+        }
     };
 
     let result = store_leaf(store, page_id, entries, txn_id)?;
@@ -762,6 +812,16 @@ mod tests {
         for (key, value) in map {
             assert_eq!(get(store, root, key).unwrap(), Some(value.as_slice()));
         }
+    }
+
+    #[test]
+    fn inserts_a_smaller_key_into_one_leaf() {
+        let mut store = MemoryStore::new();
+        let mut root = insert(&mut store, 0, b"key-012", b"base", 1).unwrap();
+        root = insert(&mut store, root, b"key-007", b"v", 2).unwrap();
+
+        assert_eq!(get(&store, root, b"key-007").unwrap(), Some(&b"v"[..]));
+        assert_eq!(get(&store, root, b"key-012").unwrap(), Some(&b"base"[..]));
     }
 
     #[test]

@@ -182,7 +182,7 @@ pub struct EnvInfo {
     pub map_size: usize,
     /// The page size used by the on-disk format.
     pub page_size: usize,
-    /// The number of pages reachable from the current commit.
+    /// The page count high-water mark for the current commit.
     pub page_count: u64,
     /// The transaction ID of the current commit.
     pub txn_id: u64,
@@ -192,6 +192,20 @@ pub struct EnvInfo {
     pub max_dbs: usize,
     /// The on-disk format version.
     pub format_version: u32,
+}
+
+/// A page or contiguous run that is no longer reachable from a committed meta.
+///
+/// `freed_txn` records the commit generation that released the extent. Data
+/// pages freed by commit N are referenced by the snapshot at N - 1, so they
+/// are reusable only once commit N + 1 has replaced that fallback snapshot.
+/// Commit-record pages are referenced by their own commit, which requires one
+/// additional generation of delay.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FreeExtent {
+    pub(crate) start_page: u64,
+    pub(crate) pages: u64,
+    pub(crate) freed_txn: u64,
 }
 
 /// The committed meta state and the slot that contains it.
@@ -211,6 +225,10 @@ pub(crate) struct EnvInner {
     pub(crate) committed: RwLock<Committed>,
     pub(crate) writer: Mutex<()>,
     pub(crate) readers: Mutex<BTreeMap<u64, usize>>,
+    /// Extents that are no longer reachable from the current commit, tagged
+    /// with the generation that released them. The writer moves reusable
+    /// extents into its transaction and returns the unused ones.
+    pub(crate) free_pool: Mutex<Vec<FreeExtent>>,
     pub(crate) poisoned: AtomicBool,
     clean_marker_on_drop: AtomicBool,
     verified: Vec<AtomicU64>,
@@ -274,6 +292,44 @@ impl EnvInner {
                 readers.remove(&txn_id);
             }
         }
+    }
+
+    pub(crate) fn oldest_reader_snapshot(&self, fallback: u64) -> u64 {
+        self.readers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys()
+            .next()
+            .copied()
+            .unwrap_or(fallback)
+    }
+
+    pub(crate) fn take_reusable_free(&self, limit_txn: u64) -> Vec<FreeExtent> {
+        let mut pool = self
+            .free_pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut reusable = Vec::new();
+        let mut retained = Vec::with_capacity(pool.len());
+
+        for extent in pool.drain(..) {
+            if extent.freed_txn <= limit_txn {
+                reusable.push(extent);
+            } else {
+                retained.push(extent);
+            }
+        }
+
+        *pool = retained;
+        reusable
+    }
+
+    pub(crate) fn return_free(&self, extents: impl IntoIterator<Item = FreeExtent>) {
+        let mut pool = self
+            .free_pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pool.extend(extents);
     }
 
     pub(crate) fn read_page(&self, page_id: u64, snapshot: &Meta) -> Result<Page<'_>> {
@@ -594,6 +650,7 @@ impl EnvOpenOptions {
             }),
             writer: Mutex::new(()),
             readers: Mutex::new(BTreeMap::new()),
+            free_pool: Mutex::new(Vec::new()),
             poisoned: AtomicBool::new(false),
             clean_marker_on_drop: AtomicBool::new(true),
             verified,

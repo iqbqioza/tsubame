@@ -1,5 +1,6 @@
 //! End-to-end tests for snapshots, commits, and persistence.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
@@ -191,6 +192,58 @@ fn batch_insert_reuses_transaction_pages() -> Result<()> {
         "page count {} suggests transaction pages were not reused",
         env.info().page_count
     );
+
+    Ok(())
+}
+
+#[test]
+fn clear_reclaims_pages_and_abort_keeps_the_tree() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+    for i in 0..1_000u32 {
+        db.put(&mut wtxn, &format!("key-{i:04}"), "initial")?;
+    }
+    wtxn.commit()?;
+
+    let mut wtxn = env.write_txn()?;
+    db.clear(&mut wtxn)?;
+    wtxn.commit()?;
+
+    let mut wtxn = env.write_txn()?;
+    for i in 0..1_000u32 {
+        db.put(&mut wtxn, &format!("key-{i:04}"), "second")?;
+    }
+    wtxn.commit()?;
+    let after_refill = env.info().page_count;
+
+    let mut wtxn = env.write_txn()?;
+    db.clear(&mut wtxn)?;
+    wtxn.commit()?;
+
+    let mut wtxn = env.write_txn()?;
+    for i in 0..1_000u32 {
+        db.put(&mut wtxn, &format!("key-{i:04}"), "third")?;
+    }
+    wtxn.commit()?;
+
+    assert!(
+        env.info().page_count <= after_refill + 20,
+        "clear/refill grew the file from {after_refill} to {}",
+        env.info().page_count
+    );
+
+    let rtxn = env.read_txn()?;
+    assert_eq!(db.get(&rtxn, "key-0000")?, Some("third"));
+    drop(rtxn);
+
+    let mut wtxn = env.write_txn()?;
+    db.clear(&mut wtxn)?;
+    wtxn.abort()?;
+
+    let rtxn = env.read_txn()?;
+    assert_eq!(db.get(&rtxn, "key-0000")?, Some("third"));
 
     Ok(())
 }
@@ -665,6 +718,341 @@ fn compaction_requires_the_environment_to_be_closed() -> Result<()> {
 
     drop(env);
     Env::compact(dir.path())?;
+
+    Ok(())
+}
+
+#[test]
+fn online_page_reuse_keeps_growth_bounded() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+    for i in 0..1_000u32 {
+        let key = format!("key-{i:04}");
+        db.put(&mut wtxn, &key, "initial")?;
+    }
+    wtxn.commit()?;
+    let base_pages = env.info().page_count;
+
+    for round in 0..50u32 {
+        let mut wtxn = env.write_txn()?;
+        for i in 0..100u32 {
+            let key = format!("key-{:04}", (round * 100 + i) % 1_000);
+            db.put(&mut wtxn, &key, &format!("round-{round}"))?;
+        }
+        wtxn.commit()?;
+    }
+
+    let after_pages = env.info().page_count;
+    assert!(
+        after_pages <= base_pages + 50,
+        "page count grew from {base_pages} to {after_pages}"
+    );
+
+    let rtxn = env.read_txn()?;
+    assert_eq!(db.get(&rtxn, "key-0000")?, Some("round-40"));
+    assert_eq!(db.get(&rtxn, "key-0001")?, Some("round-40"));
+    drop(rtxn);
+    drop(db);
+    drop(env);
+
+    let env = options().open(dir.path())?;
+    let rtxn = env.read_txn()?;
+    let db = env.open_database::<Str, Str>(&rtxn, None)?;
+    assert_eq!(db.get(&rtxn, "key-0000")?, Some("round-40"));
+    assert_eq!(db.get(&rtxn, "key-0900")?, Some("round-49"));
+
+    Ok(())
+}
+
+#[test]
+fn online_page_reuse_reclaims_overflow_extents() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+    for i in 0..20u32 {
+        let value = format!("initial-{i}-{}", "x".repeat(10_000));
+        db.put(&mut wtxn, &format!("key-{i:04}"), &value)?;
+    }
+    wtxn.commit()?;
+    let base_pages = env.info().page_count;
+
+    for round in 0..5u32 {
+        let mut wtxn = env.write_txn()?;
+        for i in 0..20u32 {
+            let value = format!("round-{round}-{i}-{}", "y".repeat(10_000));
+            db.put(&mut wtxn, &format!("key-{i:04}"), &value)?;
+        }
+        wtxn.commit()?;
+    }
+    let steady_pages = env.info().page_count;
+
+    for round in 5..25u32 {
+        let mut wtxn = env.write_txn()?;
+        for i in 0..20u32 {
+            let value = format!("round-{round}-{i}-{}", "y".repeat(10_000));
+            db.put(&mut wtxn, &format!("key-{i:04}"), &value)?;
+        }
+        wtxn.commit()?;
+    }
+
+    let after_pages = env.info().page_count;
+    assert!(
+        after_pages <= steady_pages + 12,
+        "overflow page count grew from {steady_pages} to {after_pages} (base {base_pages})"
+    );
+
+    let rtxn = env.read_txn()?;
+    let value = db.get(&rtxn, "key-0000")?.expect("missing value");
+    assert!(value.starts_with("round-24-0-"));
+    let value = db.get(&rtxn, "key-0019")?.expect("missing value");
+    assert!(value.starts_with("round-24-19-"));
+
+    Ok(())
+}
+
+#[test]
+fn page_reuse_waits_for_readers() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+    db.put(&mut wtxn, "key", "old")?;
+    wtxn.commit()?;
+
+    let rtxn = env.read_txn()?;
+    for round in 0..20 {
+        let mut wtxn = env.write_txn()?;
+        db.put(&mut wtxn, "key", &format!("new-{round}"))?;
+        wtxn.commit()?;
+    }
+    assert_eq!(db.get(&rtxn, "key")?, Some("old"));
+    drop(rtxn);
+
+    let rtxn = env.read_txn()?;
+    assert_eq!(db.get(&rtxn, "key")?, Some("new-19"));
+
+    Ok(())
+}
+
+#[test]
+fn aborted_transactions_return_reused_pages() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+    for i in 0..100u32 {
+        db.put(&mut wtxn, &format!("key-{i:04}"), "initial")?;
+    }
+    wtxn.commit()?;
+    let base_pages = env.info().page_count;
+
+    for round in 0..20u32 {
+        let mut wtxn = env.write_txn()?;
+        for i in 0..100u32 {
+            db.put(
+                &mut wtxn,
+                &format!("key-{i:04}"),
+                &format!("aborted-{round}"),
+            )?;
+        }
+        wtxn.abort()?;
+    }
+
+    let mut wtxn = env.write_txn()?;
+    for i in 0..100u32 {
+        db.put(&mut wtxn, &format!("key-{i:04}"), "committed")?;
+    }
+    wtxn.commit()?;
+
+    let after_pages = env.info().page_count;
+    assert!(
+        after_pages <= base_pages + 10,
+        "aborted transactions leaked pages: {base_pages} -> {after_pages}"
+    );
+
+    let rtxn = env.read_txn()?;
+    assert_eq!(db.get(&rtxn, "key-0000")?, Some("committed"));
+
+    Ok(())
+}
+
+#[test]
+fn page_reuse_keeps_previous_meta_recoverable() -> Result<()> {
+    let dir = tempdir()?;
+    let latest_txn;
+    {
+        let env = options().open(dir.path())?;
+        let mut wtxn = env.write_txn()?;
+        let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+        wtxn.commit()?;
+
+        for round in 0..30u32 {
+            let mut wtxn = env.write_txn()?;
+            db.put(&mut wtxn, "key", &format!("round-{round}"))?;
+            wtxn.commit()?;
+        }
+        latest_txn = env.info().txn_id;
+        let rtxn = env.read_txn()?;
+        assert_eq!(db.get(&rtxn, "key")?, Some("round-29"));
+    }
+
+    std::fs::remove_file(dir.path().join("clean.tsubame")).ok();
+    let slot = (latest_txn - 1) % 2;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(dir.path().join("data.tsubame"))?;
+    file.seek(SeekFrom::Start(slot * 4096 + 100))?;
+    file.write_all(&[0xff])?;
+
+    let env = options().open(dir.path())?;
+    assert_eq!(env.info().txn_id, latest_txn - 1);
+    let rtxn = env.read_txn()?;
+    let db = env.open_database::<Str, Str>(&rtxn, None)?;
+    assert_eq!(db.get(&rtxn, "key")?, Some("round-28"));
+
+    Ok(())
+}
+
+#[test]
+fn page_reuse_keeps_previous_commit_record_recoverable() -> Result<()> {
+    let dir = tempdir()?;
+    let latest_txn;
+    {
+        let env = options().open(dir.path())?;
+        let mut wtxn = env.write_txn()?;
+        let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+        for i in 0..10u32 {
+            let value = format!("initial-{i}-{}", "x".repeat(10_000));
+            db.put(&mut wtxn, &format!("key-{i:04}"), &value)?;
+        }
+        wtxn.commit()?;
+
+        for round in 0..6u32 {
+            let mut wtxn = env.write_txn()?;
+            for i in 0..10u32 {
+                let value = format!("round-{round}-{i}-{}", "y".repeat(10_000));
+                db.put(&mut wtxn, &format!("key-{i:04}"), &value)?;
+            }
+            wtxn.commit()?;
+        }
+        latest_txn = env.info().txn_id;
+        let rtxn = env.read_txn()?;
+        let value = db.get(&rtxn, "key-0000")?.expect("missing value");
+        assert!(value.starts_with("round-5-0-"));
+    }
+
+    std::fs::remove_file(dir.path().join("clean.tsubame")).ok();
+    let slot = (latest_txn - 1) % 2;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(dir.path().join("data.tsubame"))?;
+    file.seek(SeekFrom::Start(slot * 4096 + 100))?;
+    file.write_all(&[0xff])?;
+
+    let env = options().open(dir.path())?;
+    assert_eq!(env.info().txn_id, latest_txn - 1);
+    let rtxn = env.read_txn()?;
+    let db = env.open_database::<Str, Str>(&rtxn, None)?;
+    let value = db.get(&rtxn, "key-0000")?.expect("missing value");
+    assert!(value.starts_with("round-4-0-"));
+
+    Ok(())
+}
+
+#[test]
+fn reuse_survives_mixed_updates_clear_and_readers() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+    wtxn.commit()?;
+
+    let mut expected = BTreeMap::new();
+    let mut state = 0x1234_5678_9abc_def0u64;
+    let mut next = |bound: u64| {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (state >> 33) % bound
+    };
+
+    let mut old_snapshot = None;
+    for round in 0..40u32 {
+        if round == 10 {
+            old_snapshot = Some((env.read_txn()?, expected.clone()));
+        }
+
+        let mut trial = expected.clone();
+        let mut wtxn = env.write_txn()?;
+        for step in 0..20u32 {
+            let index = next(64);
+            let key = format!("key-{index:03}");
+            match next(10) {
+                0 => {
+                    db.clear(&mut wtxn)?;
+                    trial.clear();
+                }
+                1..=3 => {
+                    db.delete(&mut wtxn, &key)?;
+                    trial.remove(&key);
+                }
+                _ => {
+                    let value = format!("round-{round}-step-{step}");
+                    db.put(&mut wtxn, &key, &value)?;
+                    trial.insert(key, value);
+                }
+            }
+        }
+
+        let abort = next(10) == 0;
+        if abort {
+            wtxn.abort()?;
+        } else {
+            wtxn.commit()?;
+            expected = trial;
+        }
+
+        let rtxn = env.read_txn()?;
+        for index in 0..64u32 {
+            let key = format!("key-{index:03}");
+            assert_eq!(
+                db.get(&rtxn, &key)?,
+                expected.get(&key).map(String::as_str),
+                "current snapshot diverged at round {round}, key {key}"
+            );
+        }
+        drop(rtxn);
+
+        if let Some((rtxn, snapshot)) = &old_snapshot {
+            for index in 0..64u32 {
+                let key = format!("key-{index:03}");
+                assert_eq!(
+                    db.get(rtxn, &key)?,
+                    snapshot.get(&key).map(String::as_str),
+                    "old snapshot diverged at round {round}, key {key}"
+                );
+            }
+        }
+    }
+
+    drop(old_snapshot);
+    drop(db);
+    drop(env);
+
+    let env = options().open(dir.path())?;
+    let rtxn = env.read_txn()?;
+    let db = env.open_database::<Str, Str>(&rtxn, None)?;
+    for index in 0..64u32 {
+        let key = format!("key-{index:03}");
+        assert_eq!(
+            db.get(&rtxn, &key)?,
+            expected.get(&key).map(String::as_str),
+            "reopened state diverged at key {key}"
+        );
+    }
 
     Ok(())
 }

@@ -10,7 +10,7 @@ use std::sync::{Arc, MutexGuard};
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::database::DatabaseKind;
-use crate::env::{Committed, Env, EnvInner};
+use crate::env::{Committed, Env, EnvInner, FreeExtent};
 use crate::storage::btree;
 use crate::storage::btree::PageSource;
 use crate::storage::commit::{self, CommitEntry, Descriptor};
@@ -222,6 +222,20 @@ pub struct RwTxn<'env> {
     next_page: u64,
     free_single: BTreeSet<u64>,
     free_runs: BTreeMap<u64, u64>,
+    // Free extents taken from the environment at the start of this
+    // transaction. They are safe for the committed snapshots and active
+    // readers, but are not part of this transaction yet.
+    cross_free: Vec<FreeExtent>,
+    // Pages from `cross_free` that this transaction has allocated. They are
+    // returned to the environment if the transaction is aborted.
+    cross_allocated: Vec<FreeExtent>,
+    // Pages reachable from the previous committed snapshot that this
+    // transaction replaced. They become reusable after two more commits.
+    base_freed: Vec<FreeExtent>,
+    // Pages allocated by this transaction. Page IDs alone do not distinguish
+    // an old base page from a reused free page below the old high-water mark.
+    owned_pages: BTreeSet<u64>,
+    deferred_free: Vec<FreeExtent>,
     unnamed_pending: Pending,
     named_pending: BTreeMap<Arc<str>, Pending>,
     cleared_named: BTreeSet<Arc<str>>,
@@ -243,6 +257,9 @@ impl<'env> RwTxn<'env> {
             .txn_id
             .checked_add(1)
             .context("transaction ID overflow")?;
+        let oldest_reader = env.inner.oldest_reader_snapshot(committed.meta.txn_id);
+        let free_limit = committed.meta.txn_id.saturating_sub(1).min(oldest_reader);
+        let cross_free = env.inner.take_reusable_free(free_limit);
 
         Ok(Self {
             env,
@@ -254,6 +271,11 @@ impl<'env> RwTxn<'env> {
             next_page: committed.meta.page_count,
             free_single: BTreeSet::new(),
             free_runs: BTreeMap::new(),
+            cross_free,
+            cross_allocated: Vec::new(),
+            base_freed: Vec::new(),
+            owned_pages: BTreeSet::new(),
+            deferred_free: Vec::new(),
             unnamed_pending: Pending::new(),
             named_pending: BTreeMap::new(),
             cleared_named: BTreeSet::new(),
@@ -294,10 +316,21 @@ impl<'env> RwTxn<'env> {
     pub(crate) fn clear_raw(&mut self, kind: DatabaseKind) -> Result<()> {
         match kind {
             DatabaseKind::Unnamed => {
+                let root = self.root.unwrap_or(self.base.unnamed_root);
+                if root != 0 {
+                    btree::free_tree(self, root)?;
+                }
                 self.unnamed_pending = Pending::new();
                 self.root = Some(0);
             }
             DatabaseKind::Named(name) => {
+                if !self.cleared_named.contains(&name) {
+                    if let Some(root) = self.catalog_lookup(&name)? {
+                        if root != 0 {
+                            btree::free_tree(self, root)?;
+                        }
+                    }
+                }
                 self.named_pending.remove(&name);
                 self.cleared_named.insert(name);
             }
@@ -419,7 +452,18 @@ impl<'env> RwTxn<'env> {
                 }
                 (0, 0, entries.len() as u32)
             }
-            Descriptor::Chain(page_id) => (page_id, 0, 0),
+            Descriptor::Chain(page_id) => {
+                let pages = commit::chain_page_count(entries.len())?;
+                self.deferred_free.push(FreeExtent {
+                    start_page: page_id,
+                    pages,
+                    // The new meta references this chain. It cannot be reused
+                    // until the following two commits have replaced both
+                    // recoverable meta snapshots.
+                    freed_txn: self.txn_id.saturating_add(1),
+                });
+                (page_id, 0, 0)
+            }
         };
 
         let new_meta = Meta {
@@ -441,7 +485,34 @@ impl<'env> RwTxn<'env> {
             return Err(error);
         }
 
+        self.recycle_pages();
         Ok(())
+    }
+
+    fn recycle_pages(&mut self) {
+        // The free pool uses commit generations to avoid overwriting pages
+        // referenced by either of the two recoverable meta snapshots. A page
+        // freed by commit N is referenced by the snapshot at N - 1, so it may
+        // only be reused once commit N + 1 has overwritten that snapshot.
+        let mut extents = std::mem::take(&mut self.cross_free);
+        extents.append(&mut self.base_freed);
+        extents.append(&mut self.deferred_free);
+        self.cross_allocated.clear();
+        for page_id in std::mem::take(&mut self.free_single) {
+            extents.push(FreeExtent {
+                start_page: page_id,
+                pages: 1,
+                freed_txn: self.txn_id,
+            });
+        }
+        for (start_page, pages) in std::mem::take(&mut self.free_runs) {
+            extents.push(FreeExtent {
+                start_page,
+                pages,
+                freed_txn: self.txn_id,
+            });
+        }
+        self.env.inner.return_free(extents);
     }
 
     fn apply_pending(&mut self, root: &mut u64) -> Result<()> {
@@ -560,6 +631,19 @@ impl<'env> RwTxn<'env> {
     }
 }
 
+impl Drop for RwTxn<'_> {
+    fn drop(&mut self) {
+        // Aborted transactions must not lose pages that were taken from the
+        // shared free pool. Returning them with their original generation is
+        // safe because uncommitted page contents are never written to disk.
+        let mut extents = std::mem::take(&mut self.cross_free);
+        extents.append(&mut self.cross_allocated);
+        if !extents.is_empty() {
+            self.env.inner.return_free(extents);
+        }
+    }
+}
+
 impl PageSource for RwTxn<'_> {
     fn page(&self, page_id: u64) -> Result<Page<'_>> {
         if let Some(page) = self.overlay.get(page_id) {
@@ -592,24 +676,43 @@ impl PageStore for RwTxn<'_> {
     fn allocate_pages(&mut self, pages: u64) -> Result<u64> {
         ensure!(pages > 0, "allocation must contain at least one page");
 
+        // Reuse only exact-size runs. Splitting a larger run for a small
+        // allocation can destroy the contiguity that overflow extents need;
+        // reserving exact runs keeps repeated updates from fragmenting the
+        // free pool into unusable pieces. Offline compaction reclaims any
+        // sizes that are no longer requested.
         if pages == 1 {
             if let Some(page) = self.free_single.pop_first() {
+                self.owned_pages.insert(page);
                 return Ok(page);
             }
-            if let Some((&start, &len)) = self.free_runs.iter().next() {
+        } else {
+            let run = self
+                .free_runs
+                .iter()
+                .find(|(_, len)| **len == pages)
+                .map(|(&start, _)| start);
+            if let Some(start) = run {
                 self.free_runs.remove(&start);
-                if len == 2 {
-                    self.free_single.insert(start + 1);
-                } else {
-                    self.free_runs.insert(start + 1, len - 1);
-                }
+                self.owned_pages.extend(start..start + pages);
                 return Ok(start);
             }
-        } else if let Some((&start, &len)) = self.free_runs.iter().find(|(_, len)| **len >= pages) {
-            self.free_runs.remove(&start);
-            if len > pages {
-                self.free_runs.insert(start + pages, len - pages);
-            }
+        }
+
+        let cross = self
+            .cross_free
+            .iter()
+            .enumerate()
+            .find(|(_, extent)| extent.pages == pages)
+            .map(|(index, extent)| (index, extent.start_page, extent.freed_txn));
+        if let Some((index, start, freed_txn)) = cross {
+            self.cross_free.remove(index);
+            self.cross_allocated.push(FreeExtent {
+                start_page: start,
+                pages,
+                freed_txn,
+            });
+            self.owned_pages.extend(start..start + pages);
             return Ok(start);
         }
 
@@ -625,6 +728,7 @@ impl PageStore for RwTxn<'_> {
             "environment map is full at {} pages; reopen it with a larger map_size",
             max_pages
         );
+        self.owned_pages.extend(start..start + pages);
 
         Ok(start)
     }
@@ -667,13 +771,32 @@ impl PageStore for RwTxn<'_> {
             .checked_add(pages)
             .context("free range overflow")?;
         let base = self.base.page_count;
+        let owned = start_page < self.next_page
+            && (start_page..end).all(|page| self.owned_pages.contains(&page));
 
-        if start_page < base {
-            if end > base {
-                self.free_new_pages(base, end - base)?;
-            }
+        if start_page >= base || owned {
+            ensure!(owned, "page {start_page} is not owned by this transaction");
+            self.free_owned_pages(start_page, pages)?;
         } else {
-            self.free_new_pages(start_page, pages)?;
+            let base_end = end.min(base);
+            if base_end > start_page {
+                ensure!(
+                    (start_page..base_end).all(|page| !self.owned_pages.contains(&page)),
+                    "free range mixes base and transaction pages"
+                );
+                self.base_freed.push(FreeExtent {
+                    start_page,
+                    pages: base_end - start_page,
+                    freed_txn: self.txn_id,
+                });
+            }
+            if end > base {
+                ensure!(
+                    (base..end).all(|page| self.owned_pages.contains(&page)),
+                    "page {base} is not owned by this transaction"
+                );
+                self.free_owned_pages(base, end - base)?;
+            }
         }
 
         Ok(())
@@ -681,11 +804,7 @@ impl PageStore for RwTxn<'_> {
 }
 
 impl RwTxn<'_> {
-    fn free_new_pages(&mut self, start_page: u64, pages: u64) -> Result<()> {
-        ensure!(
-            start_page >= self.base.page_count,
-            "page {start_page} is not owned by this transaction"
-        );
+    fn free_owned_pages(&mut self, start_page: u64, pages: u64) -> Result<()> {
         let end = start_page
             .checked_add(pages)
             .context("free range overflow")?;
