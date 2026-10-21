@@ -902,7 +902,7 @@ impl EnvInner {
         let result = (|| {
             let slots = self.read_reader_slots(&mut file)?;
             let mut oldest = None;
-            for chunk in slots.chunks_exact(READER_SLOT_SIZE) {
+            for chunk in slots.as_chunks::<READER_SLOT_SIZE>().0 {
                 let txn_id = LittleEndian::read_u64(chunk);
                 if txn_id == READER_RESERVED {
                     return Ok(Some(0));
@@ -925,7 +925,7 @@ impl EnvInner {
         self.lock_reader_registry(true)?;
         let result = (|| {
             let slots = self.read_reader_slots(&mut file)?;
-            for (index, chunk) in slots.chunks_exact(READER_SLOT_SIZE).enumerate() {
+            for (index, chunk) in slots.as_chunks::<READER_SLOT_SIZE>().0.iter().enumerate() {
                 if LittleEndian::read_u64(chunk) == 0 {
                     let offset = (index * READER_SLOT_SIZE) as u64;
                     file.seek(SeekFrom::Start(offset))?;
