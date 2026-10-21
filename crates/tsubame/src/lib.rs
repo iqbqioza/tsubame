@@ -8,9 +8,10 @@
 //! # Status
 //!
 //! The environment lifecycle, the on-disk meta format, the B+tree read and
-//! write paths, transactions, typed database operations, and named databases
-//! are implemented. Cursors and iteration are still under construction. APIs
-//! may change while the engine is being built.
+//! write paths, transactions, typed database operations, named databases, and
+//! ordered forward iteration are implemented. Range, prefix, and reverse
+//! iterators are still under construction. APIs may change while the engine is
+//! being built.
 //!
 //! # Example
 //!

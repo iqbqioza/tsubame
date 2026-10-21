@@ -265,6 +265,102 @@ fn named_database_delete_and_clear() -> Result<()> {
 }
 
 #[test]
+fn iterates_entries_in_key_order() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, Some("ordered"))?;
+    for key in ["d", "a", "c", "b", "e"] {
+        db.put(&mut wtxn, key, key)?;
+    }
+    wtxn.commit()?;
+
+    let rtxn = env.read_txn()?;
+    let db = env.open_database::<Str, Str>(&rtxn, Some("ordered"))?;
+    let mut seen = Vec::new();
+    for item in db.iter(&rtxn)? {
+        let (key, value) = item?;
+        seen.push((key.to_owned(), value.to_owned()));
+    }
+
+    assert_eq!(
+        seen,
+        [
+            ("a".to_owned(), "a".to_owned()),
+            ("b".to_owned(), "b".to_owned()),
+            ("c".to_owned(), "c".to_owned()),
+            ("d".to_owned(), "d".to_owned()),
+            ("e".to_owned(), "e".to_owned()),
+        ]
+    );
+
+    Ok(())
+}
+
+#[test]
+fn iterates_many_leaves_in_order() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+    for i in 0..1_000u32 {
+        let key = format!("key-{i:04}");
+        let value = format!("value-{i:04}");
+        db.put(&mut wtxn, &key, &value)?;
+    }
+    wtxn.commit()?;
+
+    let rtxn = env.read_txn()?;
+    let mut expected = 0u32;
+    for item in db.iter(&rtxn)? {
+        let (key, value) = item?;
+        assert_eq!(key, format!("key-{expected:04}"));
+        assert_eq!(value, format!("value-{expected:04}"));
+        expected += 1;
+    }
+    assert_eq!(expected, 1_000);
+
+    Ok(())
+}
+
+#[test]
+fn empty_database_iterates_zero_entries() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+    wtxn.commit()?;
+
+    let rtxn = env.read_txn()?;
+    assert_eq!(db.iter(&rtxn)?.count(), 0);
+
+    Ok(())
+}
+
+#[test]
+fn iteration_keeps_the_snapshot() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+    db.put(&mut wtxn, "key", "old")?;
+    wtxn.commit()?;
+
+    let rtxn = env.read_txn()?;
+    let mut iter = db.iter(&rtxn)?;
+
+    let mut wtxn = env.write_txn()?;
+    db.put(&mut wtxn, "key", "new")?;
+    wtxn.commit()?;
+
+    let (key, value) = iter.next().unwrap()?;
+    assert_eq!((key, value), ("key", "old"));
+    assert!(iter.next().is_none());
+
+    Ok(())
+}
+
+#[test]
 fn max_dbs_is_enforced() -> Result<()> {
     let dir = tempdir()?;
     let mut options = options();
