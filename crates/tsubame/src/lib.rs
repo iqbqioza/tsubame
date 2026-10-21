@@ -7,10 +7,11 @@
 //!
 //! # Status
 //!
-//! The environment lifecycle and the on-disk meta format are implemented.
-//! Transactions and the B+tree are still under construction, so opening an
-//! environment works but read and write transactions currently return an
-//! error. APIs may change while the engine is being built.
+//! The environment lifecycle, the on-disk meta format, and the B+tree read
+//! path are implemented. Transactions and B+tree writes are still under
+//! construction, so opening an environment works but read and write
+//! transactions currently return an error. APIs may change while the engine is
+//! being built.
 //!
 //! # Example
 //!

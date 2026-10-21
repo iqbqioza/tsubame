@@ -7,9 +7,9 @@ inspired by [heed].
 
 > [!WARNING]
 > Tsubame is under construction. The workspace layout, public API surface,
-> encoding traits, built-in codecs, and environment format exist, but
-> transactions and the B+tree are not implemented yet. Opening an
-> environment works; starting a transaction currently returns an error.
+> encoding traits, built-in codecs, environment format, and B+tree read path
+> exist, but transactions and B+tree writes are not implemented yet. Opening
+> an environment works; starting a transaction currently returns an error.
 
 ## Why Tsubame
 
@@ -37,7 +37,8 @@ added without changing the main API.
 - [x] `Bytes`, `Str`, `Unit`, and integer codecs
 - [x] Public API skeleton for environments, databases, and transactions
 - [x] On-disk meta format and environment lifecycle
-- [ ] B+tree and typed database operations
+- [x] B+tree page format and read path
+- [ ] B+tree writes, transactions, and typed database operations
 - [ ] Read/write transactions and cursors
 - [ ] Ordered, range, prefix, and reverse iterators
 - [ ] Serde-based codecs behind features
