@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail, ensure};
 use fs4::TryLockError;
 use memmap2::Mmap;
 
+use crate::comparator::{KeyComparator, LEXICOGRAPHIC};
 use crate::iter::Cursor;
 use crate::storage::PAGE_SIZE;
 use crate::storage::btree::{self, PageSource};
@@ -26,7 +27,7 @@ const LOCK_FILE: &str = "lock.tsubame";
 const COMPACT_FILE: &str = "data.tsubame.compact";
 
 /// Rewrites an environment into a compact data file.
-pub(crate) fn compact(path: &Path) -> Result<()> {
+pub(crate) fn compact_with(path: &Path, comparator: KeyComparator) -> Result<()> {
     ensure!(path.is_dir(), "`{}` is not a directory", path.display());
     let data_path = path.join(DATA_FILE);
     ensure!(
@@ -121,9 +122,15 @@ pub(crate) fn compact(path: &Path) -> Result<()> {
         let source = MmapSource {
             data: map_slice,
             page_count: old_meta.page_count,
+            comparator,
+        };
+        let catalog_source = MmapSource {
+            data: map_slice,
+            page_count: old_meta.page_count,
+            comparator: LEXICOGRAPHIC,
         };
         let unnamed = collect_entries(&source, old_meta.unnamed_root)?;
-        let catalog = collect_entries(&source, old_meta.catalog_root)?;
+        let catalog = collect_entries(&catalog_source, old_meta.catalog_root)?;
         let mut named = Vec::with_capacity(catalog.len());
 
         for (name, root_bytes) in catalog {
@@ -179,14 +186,16 @@ pub(crate) fn compact(path: &Path) -> Result<()> {
             .txn_id
             .checked_add(1)
             .context("transaction ID overflow")?;
-        let unnamed_root = btree::bulk_load(&mut store, &unnamed_entries, txn_id)?;
+        let unnamed_root =
+            btree::bulk_load_with(&mut store, &unnamed_entries, txn_id, &comparator)?;
 
         let mut catalog_entries = Vec::with_capacity(named_entries.len());
         for (name, entries) in named_entries {
-            let root = btree::bulk_load(&mut store, &entries, txn_id)?;
+            let root = btree::bulk_load_with(&mut store, &entries, txn_id, &comparator)?;
             catalog_entries.push((name, root.to_le_bytes().to_vec()));
         }
-        let catalog_root = btree::bulk_load(&mut store, &catalog_entries, txn_id)?;
+        let catalog_root =
+            btree::bulk_load_with(&mut store, &catalog_entries, txn_id, &LEXICOGRAPHIC)?;
 
         let mut meta = Meta::initial();
         meta.txn_id = txn_id;
@@ -225,6 +234,7 @@ pub(crate) fn compact(path: &Path) -> Result<()> {
 struct MmapSource<'a> {
     data: &'a [u8],
     page_count: u64,
+    comparator: KeyComparator,
 }
 
 impl PageSource for MmapSource<'_> {
@@ -272,6 +282,10 @@ impl PageSource for MmapSource<'_> {
             "overflow extent is outside the mapped region"
         );
         overflow::validate_extent(&self.data[start..end], reference)
+    }
+
+    fn comparator(&self) -> &KeyComparator {
+        &self.comparator
     }
 }
 

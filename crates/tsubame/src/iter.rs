@@ -7,6 +7,7 @@ use std::ops::Bound;
 
 use anyhow::{Result, bail, ensure};
 
+use crate::comparator::KeyComparator;
 use crate::storage::btree::PageSource;
 use crate::storage::page::{LeafValue, Page, PageType};
 use crate::traits::BytesDecode;
@@ -17,6 +18,7 @@ const MAX_DEPTH: usize = 64;
 
 pub(crate) struct Cursor<'a, S: PageSource> {
     source: &'a S,
+    comparator: KeyComparator,
     stack: Vec<(u64, usize)>,
     leaf: Option<u64>,
     slot: usize,
@@ -26,10 +28,15 @@ impl<'a, S: PageSource> Cursor<'a, S> {
     pub(crate) fn new(source: &'a S) -> Self {
         Self {
             source,
+            comparator: *source.comparator(),
             stack: Vec::new(),
             leaf: None,
             slot: 0,
         }
+    }
+
+    pub(crate) fn comparator(&self) -> KeyComparator {
+        self.comparator
     }
 
     fn page(&self, page_id: u64) -> Result<Page<'a>> {
@@ -70,12 +77,12 @@ impl<'a, S: PageSource> Cursor<'a, S> {
                         page.slot_count() > 0,
                         "branch page {page_id} has no children"
                     );
-                    let index = page.branch_child_index(key)?;
+                    let index = page.branch_child_index_with(key, &self.comparator)?;
                     self.stack.push((page_id, index));
                     page_id = page.child(index)?;
                 }
                 PageType::Leaf => {
-                    let slot = page.lower_bound(key)?;
+                    let slot = page.lower_bound_with(key, &self.comparator)?;
                     self.leaf = Some(page_id);
                     self.slot = slot;
                     if slot >= page.slot_count() {
@@ -105,12 +112,12 @@ impl<'a, S: PageSource> Cursor<'a, S> {
                         page.slot_count() > 0,
                         "branch page {page_id} has no children"
                     );
-                    let index = page.branch_child_index(key)?;
+                    let index = page.branch_child_index_with(key, &self.comparator)?;
                     self.stack.push((page_id, index));
                     page_id = page.child(index)?;
                 }
                 PageType::Leaf => {
-                    let slot = page.upper_bound(key)?;
+                    let slot = page.upper_bound_with(key, &self.comparator)?;
                     self.leaf = Some(page_id);
                     if slot > 0 {
                         self.slot = slot - 1;
@@ -374,19 +381,19 @@ where
     }
 }
 
-fn before_start(bound: &Bound<Vec<u8>>, key: &[u8]) -> bool {
+fn before_start(bound: &Bound<Vec<u8>>, key: &[u8], comparator: KeyComparator) -> bool {
     match bound {
         Bound::Unbounded => false,
-        Bound::Included(start) => key < start.as_slice(),
-        Bound::Excluded(start) => key <= start.as_slice(),
+        Bound::Included(start) => comparator.compare(key, start) == Ordering::Less,
+        Bound::Excluded(start) => comparator.compare(key, start) != Ordering::Greater,
     }
 }
 
-fn past_end(bound: &Bound<Vec<u8>>, key: &[u8]) -> bool {
+fn past_end(bound: &Bound<Vec<u8>>, key: &[u8], comparator: KeyComparator) -> bool {
     match bound {
         Bound::Unbounded => false,
-        Bound::Included(end) => key > end.as_slice(),
-        Bound::Excluded(end) => key >= end.as_slice(),
+        Bound::Included(end) => comparator.compare(key, end) == Ordering::Greater,
+        Bound::Excluded(end) => comparator.compare(key, end) != Ordering::Less,
     }
 }
 
@@ -456,7 +463,7 @@ where
 
         loop {
             while let Some((key, _)) = self.pending.peek().copied() {
-                if before_start(&self.start, key) {
+                if before_start(&self.start, key, self.cursor.comparator()) {
                     self.pending.next();
                 } else {
                     break;
@@ -471,12 +478,12 @@ where
                 }
             };
             let base = match base {
-                Some((key, _)) if past_end(&self.end, key) => None,
+                Some((key, _)) if past_end(&self.end, key, self.cursor.comparator()) => None,
                 base => base,
             };
 
             let pending = match self.pending.peek().copied() {
-                Some((key, _)) if past_end(&self.end, key) => None,
+                Some((key, _)) if past_end(&self.end, key, self.cursor.comparator()) => None,
                 pending => pending,
             };
 
@@ -500,7 +507,7 @@ where
                     }
                 }
                 (Some((base_key, base_value)), Some((pending_key, pending_value))) => {
-                    match pending_key.cmp(base_key) {
+                    match self.cursor.comparator().compare(pending_key, base_key) {
                         Ordering::Less => {
                             self.pending.next();
                             if let Some(value) = pending_value {
@@ -587,7 +594,9 @@ where
 
         loop {
             while let Some((key, _)) = self.pending.peek().copied() {
-                if past_end(&self.end, key) || before_start(&self.start, key) {
+                if past_end(&self.end, key, self.cursor.comparator())
+                    || before_start(&self.start, key, self.cursor.comparator())
+                {
                     self.pending.next();
                 } else {
                     break;
@@ -602,12 +611,12 @@ where
                 }
             };
             let base = match base {
-                Some((key, _)) if before_start(&self.start, key) => None,
+                Some((key, _)) if before_start(&self.start, key, self.cursor.comparator()) => None,
                 base => base,
             };
 
             let pending = match self.pending.peek().copied() {
-                Some((key, _)) if past_end(&self.end, key) => None,
+                Some((key, _)) if past_end(&self.end, key, self.cursor.comparator()) => None,
                 pending => pending,
             };
 
@@ -631,7 +640,7 @@ where
                     }
                 }
                 (Some((base_key, base_value)), Some((pending_key, pending_value))) => {
-                    match pending_key.cmp(base_key) {
+                    match self.cursor.comparator().compare(pending_key, base_key) {
                         Ordering::Greater => {
                             self.pending.next();
                             if let Some(value) = pending_value {
@@ -710,8 +719,8 @@ impl<'txn, 'env, KC, DC> RoRange<'txn, 'env, KC, DC> {
     fn past_end(&self, key: &[u8]) -> bool {
         match &self.end {
             Bound::Unbounded => false,
-            Bound::Included(end) => key > end.as_slice(),
-            Bound::Excluded(end) => key >= end.as_slice(),
+            Bound::Included(end) => self.cursor.comparator().compare(key, end) == Ordering::Greater,
+            Bound::Excluded(end) => self.cursor.comparator().compare(key, end) != Ordering::Less,
         }
     }
 }
@@ -800,8 +809,12 @@ impl<'txn, 'env, KC, DC> RoRevRange<'txn, 'env, KC, DC> {
     fn before_start(&self, key: &[u8]) -> bool {
         match &self.start {
             Bound::Unbounded => false,
-            Bound::Included(start) => key < start.as_slice(),
-            Bound::Excluded(start) => key <= start.as_slice(),
+            Bound::Included(start) => {
+                self.cursor.comparator().compare(key, start) == Ordering::Less
+            }
+            Bound::Excluded(start) => {
+                self.cursor.comparator().compare(key, start) != Ordering::Greater
+            }
         }
     }
 }

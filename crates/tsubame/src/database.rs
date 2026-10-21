@@ -87,7 +87,7 @@ impl<KC, DC> Database<KC, DC> {
         let key =
             KC::bytes_encode(key).map_err(|error| codec_error("key encoding failed", error))?;
         let root = txn.root_for(&self.kind)?;
-        let Some(value) = btree::get(txn, root, &key)? else {
+        let Some(value) = btree::get_with(txn, root, &key, &txn.comparator())? else {
             return Ok(None);
         };
 
@@ -160,7 +160,8 @@ impl<KC, DC> Database<KC, DC> {
             "transaction belongs to a different environment"
         );
         let root = txn.read_root(&self.kind)?;
-        let pending = txn.pending_for(&self.kind);
+        let comparator = txn.comparator();
+        let pending = txn.pending_for(&self.kind, comparator);
         RwIter::new(txn, root, pending)
     }
 
@@ -185,7 +186,8 @@ impl<KC, DC> Database<KC, DC> {
             "transaction belongs to a different environment"
         );
         let root = txn.read_root(&self.kind)?;
-        let pending = txn.pending_for(&self.kind);
+        let comparator = txn.comparator();
+        let pending = txn.pending_for(&self.kind, comparator);
         let start = encode_bound::<KC>(start)?;
         let end = encode_bound::<KC>(end)?;
         RwIter::range(txn, root, pending, start, end)
@@ -209,7 +211,8 @@ impl<KC, DC> Database<KC, DC> {
             "transaction belongs to a different environment"
         );
         let root = txn.read_root(&self.kind)?;
-        let pending = txn.pending_for_rev(&self.kind);
+        let comparator = txn.comparator();
+        let pending = txn.pending_for_rev(&self.kind, comparator);
         RwRevIter::new(txn, root, pending, Bound::Unbounded, Bound::Unbounded)
     }
 
@@ -234,7 +237,8 @@ impl<KC, DC> Database<KC, DC> {
             "transaction belongs to a different environment"
         );
         let root = txn.read_root(&self.kind)?;
-        let pending = txn.pending_for_rev(&self.kind);
+        let comparator = txn.comparator();
+        let pending = txn.pending_for_rev(&self.kind, comparator);
         let start = encode_bound::<KC>(start)?;
         let end = encode_bound::<KC>(end)?;
         RwRevIter::new(txn, root, pending, start, end)
@@ -259,8 +263,13 @@ impl<KC, DC> Database<KC, DC> {
             txn.belongs_to(&self.env),
             "transaction belongs to a different environment"
         );
+        ensure!(
+            txn.comparator().is_lexicographic(),
+            "prefix iteration requires a lexicographic comparator"
+        );
         let root = txn.read_root(&self.kind)?;
-        let pending = txn.pending_for(&self.kind);
+        let comparator = txn.comparator();
+        let pending = txn.pending_for(&self.kind, comparator);
         let start = KC::bytes_encode(prefix)
             .map_err(|error| codec_error("prefix encoding failed", error))?
             .into_owned();
@@ -289,8 +298,13 @@ impl<KC, DC> Database<KC, DC> {
             txn.belongs_to(&self.env),
             "transaction belongs to a different environment"
         );
+        ensure!(
+            txn.comparator().is_lexicographic(),
+            "prefix iteration requires a lexicographic comparator"
+        );
         let root = txn.read_root(&self.kind)?;
-        let pending = txn.pending_for_rev(&self.kind);
+        let comparator = txn.comparator();
+        let pending = txn.pending_for_rev(&self.kind, comparator);
         let start = KC::bytes_encode(prefix)
             .map_err(|error| codec_error("prefix encoding failed", error))?
             .into_owned();
@@ -377,6 +391,10 @@ impl<KC, DC> Database<KC, DC> {
         KC: BytesEncode<'a> + BytesDecode<'txn>,
         DC: BytesDecode<'txn>,
     {
+        ensure!(
+            txn.comparator().is_lexicographic(),
+            "prefix iteration requires a lexicographic comparator"
+        );
         let root = self.resolve_root(txn)?;
         let start = KC::bytes_encode(prefix)
             .map_err(|error| codec_error("prefix encoding failed", error))?
@@ -402,6 +420,10 @@ impl<KC, DC> Database<KC, DC> {
         KC: BytesEncode<'a> + BytesDecode<'txn>,
         DC: BytesDecode<'txn>,
     {
+        ensure!(
+            txn.comparator().is_lexicographic(),
+            "prefix iteration requires a lexicographic comparator"
+        );
         let root = self.resolve_root(txn)?;
         let start = KC::bytes_encode(prefix)
             .map_err(|error| codec_error("prefix encoding failed", error))?

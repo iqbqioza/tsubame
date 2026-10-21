@@ -16,6 +16,7 @@ use fs4::TryLockError;
 use memmap2::Mmap;
 
 use crate::Result;
+use crate::comparator::KeyComparator;
 use crate::database::{Database, DatabaseKind};
 use crate::storage::commit;
 use crate::storage::meta::{self, Meta};
@@ -60,6 +61,11 @@ impl Env {
     /// Returns whether this writable environment allows concurrent readers.
     pub fn is_multi_process(&self) -> bool {
         self.inner.multi_process
+    }
+
+    /// Returns the key order used by this environment.
+    pub fn comparator(&self) -> KeyComparator {
+        self.inner.comparator
     }
 
     /// Returns a consistent snapshot of the environment metadata.
@@ -186,7 +192,15 @@ impl Env {
     /// Returns an error if the environment is open, its commit cannot be
     /// validated, or the replacement file cannot be written.
     pub fn compact(path: impl AsRef<Path>) -> Result<()> {
-        crate::storage::compact::compact(path.as_ref())
+        crate::storage::compact::compact_with(path.as_ref(), KeyComparator::lexicographic())
+    }
+
+    /// Compacts an environment that uses a custom key comparator.
+    ///
+    /// The same comparator must be used when the compacted environment is
+    /// reopened.
+    pub fn compact_with(path: impl AsRef<Path>, comparator: KeyComparator) -> Result<()> {
+        crate::storage::compact::compact_with(path.as_ref(), comparator)
     }
 }
 
@@ -426,6 +440,7 @@ pub(crate) struct EnvInner {
     pub(crate) read_only: bool,
     pub(crate) multi_process: bool,
     pub(crate) page_reuse: bool,
+    pub(crate) comparator: KeyComparator,
     pub(crate) committed: RwLock<Committed>,
     pub(crate) writer: Mutex<()>,
     pub(crate) readers: Mutex<BTreeMap<u64, usize>>,
@@ -756,6 +771,8 @@ pub struct EnvOpenOptions {
     /// This disables cross-transaction page reuse so snapshots held by other
     /// processes remain valid until they are dropped.
     pub multi_process: bool,
+    /// Key order used by every database in the environment.
+    pub comparator: KeyComparator,
 }
 
 impl Default for EnvOpenOptions {
@@ -765,6 +782,7 @@ impl Default for EnvOpenOptions {
             max_dbs: DEFAULT_MAX_DBS,
             read_only: false,
             multi_process: false,
+            comparator: KeyComparator::lexicographic(),
         }
     }
 }
@@ -805,6 +823,16 @@ impl EnvOpenOptions {
     /// grow until it is compacted offline.
     pub fn multi_process(&mut self, multi_process: bool) -> &mut Self {
         self.multi_process = multi_process;
+        self
+    }
+
+    /// Sets the key order used by every database in the environment.
+    ///
+    /// The same comparator must be supplied whenever the environment is
+    /// reopened and when it is compacted. Prefix iteration is only available
+    /// with the default lexicographic comparator.
+    pub fn comparator(&mut self, comparator: KeyComparator) -> &mut Self {
+        self.comparator = comparator;
         self
     }
 
@@ -1029,6 +1057,7 @@ impl EnvOpenOptions {
             read_only: self.read_only,
             multi_process: self.multi_process && !self.read_only,
             page_reuse: !self.read_only && !self.multi_process,
+            comparator: self.comparator,
             committed: RwLock::new(Committed {
                 meta,
                 slot: meta_slot,
@@ -1104,6 +1133,7 @@ mod tests {
         assert_eq!(options.max_dbs, DEFAULT_MAX_DBS);
         assert!(!options.read_only);
         assert!(!options.multi_process);
+        assert!(options.comparator.is_lexicographic());
     }
 
     #[test]
@@ -1119,6 +1149,7 @@ mod tests {
         assert_eq!(options.max_dbs, 2);
         assert!(options.read_only);
         assert!(options.multi_process);
+        assert!(options.comparator.is_lexicographic());
     }
 
     #[test]

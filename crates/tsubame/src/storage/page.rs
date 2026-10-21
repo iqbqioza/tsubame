@@ -4,11 +4,14 @@
 //! and cells are packed downward from the end of the page. Every page carries
 //! a CRC32C checksum over its bytes with the checksum field zeroed.
 
+use std::cmp::Ordering;
+
 use anyhow::{Context, Result, bail, ensure};
 use byteorder::{ByteOrder, LittleEndian};
 
 use super::PAGE_SIZE;
 use super::overflow::{OVERFLOW_REF_SIZE, OverflowRef};
+use crate::comparator::KeyComparator;
 
 /// The maximum encoded key size accepted by format version 1.
 pub(crate) const MAX_KEY_SIZE: usize = 1024;
@@ -519,14 +522,25 @@ impl<'a> Page<'a> {
 
     /// Returns the slot index containing `key`, if it exists.
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn leaf_index(&self, key: &[u8]) -> Result<Option<usize>> {
+        self.leaf_index_with(key, &KeyComparator::lexicographic())
+    }
+
+    pub(crate) fn leaf_index_with(
+        &self,
+        key: &[u8],
+        comparator: &KeyComparator,
+    ) -> Result<Option<usize>> {
         ensure!(
             self.page_type == PageType::Leaf,
             "leaf_index called on a branch page"
         );
 
-        let index = self.lower_bound(key)?;
-        if index == self.slot_count || self.key_at(index) != key {
+        let index = self.lower_bound_with(key, comparator)?;
+        if index == self.slot_count
+            || comparator.compare(self.key_at(index), key) != Ordering::Equal
+        {
             Ok(None)
         } else {
             Ok(Some(index))
@@ -556,28 +570,55 @@ impl<'a> Page<'a> {
 
     /// Returns the child to follow for `key` in a branch page.
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn branch_child(&self, key: &[u8]) -> Result<u64> {
-        let index = self.branch_child_index(key)?;
+        self.branch_child_with(key, &KeyComparator::lexicographic())
+    }
+
+    pub(crate) fn branch_child_with(&self, key: &[u8], comparator: &KeyComparator) -> Result<u64> {
+        let index = self.branch_child_index_with(key, comparator)?;
         self.child(index)
     }
 
     /// Returns the child slot index to follow for `key` in a branch page.
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn branch_child_index(&self, key: &[u8]) -> Result<usize> {
+        self.branch_child_index_with(key, &KeyComparator::lexicographic())
+    }
+
+    pub(crate) fn branch_child_index_with(
+        &self,
+        key: &[u8],
+        comparator: &KeyComparator,
+    ) -> Result<usize> {
         ensure!(
             self.page_type == PageType::Branch,
             "branch_child_index called on a leaf page"
         );
         ensure!(self.slot_count > 0, "branch page has no children");
 
-        let mut left = 0;
+        // The first child is the negative-infinity slot. Its key is only a
+        // placeholder and may not be the minimum under a custom comparator.
+        let mut left = 1;
         let mut right = self.slot_count;
-        while left < right {
-            let mid = (left + right) / 2;
-            if self.key_at(mid) <= key {
-                left = mid + 1;
-            } else {
-                right = mid;
+        if comparator.is_lexicographic() {
+            while left < right {
+                let mid = (left + right) / 2;
+                if self.key_at(mid) <= key {
+                    left = mid + 1;
+                } else {
+                    right = mid;
+                }
+            }
+        } else {
+            while left < right {
+                let mid = (left + right) / 2;
+                if comparator.compare(self.key_at(mid), key) != Ordering::Greater {
+                    left = mid + 1;
+                } else {
+                    right = mid;
+                }
             }
         }
 
@@ -587,12 +628,17 @@ impl<'a> Page<'a> {
 
     /// Returns the first slot whose key is `>= key`.
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn lower_bound(&self, key: &[u8]) -> Result<usize> {
+        self.lower_bound_with(key, &KeyComparator::lexicographic())
+    }
+
+    pub(crate) fn lower_bound_with(&self, key: &[u8], comparator: &KeyComparator) -> Result<usize> {
         let mut left = 0;
         let mut right = self.slot_count;
         while left < right {
             let mid = (left + right) / 2;
-            if self.key_at(mid) < key {
+            if comparator.compare(self.key_at(mid), key) == Ordering::Less {
                 left = mid + 1;
             } else {
                 right = mid;
@@ -602,12 +648,17 @@ impl<'a> Page<'a> {
     }
 
     /// Returns the first slot whose key is `> key`.
+    #[allow(dead_code)]
     pub(crate) fn upper_bound(&self, key: &[u8]) -> Result<usize> {
+        self.upper_bound_with(key, &KeyComparator::lexicographic())
+    }
+
+    pub(crate) fn upper_bound_with(&self, key: &[u8], comparator: &KeyComparator) -> Result<usize> {
         let mut left = 0;
         let mut right = self.slot_count;
         while left < right {
             let mid = (left + right) / 2;
-            if self.key_at(mid) <= key {
+            if comparator.compare(self.key_at(mid), key) != Ordering::Greater {
                 left = mid + 1;
             } else {
                 right = mid;
@@ -722,7 +773,23 @@ fn push_leaf_entry(builder: &mut PageBuilder, key: &[u8], value: &LeafValue<'_>)
 /// Builds a branch page from separator keys and child page IDs.
 ///
 /// The first entry must use an empty key, which represents negative infinity.
+#[allow(dead_code)] // Validation wrapper used by tests and external builders.
 pub(crate) fn build_branch(
+    page_id: u64,
+    txn_id: u64,
+    entries: &[(&[u8], u64)],
+) -> Result<[u8; PAGE_SIZE]> {
+    for pair in entries.windows(2) {
+        ensure!(
+            pair[0].0 < pair[1].0,
+            "branch keys must be strictly ascending"
+        );
+    }
+    build_branch_sorted(page_id, txn_id, entries)
+}
+
+/// Builds a branch page whose keys are already in tree order.
+pub(crate) fn build_branch_sorted(
     page_id: u64,
     txn_id: u64,
     entries: &[(&[u8], u64)],
@@ -732,12 +799,6 @@ pub(crate) fn build_branch(
         entries[0].0.is_empty(),
         "the first branch key must be empty"
     );
-    for pair in entries.windows(2) {
-        ensure!(
-            pair[0].0 < pair[1].0,
-            "branch keys must be strictly ascending"
-        );
-    }
 
     let mut builder = PageBuilder::new(PageType::Branch);
     for (key, child) in entries {

@@ -51,6 +51,7 @@ added without changing the main API.
 - [x] Lazy free-list reconstruction after reopening
 - [x] Read-only environments with shared locks
 - [x] Concurrent writer and read-only processes (`multi_process`)
+- [x] Custom key comparators
 - [x] Offline compaction
 
 ## Codec features
@@ -95,6 +96,29 @@ fn main() -> Result<()> {
 }
 ```
 
+## Custom key order
+
+The default order is lexicographic byte order. `KeyComparator` can be supplied
+to every database in an environment:
+
+```rust
+use std::cmp::Ordering;
+use tsubame::{EnvOpenOptions, KeyComparator};
+
+fn reverse(left: &[u8], right: &[u8]) -> Ordering {
+    right.cmp(left)
+}
+
+fn main() -> tsubame::Result<()> {
+    let mut options = EnvOpenOptions::new();
+    options.comparator(KeyComparator::custom(reverse));
+    let env = options.open("/tmp/tsubame-reverse")?;
+    Ok(())
+}
+```
+
+The same comparator must be passed to `Env::compact_with` when compacting.
+
 ## Examples
 
 ```sh
@@ -125,7 +149,9 @@ The examples use a temporary directory and clean up after themselves.
   Env::compact("/path/to/env")?;
   ```
   The environment must be closed while compaction runs.
-- Custom key comparators are not exposed yet.
+- Custom key comparators are environment-wide and must be supplied again on
+  every open and offline compaction. They are not stored in the data file.
+  Prefix iteration requires lexicographic order.
 - Performance is benchmarked rather than assumed; see [`benchmarks`](benchmarks).
 
 ## Development

@@ -9,6 +9,7 @@ use std::sync::{Arc, MutexGuard};
 
 use anyhow::{Context, Result, bail, ensure};
 
+use crate::comparator::KeyComparator;
 use crate::database::DatabaseKind;
 use crate::env::{Committed, Env, EnvInner, FreeExtent};
 use crate::storage::btree;
@@ -173,6 +174,22 @@ impl Pending {
 pub(crate) type PendingIter<'a> = Box<dyn Iterator<Item = (&'a [u8], Option<&'a [u8]>)> + 'a>;
 pub(crate) type PendingRevIter<'a> = Box<dyn Iterator<Item = (&'a [u8], Option<&'a [u8]>)> + 'a>;
 
+fn sort_pending<'a>(
+    pending: PendingIter<'a>,
+    comparator: KeyComparator,
+    reverse: bool,
+) -> PendingIter<'a> {
+    if comparator.is_lexicographic() {
+        return pending;
+    }
+    let mut entries: Vec<_> = pending.collect();
+    entries.sort_by(|left, right| comparator.compare(left.0, right.0));
+    if reverse {
+        entries.reverse();
+    }
+    Box::new(entries.into_iter())
+}
+
 /// A read-only transaction.
 ///
 /// Read-only transactions see a stable snapshot of the environment until they
@@ -188,6 +205,10 @@ impl<'env> RoTxn<'env> {
     }
 
     #[inline]
+    pub(crate) fn comparator(&self) -> KeyComparator {
+        self.env.inner.comparator
+    }
+
     pub(crate) fn root_for(&self, kind: &DatabaseKind) -> Result<u64> {
         match kind {
             DatabaseKind::Unnamed => Ok(self.meta.unnamed_root),
@@ -233,6 +254,10 @@ impl PageSource for RoTxn<'_> {
 
     fn overflow(&self, reference: OverflowRef) -> Result<&[u8]> {
         self.env.inner.read_overflow(reference, &self.meta)
+    }
+
+    fn comparator(&self) -> &crate::comparator::KeyComparator {
+        &self.env.inner.comparator
     }
 }
 
@@ -396,6 +421,10 @@ impl<'env> RwTxn<'env> {
         self.database_count
     }
 
+    pub(crate) fn comparator(&self) -> KeyComparator {
+        self.env.inner.comparator
+    }
+
     pub(crate) fn read_root(&self, kind: &DatabaseKind) -> Result<u64> {
         match kind {
             DatabaseKind::Unnamed => Ok(self.root.unwrap_or(self.base.unnamed_root)),
@@ -409,26 +438,36 @@ impl<'env> RwTxn<'env> {
         }
     }
 
-    pub(crate) fn pending_for<'a>(&'a self, kind: &DatabaseKind) -> PendingIter<'a> {
-        match kind {
+    pub(crate) fn pending_for<'a>(
+        &'a self,
+        kind: &DatabaseKind,
+        comparator: KeyComparator,
+    ) -> PendingIter<'a> {
+        let pending: PendingIter<'a> = match kind {
             DatabaseKind::Unnamed => self.unnamed_pending.iter(),
             DatabaseKind::Named(name) => self
                 .named_pending
                 .get(name.as_ref())
                 .map(Pending::iter)
                 .unwrap_or_else(|| Box::new(std::iter::empty())),
-        }
+        };
+        sort_pending(pending, comparator, false)
     }
 
-    pub(crate) fn pending_for_rev<'a>(&'a self, kind: &DatabaseKind) -> PendingRevIter<'a> {
-        match kind {
+    pub(crate) fn pending_for_rev<'a>(
+        &'a self,
+        kind: &DatabaseKind,
+        comparator: KeyComparator,
+    ) -> PendingRevIter<'a> {
+        let pending: PendingRevIter<'a> = match kind {
             DatabaseKind::Unnamed => self.unnamed_pending.iter_rev(),
             DatabaseKind::Named(name) => self
                 .named_pending
                 .get(name.as_ref())
                 .map(Pending::iter_rev)
                 .unwrap_or_else(|| Box::new(std::iter::empty())),
-        }
+        };
+        sort_pending(pending, comparator, true)
     }
 
     pub(crate) fn pending_get(&self, kind: &DatabaseKind, key: &[u8]) -> Option<Option<&[u8]>> {
@@ -450,7 +489,7 @@ impl<'env> RwTxn<'env> {
             return Ok(value);
         }
         let root = self.read_root(kind)?;
-        btree::get(self, root, key)
+        btree::get_with(self, root, key, &self.env.inner.comparator)
     }
 
     pub(crate) fn increment_database_count(&mut self) -> Result<()> {
@@ -611,33 +650,43 @@ impl<'env> RwTxn<'env> {
     }
 
     fn apply_pending_to(&mut self, root: &mut u64, pending: Pending) -> Result<()> {
+        let comparator = self.env.inner.comparator;
         match pending {
             Pending::Empty => Ok(()),
-            Pending::One(key, value) => self.apply_one(root, key, value),
+            Pending::One(key, value) => self.apply_one(root, key, value, comparator),
             Pending::Map(pending) => {
                 if *root == 0 && pending.len() >= BULK_LOAD_THRESHOLD {
-                    let entries: Vec<(Vec<u8>, Vec<u8>)> = pending
+                    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = pending
                         .into_iter()
                         .filter_map(|(key, value)| value.map(|value| (key, value)))
                         .collect();
+                    if !comparator.is_lexicographic() {
+                        entries.sort_by(|left, right| comparator.compare(&left.0, &right.0));
+                    }
                     if !entries.is_empty() {
-                        *root = btree::bulk_load(self, &entries, self.txn_id)?;
+                        *root = btree::bulk_load_with(self, &entries, self.txn_id, &comparator)?;
                     }
                     return Ok(());
                 }
 
                 for (key, value) in pending {
-                    self.apply_one(root, key, value)?;
+                    self.apply_one(root, key, value, comparator)?;
                 }
                 Ok(())
             }
         }
     }
 
-    fn apply_one(&mut self, root: &mut u64, key: Vec<u8>, value: Option<Vec<u8>>) -> Result<()> {
+    fn apply_one(
+        &mut self,
+        root: &mut u64,
+        key: Vec<u8>,
+        value: Option<Vec<u8>>,
+        comparator: KeyComparator,
+    ) -> Result<()> {
         *root = match value {
-            Some(value) => btree::insert(self, *root, &key, &value, self.txn_id)?,
-            None => btree::delete(self, *root, &key, self.txn_id)?,
+            Some(value) => btree::insert_with(self, *root, &key, &value, self.txn_id, &comparator)?,
+            None => btree::delete_with(self, *root, &key, self.txn_id, &comparator)?,
         };
         Ok(())
     }
@@ -754,6 +803,10 @@ impl PageSource for RwTxn<'_> {
         } else {
             self.env.inner.read_overflow(reference, &self.base)
         }
+    }
+
+    fn comparator(&self) -> &crate::comparator::KeyComparator {
+        &self.env.inner.comparator
     }
 }
 
