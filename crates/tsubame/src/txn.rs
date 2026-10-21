@@ -24,6 +24,116 @@ use crate::storage::{PAGE_SIZE, io};
 /// build the tree bottom-up instead of inserting one path at a time.
 const BULK_LOAD_THRESHOLD: usize = 1024;
 
+/// Keep small page overlays in a vector to avoid a B-tree node per page.
+const SMALL_OVERLAY_CAPACITY: usize = 8;
+
+enum PageOverlay {
+    Small(Vec<(u64, [u8; PAGE_SIZE])>),
+    Large(BTreeMap<u64, [u8; PAGE_SIZE]>),
+}
+
+impl PageOverlay {
+    fn new() -> Self {
+        Self::Small(Vec::new())
+    }
+
+    fn get(&self, page_id: u64) -> Option<&[u8; PAGE_SIZE]> {
+        match self {
+            Self::Small(entries) => entries
+                .iter()
+                .find(|(id, _)| *id == page_id)
+                .map(|(_, page)| page),
+            Self::Large(pages) => pages.get(&page_id),
+        }
+    }
+
+    fn insert(&mut self, page_id: u64, page: [u8; PAGE_SIZE]) {
+        match self {
+            Self::Small(entries) => {
+                if let Some((_, existing)) = entries.iter_mut().find(|(id, _)| *id == page_id) {
+                    *existing = page;
+                    return;
+                }
+                if entries.len() < SMALL_OVERLAY_CAPACITY {
+                    entries.push((page_id, page));
+                    return;
+                }
+
+                let mut pages: BTreeMap<u64, [u8; PAGE_SIZE]> = entries.drain(..).collect();
+                pages.insert(page_id, page);
+                *self = Self::Large(pages);
+            }
+            Self::Large(pages) => {
+                pages.insert(page_id, page);
+            }
+        }
+    }
+
+    fn remove(&mut self, page_id: u64) {
+        match self {
+            Self::Small(entries) => entries.retain(|(id, _)| *id != page_id),
+            Self::Large(pages) => {
+                pages.remove(&page_id);
+            }
+        }
+    }
+
+    fn iter(&self) -> PageOverlayIter<'_> {
+        match self {
+            Self::Small(entries) => PageOverlayIter::Small(entries.iter()),
+            Self::Large(pages) => PageOverlayIter::Large(pages.iter()),
+        }
+    }
+}
+
+enum PageOverlayIter<'a> {
+    Small(std::slice::Iter<'a, (u64, [u8; PAGE_SIZE])>),
+    Large(std::collections::btree_map::Iter<'a, u64, [u8; PAGE_SIZE]>),
+}
+
+impl<'a> Iterator for PageOverlayIter<'a> {
+    type Item = (&'a u64, &'a [u8; PAGE_SIZE]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Small(entries) => entries.next().map(|(id, page)| (id, page)),
+            Self::Large(pages) => pages.next(),
+        }
+    }
+}
+
+enum Pending {
+    Empty,
+    One(Vec<u8>, Option<Vec<u8>>),
+    Map(BTreeMap<Vec<u8>, Option<Vec<u8>>>),
+}
+
+impl Pending {
+    fn new() -> Self {
+        Self::Empty
+    }
+
+    fn insert(&mut self, key: Vec<u8>, value: Option<Vec<u8>>) {
+        match std::mem::replace(self, Self::Empty) {
+            Self::Empty => *self = Self::One(key, value),
+            Self::One(existing_key, existing_value) => {
+                if existing_key == key {
+                    *self = Self::One(existing_key, value);
+                } else {
+                    let mut map = BTreeMap::new();
+                    map.insert(existing_key, existing_value);
+                    map.insert(key, value);
+                    *self = Self::Map(map);
+                }
+            }
+            Self::Map(mut map) => {
+                map.insert(key, value);
+                *self = Self::Map(map);
+            }
+        }
+    }
+}
+
 /// A read-only transaction.
 ///
 /// Read-only transactions see a stable snapshot of the environment until they
@@ -74,13 +184,12 @@ pub struct RwTxn<'env> {
     base: Meta,
     base_slot: u8,
     txn_id: u64,
-    overlay: BTreeMap<u64, [u8; PAGE_SIZE]>,
+    overlay: PageOverlay,
     extents: BTreeMap<u64, Vec<u8>>,
     next_page: u64,
     free_single: BTreeSet<u64>,
     free_runs: BTreeMap<u64, u64>,
-    freed: Vec<(u64, u64)>,
-    pending: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    pending: Pending,
     root: Option<u64>,
     failed: bool,
     _writer: MutexGuard<'env, ()>,
@@ -103,13 +212,12 @@ impl<'env> RwTxn<'env> {
             base: committed.meta,
             base_slot: committed.slot,
             txn_id,
-            overlay: BTreeMap::new(),
+            overlay: PageOverlay::new(),
             extents: BTreeMap::new(),
             next_page: committed.meta.page_count,
             free_single: BTreeSet::new(),
             free_runs: BTreeMap::new(),
-            freed: Vec::new(),
-            pending: BTreeMap::new(),
+            pending: Pending::new(),
             root: None,
             failed: false,
             _writer: writer,
@@ -129,7 +237,7 @@ impl<'env> RwTxn<'env> {
     }
 
     pub(crate) fn clear_raw(&mut self) {
-        self.pending.clear();
+        self.pending = Pending::new();
         self.root = Some(0);
     }
 
@@ -154,8 +262,8 @@ impl<'env> RwTxn<'env> {
 
         let entries: Vec<CommitEntry> = self
             .overlay
-            .keys()
-            .map(|page_id| CommitEntry::Page(*page_id))
+            .iter()
+            .map(|(page_id, _)| CommitEntry::Page(*page_id))
             .chain(
                 self.extents
                     .iter()
@@ -215,29 +323,34 @@ impl<'env> RwTxn<'env> {
     }
 
     fn apply_pending(&mut self, root: &mut u64) -> Result<()> {
-        if self.pending.is_empty() {
-            return Ok(());
-        }
+        match std::mem::replace(&mut self.pending, Pending::Empty) {
+            Pending::Empty => Ok(()),
+            Pending::One(key, value) => self.apply_one(root, key, value),
+            Pending::Map(pending) => {
+                if *root == 0 && pending.len() >= BULK_LOAD_THRESHOLD {
+                    let entries: Vec<(Vec<u8>, Vec<u8>)> = pending
+                        .into_iter()
+                        .filter_map(|(key, value)| value.map(|value| (key, value)))
+                        .collect();
+                    if !entries.is_empty() {
+                        *root = btree::bulk_load(self, &entries, self.txn_id)?;
+                    }
+                    return Ok(());
+                }
 
-        let pending = std::mem::take(&mut self.pending);
-        if *root == 0 && pending.len() >= BULK_LOAD_THRESHOLD {
-            let entries: Vec<(Vec<u8>, Vec<u8>)> = pending
-                .into_iter()
-                .filter_map(|(key, value)| value.map(|value| (key, value)))
-                .collect();
-            if !entries.is_empty() {
-                *root = btree::bulk_load(self, &entries, self.txn_id)?;
+                for (key, value) in pending {
+                    self.apply_one(root, key, value)?;
+                }
+                Ok(())
             }
-            return Ok(());
         }
+    }
 
-        for (key, value) in pending {
-            *root = match value {
-                Some(value) => btree::insert(self, *root, &key, &value, self.txn_id)?,
-                None => btree::delete(self, *root, &key, self.txn_id)?,
-            };
-        }
-
+    fn apply_one(&mut self, root: &mut u64, key: Vec<u8>, value: Option<Vec<u8>>) -> Result<()> {
+        *root = match value {
+            Some(value) => btree::insert(self, *root, &key, &value, self.txn_id)?,
+            None => btree::delete(self, *root, &key, self.txn_id)?,
+        };
         Ok(())
     }
 
@@ -256,7 +369,7 @@ impl<'env> RwTxn<'env> {
     fn write_and_sync(&self, new_meta: &Meta) -> Result<()> {
         let data = &self.env.inner.data;
 
-        for (page_id, page) in &self.overlay {
+        for (page_id, page) in self.overlay.iter() {
             ensure!(
                 *page_id >= 2 && *page_id < self.next_page,
                 "page {page_id} is outside the transaction allocation range"
@@ -301,7 +414,7 @@ impl<'env> RwTxn<'env> {
 
 impl PageSource for RwTxn<'_> {
     fn page(&self, page_id: u64) -> Result<Page<'_>> {
-        if let Some(page) = self.overlay.get(&page_id) {
+        if let Some(page) = self.overlay.get(page_id) {
             Page::parse_trusted(page, Some(page_id))
         } else {
             self.env.inner.read_page(page_id, &self.base)
@@ -319,7 +432,7 @@ impl PageSource for RwTxn<'_> {
 
 impl PageStore for RwTxn<'_> {
     fn read_page(&self, page_id: u64) -> Result<[u8; PAGE_SIZE]> {
-        if let Some(page) = self.overlay.get(&page_id) {
+        if let Some(page) = self.overlay.get(page_id) {
             return Ok(*page);
         }
 
@@ -408,8 +521,6 @@ impl PageStore for RwTxn<'_> {
         let base = self.base.page_count;
 
         if start_page < base {
-            let base_end = end.min(base);
-            self.freed.push((start_page, base_end - start_page));
             if end > base {
                 self.free_new_pages(base, end - base)?;
             }
@@ -436,7 +547,7 @@ impl RwTxn<'_> {
         );
 
         if pages == 1 {
-            self.overlay.remove(&start_page);
+            self.overlay.remove(start_page);
             self.free_single.insert(start_page);
         } else {
             self.extents.remove(&start_page);
