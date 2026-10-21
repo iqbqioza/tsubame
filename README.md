@@ -45,7 +45,7 @@ added without changing the main API.
 - [x] Named databases and catalog
 - [x] Ordered forward iteration
 - [x] Range, prefix, and reverse iterators
-- [x] Write transaction iteration with pending writes
+- [x] Write transaction reads and iteration with pending writes
 - [x] Serde-based codecs behind features
 - [x] Cross-transaction page reuse within a process
 - [x] Lazy free-list reconstruction after reopening

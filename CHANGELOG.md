@@ -12,6 +12,8 @@ All notable changes to this project are documented here.
   recycled as well.
 - Lazy free-list reconstruction on the first write after reopening, so pages
   freed by a previous process become reusable without a compaction.
+- `get_rw`, `range_rw`, `rev_iter_rw`, `rev_range_rw`, `prefix_rw`, and
+  `rev_prefix_rw` on write transactions, including staged puts and deletes.
 - Clearing a database now releases its old tree pages for reuse.
 
 ### Fixed

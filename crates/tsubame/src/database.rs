@@ -14,7 +14,8 @@ use anyhow::ensure;
 use crate::Result;
 use crate::env::EnvInner;
 use crate::iter::{
-    RoIter, RoPrefix, RoRange, RoRevIter, RoRevPrefix, RoRevRange, RwIter, prefix_successor,
+    RoIter, RoPrefix, RoRange, RoRevIter, RoRevPrefix, RoRevRange, RwIter, RwPrefix, RwRange,
+    RwRevIter, RwRevPrefix, RwRevRange, prefix_successor,
 };
 use crate::storage::btree;
 use crate::storage::page::MAX_KEY_SIZE;
@@ -94,6 +95,38 @@ impl<KC, DC> Database<KC, DC> {
         })?))
     }
 
+    /// Returns the write transaction's value for `key`, including staged
+    /// writes and deletes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key cannot be encoded or the stored value
+    /// cannot be decoded.
+    pub fn get_rw<'a, 'txn>(
+        &self,
+        txn: &'txn RwTxn<'_>,
+        key: &'a KC::EItem,
+    ) -> Result<Option<DC::DItem>>
+    where
+        KC: BytesEncode<'a>,
+        DC: BytesDecode<'txn>,
+    {
+        ensure!(
+            txn.belongs_to(&self.env),
+            "transaction belongs to a different environment"
+        );
+
+        let key =
+            KC::bytes_encode(key).map_err(|error| codec_error("key encoding failed", error))?;
+        let Some(value) = txn.get_raw(&self.kind, &key)? else {
+            return Ok(None);
+        };
+
+        Ok(Some(DC::bytes_decode(value).map_err(|error| {
+            codec_error("value decoding failed", error)
+        })?))
+    }
+
     /// Returns an iterator over all entries in ascending key order.
     ///
     /// # Errors
@@ -128,6 +161,142 @@ impl<KC, DC> Database<KC, DC> {
         let root = txn.read_root(&self.kind)?;
         let pending = txn.pending_for(&self.kind);
         RwIter::new(txn, root, pending)
+    }
+
+    /// Returns a forward range iterator over the write transaction's view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a bound cannot be encoded, or if the database cannot
+    /// be resolved in the transaction.
+    pub fn range_rw<'a, 'txn, 'env>(
+        &self,
+        txn: &'txn RwTxn<'env>,
+        start: Bound<&'a KC::EItem>,
+        end: Bound<&'a KC::EItem>,
+    ) -> Result<RwRange<'txn, 'env, KC, DC>>
+    where
+        KC: BytesEncode<'a> + BytesDecode<'txn>,
+        DC: BytesDecode<'txn>,
+    {
+        ensure!(
+            txn.belongs_to(&self.env),
+            "transaction belongs to a different environment"
+        );
+        let root = txn.read_root(&self.kind)?;
+        let pending = txn.pending_for(&self.kind);
+        let start = encode_bound::<KC>(start)?;
+        let end = encode_bound::<KC>(end)?;
+        RwIter::range(txn, root, pending, start, end)
+    }
+
+    /// Returns a reverse iterator over the write transaction's view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be resolved in the transaction.
+    pub fn rev_iter_rw<'txn, 'env>(
+        &self,
+        txn: &'txn RwTxn<'env>,
+    ) -> Result<RwRevIter<'txn, 'env, KC, DC>>
+    where
+        KC: BytesDecode<'txn>,
+        DC: BytesDecode<'txn>,
+    {
+        ensure!(
+            txn.belongs_to(&self.env),
+            "transaction belongs to a different environment"
+        );
+        let root = txn.read_root(&self.kind)?;
+        let pending = txn.pending_for_rev(&self.kind);
+        RwRevIter::new(txn, root, pending, Bound::Unbounded, Bound::Unbounded)
+    }
+
+    /// Returns a reverse range iterator over the write transaction's view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a bound cannot be encoded, or if the database cannot
+    /// be resolved in the transaction.
+    pub fn rev_range_rw<'a, 'txn, 'env>(
+        &self,
+        txn: &'txn RwTxn<'env>,
+        start: Bound<&'a KC::EItem>,
+        end: Bound<&'a KC::EItem>,
+    ) -> Result<RwRevRange<'txn, 'env, KC, DC>>
+    where
+        KC: BytesEncode<'a> + BytesDecode<'txn>,
+        DC: BytesDecode<'txn>,
+    {
+        ensure!(
+            txn.belongs_to(&self.env),
+            "transaction belongs to a different environment"
+        );
+        let root = txn.read_root(&self.kind)?;
+        let pending = txn.pending_for_rev(&self.kind);
+        let start = encode_bound::<KC>(start)?;
+        let end = encode_bound::<KC>(end)?;
+        RwRevIter::new(txn, root, pending, start, end)
+    }
+
+    /// Returns a forward prefix iterator over the write transaction's view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the prefix cannot be encoded, or if the database
+    /// cannot be resolved in the transaction.
+    pub fn prefix_rw<'a, 'txn, 'env>(
+        &self,
+        txn: &'txn RwTxn<'env>,
+        prefix: &'a KC::EItem,
+    ) -> Result<RwPrefix<'txn, 'env, KC, DC>>
+    where
+        KC: BytesEncode<'a> + BytesDecode<'txn>,
+        DC: BytesDecode<'txn>,
+    {
+        ensure!(
+            txn.belongs_to(&self.env),
+            "transaction belongs to a different environment"
+        );
+        let root = txn.read_root(&self.kind)?;
+        let pending = txn.pending_for(&self.kind);
+        let start = KC::bytes_encode(prefix)
+            .map_err(|error| codec_error("prefix encoding failed", error))?
+            .into_owned();
+        let end = prefix_successor(&start)
+            .map(Bound::Excluded)
+            .unwrap_or(Bound::Unbounded);
+        RwIter::range(txn, root, pending, Bound::Included(start), end)
+    }
+
+    /// Returns a reverse prefix iterator over the write transaction's view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the prefix cannot be encoded, or if the database
+    /// cannot be resolved in the transaction.
+    pub fn rev_prefix_rw<'a, 'txn, 'env>(
+        &self,
+        txn: &'txn RwTxn<'env>,
+        prefix: &'a KC::EItem,
+    ) -> Result<RwRevPrefix<'txn, 'env, KC, DC>>
+    where
+        KC: BytesEncode<'a> + BytesDecode<'txn>,
+        DC: BytesDecode<'txn>,
+    {
+        ensure!(
+            txn.belongs_to(&self.env),
+            "transaction belongs to a different environment"
+        );
+        let root = txn.read_root(&self.kind)?;
+        let pending = txn.pending_for_rev(&self.kind);
+        let start = KC::bytes_encode(prefix)
+            .map_err(|error| codec_error("prefix encoding failed", error))?
+            .into_owned();
+        let end = prefix_successor(&start)
+            .map(Bound::Excluded)
+            .unwrap_or(Bound::Unbounded);
+        RwRevIter::new(txn, root, pending, Bound::Included(start), end)
     }
 
     /// Returns a reverse iterator over all entries in descending key order.
