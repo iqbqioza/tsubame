@@ -32,6 +32,7 @@ pub const DEFAULT_MAX_DBS: usize = 10;
 
 const DATA_FILE: &str = "data.tsubame";
 const LOCK_FILE: &str = "lock.tsubame";
+const WRITER_LOCK_FILE: &str = "writer.tsubame.lock";
 const CLEAN_FILE: &str = "clean.tsubame";
 const MIN_MAP_SIZE: usize = 3 * PAGE_SIZE;
 const CLEAN_MAGIC: [u8; 8] = *b"TSUBCLN\0";
@@ -56,6 +57,11 @@ impl Env {
         self.inner.read_only
     }
 
+    /// Returns whether this writable environment allows concurrent readers.
+    pub fn is_multi_process(&self) -> bool {
+        self.inner.multi_process
+    }
+
     /// Returns a consistent snapshot of the environment metadata.
     pub fn info(&self) -> EnvInfo {
         let committed = self.inner.read_committed();
@@ -68,6 +74,7 @@ impl Env {
             max_dbs: self.inner.max_dbs,
             format_version: meta::FORMAT_VERSION,
             read_only: self.inner.read_only,
+            multi_process: self.inner.multi_process,
         }
     }
 
@@ -77,6 +84,9 @@ impl Env {
     /// consistent snapshot of the environment.
     pub fn read_txn(&self) -> Result<RoTxn<'_>> {
         self.inner.ensure_usable()?;
+        if self.inner.read_only {
+            self.inner.refresh_read_only()?;
+        }
         let committed = self.inner.read_committed();
         self.inner.register_reader(committed.meta.txn_id);
         Ok(RoTxn::new(self, committed.meta))
@@ -208,6 +218,8 @@ pub struct EnvInfo {
     pub format_version: u32,
     /// Whether this environment was opened read-only.
     pub read_only: bool,
+    /// Whether concurrent readers were enabled for this writable environment.
+    pub multi_process: bool,
 }
 
 /// A page or contiguous run that is no longer reachable from a committed meta.
@@ -412,6 +424,8 @@ pub(crate) struct EnvInner {
     pub(crate) data: File,
     pub(crate) mmap: Mmap,
     pub(crate) read_only: bool,
+    pub(crate) multi_process: bool,
+    pub(crate) page_reuse: bool,
     pub(crate) committed: RwLock<Committed>,
     pub(crate) writer: Mutex<()>,
     pub(crate) readers: Mutex<BTreeMap<u64, usize>>,
@@ -424,6 +438,7 @@ pub(crate) struct EnvInner {
     clean_marker_on_drop: AtomicBool,
     verified: Vec<AtomicU64>,
     _lock: File,
+    _writer_lock: Option<File>,
 }
 
 impl EnvInner {
@@ -531,7 +546,7 @@ impl EnvInner {
     /// read-only reopen latency proportional to the database size. The writer
     /// lock is already held when this is called, so the scan runs once.
     pub(crate) fn ensure_free_pool(&self) {
-        if self.free_pool_ready.swap(true, Ordering::AcqRel) {
+        if !self.page_reuse || self.free_pool_ready.swap(true, Ordering::AcqRel) {
             return;
         }
         let committed = self.read_committed();
@@ -540,6 +555,56 @@ impl EnvInner {
         // complete.
         let free = reconstruct_free_list(&self.mmap, &committed.meta).unwrap_or_default();
         self.return_free(free);
+    }
+
+    #[inline]
+    /// Refreshes the committed snapshot from disk for a read-only environment.
+    pub(crate) fn refresh_read_only(&self) -> Result<()> {
+        let data_path = self.path.join(DATA_FILE);
+        let loaded = meta::load_all(&self.data, &data_path)?;
+        let clean_txn = read_clean_marker(&self.path);
+        let mut chosen = None;
+        let mut errors = Vec::new();
+
+        for candidate in loaded {
+            let required = pages_to_bytes(candidate.meta.page_count)?;
+            let required_data = required.saturating_sub(2 * PAGE_SIZE);
+            if self.mmap.len() < required_data {
+                errors.push(format!(
+                    "slot {}: committed pages exceed the read-only mapping",
+                    candidate.slot
+                ));
+                continue;
+            }
+            if clean_txn == Some(candidate.meta.txn_id) {
+                chosen = Some(candidate);
+                break;
+            }
+            match commit::validate(&self.mmap, &candidate.meta) {
+                Ok(()) => {
+                    chosen = Some(candidate);
+                    break;
+                }
+                Err(error) => errors.push(format!("slot {}: {error:#}", candidate.slot)),
+            }
+        }
+
+        let chosen = chosen.with_context(|| {
+            format!(
+                "no recoverable commit in `{}`: {}",
+                self.path.display(),
+                errors.join("; ")
+            )
+        })?;
+        let mut committed = self
+            .committed
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *committed = Committed {
+            meta: chosen.meta,
+            slot: chosen.slot,
+        };
+        Ok(())
     }
 
     #[inline]
@@ -686,6 +751,11 @@ pub struct EnvOpenOptions {
     pub max_dbs: usize,
     /// Whether the environment is opened read-only.
     pub read_only: bool,
+    /// Whether a writable environment may coexist with read-only processes.
+    ///
+    /// This disables cross-transaction page reuse so snapshots held by other
+    /// processes remain valid until they are dropped.
+    pub multi_process: bool,
 }
 
 impl Default for EnvOpenOptions {
@@ -694,6 +764,7 @@ impl Default for EnvOpenOptions {
             map_size: DEFAULT_MAP_SIZE,
             max_dbs: DEFAULT_MAX_DBS,
             read_only: false,
+            multi_process: false,
         }
     }
 }
@@ -720,10 +791,20 @@ impl EnvOpenOptions {
     /// Opens the environment without write access.
     ///
     /// Read-only environments take a shared file lock. Multiple read-only
-    /// processes can share an environment, but no writable environment can be
-    /// open at the same time.
+    /// processes can share an environment. A writable environment can be open
+    /// at the same time only when it enables [`Self::multi_process`].
     pub fn read_only(&mut self, read_only: bool) -> &mut Self {
         self.read_only = read_only;
+        self
+    }
+
+    /// Allows a writable environment to coexist with read-only environments.
+    ///
+    /// Cross-transaction page reuse is disabled in this mode so pages retained
+    /// by another process's snapshot are never overwritten. The data file can
+    /// grow until it is compacted offline.
+    pub fn multi_process(&mut self, multi_process: bool) -> &mut Self {
+        self.multi_process = multi_process;
         self
     }
 
@@ -768,7 +849,8 @@ impl EnvOpenOptions {
                 )
             })?;
 
-        let lock_result = if self.read_only {
+        let shared_lifecycle = self.read_only || self.multi_process;
+        let lock_result = if shared_lifecycle {
             fs4::FileExt::try_lock_shared(&lock)
         } else {
             fs4::FileExt::try_lock(&lock)
@@ -776,7 +858,7 @@ impl EnvOpenOptions {
         match lock_result {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
-                if self.read_only {
+                if shared_lifecycle {
                     bail!("environment `{}` is open for writing", path.display())
                 } else {
                     bail!("environment `{}` is already locked", path.display())
@@ -788,6 +870,32 @@ impl EnvOpenOptions {
                 });
             }
         }
+
+        let writer_lock = if self.multi_process && !self.read_only {
+            let writer_path = path.join(WRITER_LOCK_FILE);
+            let writer_lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&writer_path)
+                .with_context(|| format!("failed to open `{}`", writer_path.display()))?;
+            match fs4::FileExt::try_lock(&writer_lock) {
+                Ok(()) => Some(writer_lock),
+                Err(TryLockError::WouldBlock) => {
+                    bail!(
+                        "environment `{}` already has an active writable owner",
+                        path.display()
+                    )
+                }
+                Err(TryLockError::Error(error)) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to lock `{}`", writer_path.display()));
+                }
+            }
+        } else {
+            None
+        };
 
         let data_path = path.join(DATA_FILE);
         let data = if self.read_only {
@@ -820,14 +928,15 @@ impl EnvOpenOptions {
             let loaded = meta::load_all(&data, &data_path)?;
             let newest = &loaded[0];
             let minimum = pages_to_bytes(newest.meta.page_count)?;
-            ensure!(
-                existing_len >= minimum as u64,
-                "data file `{}` is truncated below the committed page count",
-                data_path.display()
-            );
-            let map_size =
+            let file_len =
                 usize::try_from(existing_len).context("data file is too large to map")?;
-            (loaded, map_size, true)
+            let map_size = requested_map_size.max(file_len);
+            ensure!(
+                map_size >= minimum,
+                "read-only map size is smaller than the committed page count"
+            );
+            let covers = existing_len >= minimum as u64;
+            (loaded, map_size, covers)
         } else if existing_len == 0 {
             #[cfg(windows)]
             let initial_len = requested_map_size as u64;
@@ -918,6 +1027,8 @@ impl EnvOpenOptions {
             data,
             mmap,
             read_only: self.read_only,
+            multi_process: self.multi_process && !self.read_only,
+            page_reuse: !self.read_only && !self.multi_process,
             committed: RwLock::new(Committed {
                 meta,
                 slot: meta_slot,
@@ -930,6 +1041,7 @@ impl EnvOpenOptions {
             clean_marker_on_drop: AtomicBool::new(!self.read_only),
             verified,
             _lock: lock,
+            _writer_lock: writer_lock,
         };
 
         Ok(Env {
@@ -991,16 +1103,22 @@ mod tests {
         assert_eq!(options.map_size, DEFAULT_MAP_SIZE);
         assert_eq!(options.max_dbs, DEFAULT_MAX_DBS);
         assert!(!options.read_only);
+        assert!(!options.multi_process);
     }
 
     #[test]
     fn builder_updates_options() {
         let mut options = EnvOpenOptions::new();
-        options.map_size(4096 * 4).max_dbs(2).read_only(true);
+        options
+            .map_size(4096 * 4)
+            .max_dbs(2)
+            .read_only(true)
+            .multi_process(true);
 
         assert_eq!(options.map_size, 4096 * 4);
         assert_eq!(options.max_dbs, 2);
         assert!(options.read_only);
+        assert!(options.multi_process);
     }
 
     #[test]

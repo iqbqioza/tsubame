@@ -977,6 +977,120 @@ fn read_only_environments_share_and_block_writers() -> Result<()> {
 }
 
 #[test]
+fn multi_process_writer_coexists_with_read_only_environment() -> Result<()> {
+    let dir = tempdir()?;
+    let mut writer_options = options();
+    writer_options.multi_process(true);
+    let writer = writer_options.open(dir.path())?;
+    assert!(writer.is_multi_process());
+    assert!(writer.info().multi_process);
+
+    let mut wtxn = writer.write_txn()?;
+    let db = writer.create_database::<Str, Str>(&mut wtxn, None)?;
+    db.put(&mut wtxn, "key", "old")?;
+    for i in 0..100u32 {
+        db.put(&mut wtxn, &format!("key-{i:03}"), "old")?;
+    }
+    wtxn.commit()?;
+    let pages_before = writer.info().page_count;
+
+    let mut read_options = options();
+    read_options.read_only(true);
+    let reader = read_options.open(dir.path())?;
+    let old_rtxn = reader.read_txn()?;
+    let old_db = reader.open_database::<Str, Str>(&old_rtxn, None)?;
+    assert_eq!(old_db.get(&old_rtxn, "key")?, Some("old"));
+
+    for round in 0..5u32 {
+        let mut wtxn = writer.write_txn()?;
+        for i in 0..100u32 {
+            db.put(&mut wtxn, &format!("key-{i:03}"), &format!("round-{round}"))?;
+        }
+        wtxn.commit()?;
+    }
+    assert!(writer.info().page_count > pages_before);
+    assert_eq!(old_db.get(&old_rtxn, "key-000")?, Some("old"));
+
+    let new_rtxn = reader.read_txn()?;
+    let new_db = reader.open_database::<Str, Str>(&new_rtxn, None)?;
+    assert_eq!(new_db.get(&new_rtxn, "key-000")?, Some("round-4"));
+
+    let mut second_writer = options();
+    second_writer.multi_process(true);
+    assert!(second_writer.open(dir.path()).is_err());
+    assert!(options().open(dir.path()).is_err());
+    assert!(Env::compact(dir.path()).is_err());
+
+    drop(new_rtxn);
+    drop(new_db);
+    drop(old_rtxn);
+    drop(old_db);
+    drop(reader);
+    drop(db);
+    drop(writer);
+
+    let env = options().open(dir.path())?;
+    let rtxn = env.read_txn()?;
+    let db = env.open_database::<Str, Str>(&rtxn, None)?;
+    assert_eq!(db.get(&rtxn, "key-000")?, Some("round-4"));
+
+    Ok(())
+}
+
+#[test]
+fn multi_process_writer_coexists_with_read_only_process() -> Result<()> {
+    let dir = tempdir()?;
+    {
+        let env = options().open(dir.path())?;
+        let mut wtxn = env.write_txn()?;
+        let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+        db.put(&mut wtxn, "key", "initial")?;
+        wtxn.commit()?;
+    }
+    std::fs::remove_file(dir.path().join("child-ready")).ok();
+    std::fs::remove_file(dir.path().join("child-release")).ok();
+
+    let mut child = std::process::Command::new(std::env::current_exe()?)
+        .args(["--exact", "read_only_child_process_helper", "--nocapture"])
+        .env("TSUBAME_READ_ONLY_CHILD", dir.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let ready = dir.path().join("child-ready");
+    for _ in 0..500 {
+        if ready.is_file() {
+            break;
+        }
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("read-only child exited before becoming ready: {status}");
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(ready.is_file(), "read-only child did not become ready");
+
+    let mut writer_options = options();
+    writer_options.multi_process(true);
+    let writer = writer_options.open(dir.path())?;
+    let db = writer.open_database::<Str, Str>(&writer.read_txn()?, None)?;
+    let mut wtxn = writer.write_txn()?;
+    db.put(&mut wtxn, "key", "updated")?;
+    wtxn.commit()?;
+    assert!(Env::compact(dir.path()).is_err());
+
+    std::fs::write(dir.path().join("child-release"), b"release")?;
+    assert!(child.wait()?.success());
+    drop(db);
+    drop(writer);
+
+    let env = options().open(dir.path())?;
+    let rtxn = env.read_txn()?;
+    let db = env.open_database::<Str, Str>(&rtxn, None)?;
+    assert_eq!(db.get(&rtxn, "key")?, Some("updated"));
+
+    Ok(())
+}
+
+#[test]
 fn read_only_child_process_helper() -> Result<()> {
     let Ok(path) = std::env::var("TSUBAME_READ_ONLY_CHILD") else {
         return Ok(());
