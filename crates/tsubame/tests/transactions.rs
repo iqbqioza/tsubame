@@ -1241,9 +1241,39 @@ fn read_only_open_does_not_create_or_extend_an_environment() -> Result<()> {
 }
 
 #[test]
+fn online_compaction_preserves_custom_comparator() -> Result<()> {
+    let dir = tempdir()?;
+    let comparator = KeyComparator::custom(reverse_bytes);
+    let mut options = options();
+    options
+        .comparator(comparator)
+        .comparator_id("reverse-online");
+    let env = options.open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+    for (key, value) in [("a", "1"), ("b", "2"), ("c", "3")] {
+        db.put(&mut wtxn, key, value)?;
+    }
+    wtxn.commit()?;
+    drop(db);
+
+    env.compact_online()?;
+    assert_eq!(env.comparator_id(), "reverse-online");
+    let rtxn = env.read_txn()?;
+    let db = env.open_database::<Str, Str>(&rtxn, None)?;
+    let keys: Vec<_> = db
+        .iter(&rtxn)?
+        .map(|item| item.map(|(key, _)| key.to_owned()))
+        .collect::<std::result::Result<_, _>>()?;
+    assert_eq!(keys, ["c", "b", "a"]);
+
+    Ok(())
+}
+
+#[test]
 fn online_compaction_remaps_an_open_environment() -> Result<()> {
     let dir = tempdir()?;
-    let mut env = options().open(dir.path())?;
+    let env = options().open(dir.path())?;
     let mut wtxn = env.write_txn()?;
     let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
     for i in 0..1_000u32 {
@@ -1289,57 +1319,45 @@ fn online_compaction_remaps_an_open_environment() -> Result<()> {
 }
 
 #[test]
-fn online_compaction_requires_exclusive_handles() -> Result<()> {
+fn online_compaction_coexists_with_active_readers() -> Result<()> {
     let dir = tempdir()?;
-    let mut env = options().open(dir.path())?;
+    let env = options().open(dir.path())?;
     let mut wtxn = env.write_txn()?;
     let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
-    db.put(&mut wtxn, "key", "value")?;
+    db.put(&mut wtxn, "key", "before")?;
     wtxn.commit()?;
+
+    let old_rtxn = env.read_txn()?;
+    let old_db = env.open_database::<Str, Str>(&old_rtxn, None)?;
+    assert_eq!(old_db.get(&old_rtxn, "key")?, Some("before"));
+
+    let writer = env.write_txn()?;
+    assert!(env.compact_online().is_err());
+    drop(writer);
+
+    env.compact_online()?;
+    assert_eq!(old_db.get(&old_rtxn, "key")?, Some("before"));
+
+    let new_rtxn = env.read_txn()?;
+    let new_db = env.open_database::<Str, Str>(&new_rtxn, None)?;
+    assert_eq!(new_db.get(&new_rtxn, "key")?, Some("before"));
+    drop(new_rtxn);
+    drop(new_db);
+    drop(old_rtxn);
+    drop(old_db);
     drop(db);
 
-    let rtxn = env.read_txn()?;
-    let handle = env.open_database::<Str, Str>(&rtxn, None)?;
-    drop(rtxn);
-    assert!(env.compact_online().is_err());
-    drop(handle);
-    env.compact_online()?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+    db.put(&mut wtxn, "after", "ok")?;
+    wtxn.commit()?;
+    drop(db);
     drop(env);
 
-    let mut read_options = options();
-    read_options.read_only(true);
-    let mut reader = read_options.open(dir.path())?;
-    assert!(reader.info().read_only);
-    assert!(reader.compact_online().is_err());
-
-    Ok(())
-}
-
-#[test]
-fn online_compaction_preserves_custom_order_and_identity() -> Result<()> {
-    let dir = tempdir()?;
-    let comparator = KeyComparator::custom(reverse_bytes);
-    let mut options = options();
-    options
-        .comparator(comparator)
-        .comparator_id("reverse-online");
-    let mut env = options.open(dir.path())?;
-    let mut wtxn = env.write_txn()?;
-    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
-    for (key, value) in [("a", "1"), ("b", "2"), ("c", "3")] {
-        db.put(&mut wtxn, key, value)?;
-    }
-    wtxn.commit()?;
-    drop(db);
-    env.compact_online()?;
-    assert_eq!(env.comparator_id(), "reverse-online");
+    let env = options().open(dir.path())?;
     let rtxn = env.read_txn()?;
     let db = env.open_database::<Str, Str>(&rtxn, None)?;
-    let keys: Vec<_> = db
-        .iter(&rtxn)?
-        .map(|item| item.map(|(key, _)| key.to_owned()))
-        .collect::<std::result::Result<_, _>>()?;
-    assert_eq!(keys, ["c", "b", "a"]);
+    assert_eq!(db.get(&rtxn, "after")?, Some("ok"));
 
     Ok(())
 }

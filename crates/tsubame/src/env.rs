@@ -82,8 +82,9 @@ impl Env {
     /// Returns a consistent snapshot of the environment metadata.
     pub fn info(&self) -> EnvInfo {
         let committed = self.inner.read_committed();
+        let state = self.inner.read_state();
         EnvInfo {
-            map_size: self.inner.map_size,
+            map_size: state.map_size,
             page_size: PAGE_SIZE,
             page_count: committed.meta.page_count,
             txn_id: committed.meta.txn_id,
@@ -104,9 +105,16 @@ impl Env {
         if self.inner.read_only {
             self.inner.refresh_read_only()?;
         }
+        let state_guard = self
+            .inner
+            .state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = Arc::clone(&state_guard);
         let committed = self.inner.read_committed();
+        drop(state_guard);
         self.inner.register_reader(committed.meta.txn_id);
-        Ok(RoTxn::new(self, committed.meta))
+        Ok(RoTxn::new(self, state, committed.meta))
     }
 
     /// Starts a read-write transaction.
@@ -126,9 +134,16 @@ impl Env {
             .writer
             .lock()
             .map_err(|_| anyhow::anyhow!("transaction lock is poisoned"))?;
+        let state_guard = self
+            .inner
+            .state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = Arc::clone(&state_guard);
         let committed = self.inner.read_committed();
+        drop(state_guard);
         self.inner.ensure_free_pool();
-        RwTxn::new(self, writer, committed)
+        RwTxn::new(self, writer, committed, state)
     }
 
     /// Opens the unnamed default database or a named database.
@@ -224,20 +239,20 @@ impl Env {
 
     /// Compacts this environment while it remains open.
     ///
-    /// This is an exclusive operation: all transactions must be finished and
-    /// all [`Database`] handles must be dropped first. The environment is
-    /// remapped to the compacted file before this method returns.
+    /// Read transactions and [`Database`] handles may remain active. Existing
+    /// readers keep the previous mmap generation, while new transactions use
+    /// the compacted file. A write transaction must not be active.
     ///
     /// Unlike [`Env::compact`], this does not require closing and reopening the
-    /// environment, but it does not run concurrently with active database
-    /// handles.
+    /// environment. Read-only and multi-process environments are rejected
+    /// because their other processes would retain the old file generation.
     ///
     /// # Errors
     ///
-    /// Returns an error for read-only or multi-process environments, when
-    /// database handles remain, or when the replacement file cannot be built or
-    /// mapped.
-    pub fn compact_online(&mut self) -> Result<()> {
+    /// Returns an error for read-only or multi-process environments, when a
+    /// write transaction is active, or when the replacement file cannot be
+    /// built or mapped.
+    pub fn compact_online(&self) -> Result<()> {
         ensure!(
             !self.inner.read_only,
             "read-only environments cannot be compacted online"
@@ -246,10 +261,19 @@ impl Env {
             !self.inner.multi_process,
             "multi-process environments must be compacted offline"
         );
-        let inner = Arc::get_mut(&mut self.inner)
-            .context("drop all Database handles before compacting online")?;
+        let _writer = self
+            .inner
+            .writer
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("a write transaction is active"))?;
 
-        let temp_dir = inner.path.join(".tsubame-online-compact");
+        let path = self.inner.path.clone();
+        let state = self.inner.read_state();
+        let map_size = state.map_size;
+        let comparator = self.inner.comparator;
+        let comparator_id = self.inner.comparator_id.clone();
+
+        let temp_dir = path.join(".tsubame-online-compact");
         if temp_dir.exists() {
             fs::remove_dir_all(&temp_dir)
                 .with_context(|| format!("failed to clear `{}`", temp_dir.display()))?;
@@ -258,7 +282,7 @@ impl Env {
             .with_context(|| format!("failed to create `{}`", temp_dir.display()))?;
 
         let result = (|| {
-            let data_path = inner.path.join(DATA_FILE);
+            let data_path = path.join(DATA_FILE);
             let temp_data = temp_dir.join(DATA_FILE);
             fs::copy(&data_path, &temp_data).with_context(|| {
                 format!(
@@ -267,15 +291,11 @@ impl Env {
                     temp_data.display()
                 )
             })?;
-            let comparator_file = inner.path.join(COMPARATOR_FILE);
+            let comparator_file = path.join(COMPARATOR_FILE);
             if comparator_file.is_file() {
                 fs::copy(&comparator_file, temp_dir.join(COMPARATOR_FILE))?;
             }
-            crate::storage::compact::compact_with(
-                &temp_dir,
-                inner.comparator,
-                &inner.comparator_id,
-            )?;
+            crate::storage::compact::compact_with(&temp_dir, comparator, &comparator_id)?;
 
             let new_file = OpenOptions::new()
                 .read(true)
@@ -284,13 +304,12 @@ impl Env {
                 .with_context(|| format!("failed to open `{}`", temp_data.display()))?;
             #[cfg(windows)]
             {
-                if new_file.metadata()?.len() < inner.map_size as u64 {
-                    new_file.set_len(inner.map_size as u64)?;
+                if new_file.metadata()?.len() < map_size as u64 {
+                    new_file.set_len(map_size as u64)?;
                     new_file.sync_data()?;
                 }
             }
-            let mapped_len = inner
-                .map_size
+            let mapped_len = map_size
                 .checked_sub(2 * PAGE_SIZE)
                 .context("map size is too small")?;
             let new_mmap = if mapped_len == 0 {
@@ -318,23 +337,31 @@ impl Env {
                 )
             })?;
 
-            let verified_words = (inner.map_size / PAGE_SIZE).div_ceil(64);
-            inner.data = new_file;
-            inner.mmap = new_mmap;
-            inner.verified = (0..verified_words).map(|_| AtomicU64::new(0)).collect();
-            *inner
-                .committed
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Committed {
+            let new_state = Arc::new(EnvState::new(new_file, new_mmap, map_size));
+            let replacement = Committed {
                 meta: chosen.meta,
                 slot: chosen.slot,
             };
-            inner
+            {
+                let mut state_guard = self
+                    .inner
+                    .state
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut committed = self
+                    .inner
+                    .committed
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *state_guard = new_state;
+                *committed = replacement;
+            }
+            self.inner
                 .free_pool
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clear();
-            inner.free_pool_ready.store(false, Ordering::Release);
+            self.inner.free_pool_ready.store(false, Ordering::Release);
             Ok(())
         })();
 
@@ -569,53 +596,24 @@ pub(crate) struct Committed {
     pub(crate) slot: u8,
 }
 
-/// The in-memory state shared by an environment and its handles.
-pub(crate) struct EnvInner {
-    pub(crate) path: PathBuf,
-    pub(crate) map_size: usize,
-    pub(crate) max_dbs: usize,
+/// The file and memory-map generation currently used by an environment.
+pub(crate) struct EnvState {
     pub(crate) data: File,
     pub(crate) mmap: Mmap,
-    pub(crate) read_only: bool,
-    pub(crate) multi_process: bool,
-    pub(crate) page_reuse: bool,
-    pub(crate) comparator: KeyComparator,
-    pub(crate) comparator_id: String,
-    pub(crate) committed: RwLock<Committed>,
-    pub(crate) writer: Mutex<()>,
-    pub(crate) readers: Mutex<BTreeMap<u64, usize>>,
-    /// Extents that are no longer reachable from the current commit, tagged
-    /// with the generation that released them. The writer moves reusable
-    /// extents into its transaction and returns the unused ones.
-    pub(crate) free_pool: Mutex<Vec<FreeExtent>>,
-    free_pool_ready: AtomicBool,
-    pub(crate) poisoned: AtomicBool,
-    clean_marker_on_drop: AtomicBool,
+    pub(crate) map_size: usize,
     verified: Vec<AtomicU64>,
-    _lock: File,
-    _writer_lock: Option<File>,
 }
 
-impl EnvInner {
-    pub(crate) fn read_committed(&self) -> Committed {
-        *self
-            .committed
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    pub(crate) fn ensure_usable(&self) -> Result<()> {
-        if self.poisoned.load(Ordering::Acquire) {
-            bail!(
-                "environment `{}` must be reopened after a failed commit",
-                self.path.display()
-            );
+impl EnvState {
+    pub(crate) fn new(data: File, mmap: Mmap, map_size: usize) -> Self {
+        let verified_words = (map_size / PAGE_SIZE).div_ceil(64);
+        let verified = (0..verified_words).map(|_| AtomicU64::new(0)).collect();
+        Self {
+            data,
+            mmap,
+            map_size,
+            verified,
         }
-        Ok(())
-    }
-
-    pub(crate) fn poison(&self) {
-        self.poisoned.store(true, Ordering::Release);
     }
 
     #[inline]
@@ -634,132 +632,6 @@ impl EnvInner {
         if let Some(word) = self.verified.get(index) {
             word.fetch_or(bit, Ordering::Relaxed);
         }
-    }
-
-    pub(crate) fn register_reader(&self, txn_id: u64) {
-        let mut readers = self
-            .readers
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *readers.entry(txn_id).or_insert(0) += 1;
-    }
-
-    pub(crate) fn release_reader(&self, txn_id: u64) {
-        let mut readers = self
-            .readers
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(count) = readers.get_mut(&txn_id) {
-            *count -= 1;
-            if *count == 0 {
-                readers.remove(&txn_id);
-            }
-        }
-    }
-
-    pub(crate) fn oldest_reader_snapshot(&self, fallback: u64) -> u64 {
-        self.readers
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .keys()
-            .next()
-            .copied()
-            .unwrap_or(fallback)
-    }
-
-    pub(crate) fn take_reusable_free(&self, limit_txn: u64) -> Vec<FreeExtent> {
-        let mut pool = self
-            .free_pool
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut reusable = Vec::new();
-        let mut retained = Vec::with_capacity(pool.len());
-
-        for extent in pool.drain(..) {
-            if extent.freed_txn <= limit_txn {
-                reusable.push(extent);
-            } else {
-                retained.push(extent);
-            }
-        }
-
-        *pool = retained;
-        reusable
-    }
-
-    pub(crate) fn return_free(&self, extents: impl IntoIterator<Item = FreeExtent>) {
-        let mut pool = self
-            .free_pool
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        pool.extend(extents);
-    }
-
-    /// Reconstructs the free list on the first write after opening.
-    ///
-    /// Reconstruction scans the reachable tree, so doing it eagerly would make
-    /// read-only reopen latency proportional to the database size. The writer
-    /// lock is already held when this is called, so the scan runs once.
-    pub(crate) fn ensure_free_pool(&self) {
-        if !self.page_reuse || self.free_pool_ready.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let committed = self.read_committed();
-        // A malformed reachable tree already fails reads. Do not turn that
-        // into an open error; leave the pool empty if reconstruction cannot
-        // complete.
-        let free = reconstruct_free_list(&self.mmap, &committed.meta).unwrap_or_default();
-        self.return_free(free);
-    }
-
-    #[inline]
-    /// Refreshes the committed snapshot from disk for a read-only environment.
-    pub(crate) fn refresh_read_only(&self) -> Result<()> {
-        let data_path = self.path.join(DATA_FILE);
-        let loaded = meta::load_all(&self.data, &data_path)?;
-        let clean_txn = read_clean_marker(&self.path);
-        let mut chosen = None;
-        let mut errors = Vec::new();
-
-        for candidate in loaded {
-            let required = pages_to_bytes(candidate.meta.page_count)?;
-            let required_data = required.saturating_sub(2 * PAGE_SIZE);
-            if self.mmap.len() < required_data {
-                errors.push(format!(
-                    "slot {}: committed pages exceed the read-only mapping",
-                    candidate.slot
-                ));
-                continue;
-            }
-            if clean_txn == Some(candidate.meta.txn_id) {
-                chosen = Some(candidate);
-                break;
-            }
-            match commit::validate(&self.mmap, &candidate.meta) {
-                Ok(()) => {
-                    chosen = Some(candidate);
-                    break;
-                }
-                Err(error) => errors.push(format!("slot {}: {error:#}", candidate.slot)),
-            }
-        }
-
-        let chosen = chosen.with_context(|| {
-            format!(
-                "no recoverable commit in `{}`: {}",
-                self.path.display(),
-                errors.join("; ")
-            )
-        })?;
-        let mut committed = self
-            .committed
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *committed = Committed {
-            meta: chosen.meta,
-            slot: chosen.slot,
-        };
-        Ok(())
     }
 
     #[inline]
@@ -833,6 +705,190 @@ impl EnvInner {
             self.mark_verified(reference.start_page);
             Ok(payload)
         }
+    }
+}
+
+/// The in-memory state shared by an environment and its handles.
+pub(crate) struct EnvInner {
+    pub(crate) path: PathBuf,
+    pub(crate) max_dbs: usize,
+    pub(crate) state: RwLock<Arc<EnvState>>,
+    pub(crate) read_only: bool,
+    pub(crate) multi_process: bool,
+    pub(crate) page_reuse: bool,
+    pub(crate) comparator: KeyComparator,
+    pub(crate) comparator_id: String,
+    pub(crate) committed: RwLock<Committed>,
+    pub(crate) writer: Mutex<()>,
+    pub(crate) readers: Mutex<BTreeMap<u64, usize>>,
+    /// Extents that are no longer reachable from the current commit, tagged
+    /// with the generation that released them. The writer moves reusable
+    /// extents into its transaction and returns the unused ones.
+    pub(crate) free_pool: Mutex<Vec<FreeExtent>>,
+    free_pool_ready: AtomicBool,
+    pub(crate) poisoned: AtomicBool,
+    clean_marker_on_drop: AtomicBool,
+    _lock: File,
+    _writer_lock: Option<File>,
+}
+
+impl EnvInner {
+    pub(crate) fn read_committed(&self) -> Committed {
+        *self
+            .committed
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) fn read_state(&self) -> Arc<EnvState> {
+        Arc::clone(
+            &self
+                .state
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
+    pub(crate) fn ensure_usable(&self) -> Result<()> {
+        if self.poisoned.load(Ordering::Acquire) {
+            bail!(
+                "environment `{}` must be reopened after a failed commit",
+                self.path.display()
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn poison(&self) {
+        self.poisoned.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn register_reader(&self, txn_id: u64) {
+        let mut readers = self
+            .readers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *readers.entry(txn_id).or_insert(0) += 1;
+    }
+
+    pub(crate) fn release_reader(&self, txn_id: u64) {
+        let mut readers = self
+            .readers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = readers.get_mut(&txn_id) {
+            *count -= 1;
+            if *count == 0 {
+                readers.remove(&txn_id);
+            }
+        }
+    }
+
+    pub(crate) fn oldest_reader_snapshot(&self, fallback: u64) -> u64 {
+        self.readers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys()
+            .next()
+            .copied()
+            .unwrap_or(fallback)
+    }
+
+    pub(crate) fn take_reusable_free(&self, limit_txn: u64) -> Vec<FreeExtent> {
+        let mut pool = self
+            .free_pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut reusable = Vec::new();
+        let mut retained = Vec::with_capacity(pool.len());
+
+        for extent in pool.drain(..) {
+            if extent.freed_txn <= limit_txn {
+                reusable.push(extent);
+            } else {
+                retained.push(extent);
+            }
+        }
+
+        *pool = retained;
+        reusable
+    }
+
+    pub(crate) fn return_free(&self, extents: impl IntoIterator<Item = FreeExtent>) {
+        let mut pool = self
+            .free_pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pool.extend(extents);
+    }
+
+    /// Reconstructs the free list on the first write after opening.
+    ///
+    /// Reconstruction scans the reachable tree, so doing it eagerly would make
+    /// read-only reopen latency proportional to the database size. The writer
+    /// lock is already held when this is called, so the scan runs once.
+    pub(crate) fn ensure_free_pool(&self) {
+        if !self.page_reuse || self.free_pool_ready.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let committed = self.read_committed();
+        let state = self.read_state();
+        // A malformed reachable tree already fails reads. Do not turn that
+        // into an open error; leave the pool empty if reconstruction cannot
+        // complete.
+        let free = reconstruct_free_list(&state.mmap, &committed.meta).unwrap_or_default();
+        self.return_free(free);
+    }
+
+    #[inline]
+    /// Refreshes the committed snapshot from disk for a read-only environment.
+    pub(crate) fn refresh_read_only(&self) -> Result<()> {
+        let data_path = self.path.join(DATA_FILE);
+        let state = self.read_state();
+        let loaded = meta::load_all(&state.data, &data_path)?;
+        let clean_txn = read_clean_marker(&self.path);
+        let mut chosen = None;
+        let mut errors = Vec::new();
+
+        for candidate in loaded {
+            let required = pages_to_bytes(candidate.meta.page_count)?;
+            let required_data = required.saturating_sub(2 * PAGE_SIZE);
+            if state.mmap.len() < required_data {
+                errors.push(format!(
+                    "slot {}: committed pages exceed the read-only mapping",
+                    candidate.slot
+                ));
+                continue;
+            }
+            if clean_txn == Some(candidate.meta.txn_id) {
+                chosen = Some(candidate);
+                break;
+            }
+            match commit::validate(&state.mmap, &candidate.meta) {
+                Ok(()) => {
+                    chosen = Some(candidate);
+                    break;
+                }
+                Err(error) => errors.push(format!("slot {}: {error:#}", candidate.slot)),
+            }
+        }
+
+        let chosen = chosen.with_context(|| {
+            format!(
+                "no recoverable commit in `{}`: {}",
+                self.path.display(),
+                errors.join("; ")
+            )
+        })?;
+        let mut committed = self
+            .committed
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *committed = Committed {
+            meta: chosen.meta,
+            slot: chosen.slot,
+        };
+        Ok(())
     }
 }
 
@@ -1300,15 +1356,11 @@ impl EnvOpenOptions {
             write_comparator_id(path, &comparator_id)?;
         }
 
-        let verified_words = (map_size / PAGE_SIZE).div_ceil(64);
-        let verified = (0..verified_words).map(|_| AtomicU64::new(0)).collect();
-
+        let state = EnvState::new(data, mmap, map_size);
         let inner = EnvInner {
             path: path.to_path_buf(),
-            map_size,
             max_dbs: self.max_dbs,
-            data,
-            mmap,
+            state: RwLock::new(Arc::new(state)),
             read_only: self.read_only,
             multi_process: self.multi_process && !self.read_only,
             page_reuse: !self.read_only && !self.multi_process,
@@ -1324,7 +1376,6 @@ impl EnvOpenOptions {
             free_pool_ready: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
             clean_marker_on_drop: AtomicBool::new(!self.read_only),
-            verified,
             _lock: lock,
             _writer_lock: writer_lock,
         };

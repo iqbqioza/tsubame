@@ -10,7 +10,7 @@
 //! The environment lifecycle, the on-disk meta format, the B+tree read and
 //! write paths, transactions, typed database operations, named databases,
 //! ordered forward/reverse iteration, ranges, prefixes, write-transaction
-//! reads, custom key order, in-process page reuse, exclusive online compaction,
+//! reads, custom key order, in-process page reuse, online compaction,
 //! and offline compaction are implemented. APIs may change while the engine is being built.
 //!
 //! # Example
