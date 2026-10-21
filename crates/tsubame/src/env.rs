@@ -17,6 +17,7 @@ use memmap2::Mmap;
 
 use crate::Result;
 use crate::database::{Database, DatabaseKind};
+use crate::storage::commit;
 use crate::storage::meta::{self, Meta};
 use crate::storage::overflow::{self, OverflowRef};
 use crate::storage::page::Page;
@@ -31,7 +32,10 @@ pub const DEFAULT_MAX_DBS: usize = 10;
 
 const DATA_FILE: &str = "data.tsubame";
 const LOCK_FILE: &str = "lock.tsubame";
+const CLEAN_FILE: &str = "clean.tsubame";
 const MIN_MAP_SIZE: usize = 3 * PAGE_SIZE;
+const CLEAN_MAGIC: [u8; 8] = *b"TSUBCLN\0";
+const CLEAN_LEN: usize = 32;
 
 /// An open environment.
 ///
@@ -177,6 +181,7 @@ pub(crate) struct EnvInner {
     pub(crate) writer: Mutex<()>,
     pub(crate) readers: Mutex<BTreeMap<u64, usize>>,
     pub(crate) poisoned: AtomicBool,
+    clean_marker_on_drop: AtomicBool,
     verified: Vec<AtomicU64>,
     _lock: File,
 }
@@ -313,6 +318,63 @@ impl EnvInner {
     }
 }
 
+impl Drop for EnvInner {
+    fn drop(&mut self) {
+        if self.poisoned.load(Ordering::Acquire)
+            || !self.clean_marker_on_drop.load(Ordering::Acquire)
+        {
+            return;
+        }
+
+        let committed = self.read_committed();
+        let _ = write_clean_marker(&self.path, committed.meta.txn_id);
+    }
+}
+
+/// Reads the clean-shutdown marker, if it is present and valid.
+fn read_clean_marker(path: &Path) -> Option<u64> {
+    let bytes = fs::read(path.join(CLEAN_FILE)).ok()?;
+    if bytes.len() != CLEAN_LEN || &bytes[0..8] != CLEAN_MAGIC.as_slice() {
+        return None;
+    }
+    if u32::from_le_bytes(bytes[8..12].try_into().ok()?) != 1 {
+        return None;
+    }
+
+    let stored = u32::from_le_bytes(bytes[24..28].try_into().ok()?);
+    let mut copy = bytes.clone();
+    copy[24..28].fill(0);
+    if stored != crc32c::crc32c(&copy) {
+        return None;
+    }
+
+    let txn_id = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
+    (txn_id > 0).then_some(txn_id)
+}
+
+/// Writes the clean-shutdown marker.
+fn write_clean_marker(path: &Path, txn_id: u64) -> Result<()> {
+    let mut bytes = [0u8; CLEAN_LEN];
+    bytes[0..8].copy_from_slice(&CLEAN_MAGIC);
+    bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+    bytes[16..24].copy_from_slice(&txn_id.to_le_bytes());
+    let checksum = crc32c::crc32c(&bytes);
+    bytes[24..28].copy_from_slice(&checksum.to_le_bytes());
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.join(CLEAN_FILE))
+        .with_context(|| format!("failed to open `{}`", path.join(CLEAN_FILE).display()))?;
+    io::write_all_at(&file, &bytes, 0)?;
+    file.set_len(CLEAN_LEN as u64)?;
+    file.sync_data()?;
+
+    Ok(())
+}
+
 /// Options used to open an [`Env`].
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -410,33 +472,47 @@ impl EnvOpenOptions {
             .len();
         let requested_map_size = normalize_map_size(self.map_size)?;
 
-        let (meta, meta_slot, map_size) = if existing_len == 0 {
-            data.set_len(requested_map_size as u64)
+        let (candidates, map_size, file_covers_newest) = if existing_len == 0 {
+            #[cfg(windows)]
+            let initial_len = requested_map_size as u64;
+            #[cfg(not(windows))]
+            let initial_len = (2 * PAGE_SIZE) as u64;
+            data.set_len(initial_len)
                 .with_context(|| format!("failed to size `{}`", data_path.display()))?;
             let meta = meta::initialize(&data).context("failed to initialize the environment")?;
             data.sync_all()
                 .with_context(|| format!("failed to sync `{}`", data_path.display()))?;
             io::sync_dir(path).with_context(|| format!("failed to sync `{}`", path.display()))?;
-            (meta, 0, requested_map_size)
+            (
+                vec![meta::LoadedMeta { meta, slot: 0 }],
+                requested_map_size,
+                true,
+            )
         } else {
-            let loaded = meta::load(&data, &data_path)?;
-            let minimum = pages_to_bytes(loaded.meta.page_count)?;
-            ensure!(
-                existing_len >= minimum as u64,
-                "data file `{}` is truncated: {} bytes cannot hold {} pages",
-                data_path.display(),
-                existing_len,
-                loaded.meta.page_count
-            );
+            let loaded = meta::load_all(&data, &data_path)?;
+            let newest = &loaded[0];
+            let minimum = pages_to_bytes(newest.meta.page_count)?;
+            #[cfg(windows)]
+            let mut covers = existing_len >= minimum as u64;
+            #[cfg(not(windows))]
+            let covers = existing_len >= minimum as u64;
+            if !covers {
+                data.set_len(minimum as u64)
+                    .with_context(|| format!("failed to size `{}`", data_path.display()))?;
+            }
 
             let map_size = requested_map_size.max(minimum);
-            if existing_len < map_size as u64 {
+
+            #[cfg(windows)]
+            if data.metadata()?.len() < map_size as u64 {
                 data.set_len(map_size as u64)
                     .with_context(|| format!("failed to size `{}`", data_path.display()))?;
                 data.sync_all()
                     .with_context(|| format!("failed to sync `{}`", data_path.display()))?;
+                covers = false;
             }
-            (loaded.meta, loaded.slot, map_size)
+
+            (loaded, map_size, covers)
         };
 
         let data_offset = (2 * PAGE_SIZE) as u64;
@@ -444,6 +520,33 @@ impl EnvOpenOptions {
         let mmap = mmap::map_data(&data, data_offset, mapped_len)
             .with_context(|| format!("failed to map `{}`", data_path.display()))?;
         debug_assert_eq!(mmap.len(), mapped_len);
+
+        let mut chosen = None;
+        let mut errors = Vec::new();
+        let clean_txn = read_clean_marker(path);
+        for candidate in candidates {
+            if clean_txn == Some(candidate.meta.txn_id) && file_covers_newest {
+                chosen = Some(candidate);
+                break;
+            }
+            match commit::validate(&mmap, &candidate.meta) {
+                Ok(()) => {
+                    chosen = Some(candidate);
+                    break;
+                }
+                Err(error) => errors.push(format!("slot {}: {error:#}", candidate.slot)),
+            }
+        }
+        let chosen = match chosen {
+            Some(committed) => committed,
+            None => bail!(
+                "no recoverable commit in `{}`: {}",
+                path.display(),
+                errors.join("; ")
+            ),
+        };
+        let meta = chosen.meta;
+        let meta_slot = chosen.slot;
 
         let verified_words = (map_size / PAGE_SIZE).div_ceil(64);
         let verified = (0..verified_words).map(|_| AtomicU64::new(0)).collect();
@@ -461,6 +564,7 @@ impl EnvOpenOptions {
             writer: Mutex::new(()),
             readers: Mutex::new(BTreeMap::new()),
             poisoned: AtomicBool::new(false),
+            clean_marker_on_drop: AtomicBool::new(true),
             verified,
             _lock: lock,
         };

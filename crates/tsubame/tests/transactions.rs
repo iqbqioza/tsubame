@@ -229,11 +229,93 @@ fn recovers_previous_commit_when_newest_meta_is_corrupt() -> Result<()> {
 
     // The second commit used meta slot 0. Break its checksum so recovery must
     // fall back to the first commit in slot 1.
+    std::fs::remove_file(dir.path().join("clean.tsubame")).ok();
     let mut file = OpenOptions::new()
         .write(true)
         .open(dir.path().join("data.tsubame"))?;
     file.seek(SeekFrom::Start(100))?;
     file.write_all(&[0xff])?;
+
+    let env = options().open(dir.path())?;
+    assert_eq!(env.info().txn_id, previous_txn);
+    let rtxn = env.read_txn()?;
+    let db = env.open_database::<Str, Str>(&rtxn, None)?;
+    assert_eq!(db.get(&rtxn, "key")?, Some("first"));
+
+    Ok(())
+}
+
+#[test]
+fn recovers_previous_commit_when_commit_record_is_corrupt() -> Result<()> {
+    let dir = tempdir()?;
+    let previous_txn;
+    let page_count;
+    {
+        let env = options().open(dir.path())?;
+        let mut wtxn = env.write_txn()?;
+        let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+        db.put(&mut wtxn, "key", "first")?;
+        wtxn.commit()?;
+        previous_txn = env.info().txn_id;
+        drop(db);
+    }
+    {
+        let env = options().open(dir.path())?;
+        let mut wtxn = env.write_txn()?;
+        let db = env.open_database::<Str, Str>(&env.read_txn()?, None)?;
+        db.put(&mut wtxn, "key", "second")?;
+        wtxn.commit()?;
+        page_count = env.info().page_count;
+        drop(db);
+    }
+
+    // The last page of the second commit is its commit record. Corrupting it
+    // must make recovery reject the commit and fall back to the previous meta.
+    std::fs::remove_file(dir.path().join("clean.tsubame")).ok();
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(dir.path().join("data.tsubame"))?;
+    file.seek(SeekFrom::Start((page_count - 1) * 4096 + 100))?;
+    file.write_all(&[0xff])?;
+
+    let env = options().open(dir.path())?;
+    assert_eq!(env.info().txn_id, previous_txn);
+    let rtxn = env.read_txn()?;
+    let db = env.open_database::<Str, Str>(&rtxn, None)?;
+    assert_eq!(db.get(&rtxn, "key")?, Some("first"));
+
+    Ok(())
+}
+
+#[test]
+fn falls_back_when_committed_pages_are_missing() -> Result<()> {
+    let dir = tempdir()?;
+    let previous_txn;
+    let page_count;
+    {
+        let env = options().open(dir.path())?;
+        let mut wtxn = env.write_txn()?;
+        let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+        db.put(&mut wtxn, "key", "first")?;
+        wtxn.commit()?;
+        previous_txn = env.info().txn_id;
+        drop(db);
+    }
+    {
+        let env = options().open(dir.path())?;
+        let mut wtxn = env.write_txn()?;
+        let db = env.open_database::<Str, Str>(&env.read_txn()?, None)?;
+        db.put(&mut wtxn, "key", "second")?;
+        wtxn.commit()?;
+        page_count = env.info().page_count;
+        drop(db);
+    }
+
+    std::fs::remove_file(dir.path().join("clean.tsubame")).ok();
+    OpenOptions::new()
+        .write(true)
+        .open(dir.path().join("data.tsubame"))?
+        .set_len((page_count - 1) * 4096)?;
 
     let env = options().open(dir.path())?;
     assert_eq!(env.info().txn_id, previous_txn);

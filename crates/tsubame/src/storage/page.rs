@@ -223,6 +223,11 @@ impl<'a> Page<'a> {
         self.page_type
     }
 
+    /// Returns the transaction ID stored in the page header.
+    pub(crate) fn txn_id(&self) -> u64 {
+        LittleEndian::read_u64(&self.bytes[16..24])
+    }
+
     /// Returns the raw page bytes.
     pub(crate) fn bytes(&self) -> &'a [u8] {
         self.bytes

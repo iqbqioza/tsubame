@@ -11,12 +11,12 @@ use super::io;
 const MAGIC: [u8; 8] = *b"TSUBAME\0";
 
 /// The on-disk format version implemented by this crate.
-pub(crate) const FORMAT_VERSION: u32 = 1;
+pub(crate) const FORMAT_VERSION: u32 = 2;
 
 /// The number of meta slots stored at the start of the data file.
 const META_SLOTS: usize = 2;
 
-const CHECKSUM_OFFSET: usize = 56;
+const CHECKSUM_OFFSET: usize = 64;
 
 /// The committed state of an environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,8 +31,12 @@ pub(crate) struct Meta {
     pub(crate) page_count: u64,
     /// Number of named databases.
     pub(crate) database_count: u32,
-    /// Reserved flags. Must be zero in format version 1.
+    /// Reserved flags. Must be zero in format version 2.
     pub(crate) flags: u32,
+    /// First page of the commit record chain, or 0 when there are no new pages.
+    pub(crate) commit_record: u64,
+    /// Single committed page when the commit wrote exactly one page.
+    pub(crate) commit_page: u64,
 }
 
 impl Meta {
@@ -45,6 +49,8 @@ impl Meta {
             page_count: 2,
             database_count: 0,
             flags: 0,
+            commit_record: 0,
+            commit_page: 0,
         }
     }
 
@@ -61,6 +67,8 @@ impl Meta {
         LittleEndian::write_u64(&mut page[40..48], self.page_count);
         LittleEndian::write_u32(&mut page[48..52], self.database_count);
         LittleEndian::write_u32(&mut page[52..56], self.flags);
+        LittleEndian::write_u64(&mut page[56..64], self.commit_record);
+        LittleEndian::write_u64(&mut page[68..76], self.commit_page);
 
         let checksum = checksum(&page);
         LittleEndian::write_u32(&mut page[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4], checksum);
@@ -106,6 +114,8 @@ impl Meta {
             page_count: LittleEndian::read_u64(&bytes[40..48]),
             database_count: LittleEndian::read_u32(&bytes[48..52]),
             flags: LittleEndian::read_u32(&bytes[52..56]),
+            commit_record: LittleEndian::read_u64(&bytes[56..64]),
+            commit_page: LittleEndian::read_u64(&bytes[68..76]),
         };
         meta.validate()?;
 
@@ -124,6 +134,23 @@ impl Meta {
             self.flags == 0,
             "unsupported meta flags {:#010x}",
             self.flags
+        );
+        ensure!(
+            self.commit_record == 0
+                || (self.commit_record >= META_SLOTS as u64
+                    && self.commit_record < self.page_count),
+            "meta commit record page {} is outside the page range",
+            self.commit_record
+        );
+        ensure!(
+            self.commit_page == 0
+                || (self.commit_page >= META_SLOTS as u64 && self.commit_page < self.page_count),
+            "meta commit page {} is outside the page range",
+            self.commit_page
+        );
+        ensure!(
+            self.commit_record == 0 || self.commit_page == 0,
+            "meta cannot have both a commit record and a single commit page"
         );
 
         validate_root("unnamed database", self.unnamed_root, self.page_count)?;
@@ -197,8 +224,8 @@ pub(crate) struct LoadedMeta {
     pub(crate) slot: u8,
 }
 
-/// Reads both meta slots and returns the newest valid state.
-pub(crate) fn load(file: &File, path: &Path) -> Result<LoadedMeta> {
+/// Reads all valid meta slots, newest first.
+pub(crate) fn load_all(file: &File, path: &Path) -> Result<Vec<LoadedMeta>> {
     let len = file
         .metadata()
         .with_context(|| format!("failed to inspect `{}`", path.display()))?
@@ -211,37 +238,49 @@ pub(crate) fn load(file: &File, path: &Path) -> Result<LoadedMeta> {
         META_SLOTS * PAGE_SIZE
     );
 
-    let mut best: Option<(usize, Meta)> = None;
+    let mut valid = Vec::with_capacity(META_SLOTS);
     let mut errors = Vec::with_capacity(META_SLOTS);
 
     for slot in 0..META_SLOTS {
         let mut page = [0u8; PAGE_SIZE];
         match io::read_exact_at(file, &mut page, slot_offset(slot)) {
             Ok(()) => match Meta::decode(&page) {
-                Ok(meta) => {
-                    if best.is_none_or(|(best_slot, current)| {
-                        (meta.txn_id, slot) > (current.txn_id, best_slot)
-                    }) {
-                        best = Some((slot, meta));
-                    }
-                }
+                Ok(meta) => valid.push(LoadedMeta {
+                    meta,
+                    slot: slot as u8,
+                }),
                 Err(error) => errors.push(format!("slot {slot}: {error:#}")),
             },
             Err(error) => errors.push(format!("slot {slot}: {error}")),
         }
     }
 
-    match best {
-        Some((slot, meta)) => Ok(LoadedMeta {
-            meta,
-            slot: slot as u8,
-        }),
-        None => bail!(
+    valid.sort_by(|left, right| {
+        right
+            .meta
+            .txn_id
+            .cmp(&left.meta.txn_id)
+            .then_with(|| right.slot.cmp(&left.slot))
+    });
+
+    if valid.is_empty() {
+        bail!(
             "no valid meta page in `{}`: {}",
             path.display(),
             errors.join("; ")
-        ),
+        );
     }
+
+    Ok(valid)
+}
+
+/// Reads both meta slots and returns the newest valid state.
+#[cfg(test)]
+pub(crate) fn load(file: &File, path: &Path) -> Result<LoadedMeta> {
+    load_all(file, path)?
+        .into_iter()
+        .next()
+        .context("no valid meta page")
 }
 
 #[cfg(test)]
@@ -260,6 +299,8 @@ mod tests {
             page_count,
             database_count: 0,
             flags: 0,
+            commit_record: 0,
+            commit_page: 0,
         }
     }
 
@@ -286,6 +327,8 @@ mod tests {
             page_count: 9,
             database_count: 2,
             flags: 0,
+            commit_record: 0,
+            commit_page: 0,
         };
 
         assert_eq!(Meta::decode(&meta.encode()).unwrap(), meta);
