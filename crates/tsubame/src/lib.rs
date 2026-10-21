@@ -9,8 +9,9 @@
 //!
 //! The environment lifecycle, the on-disk meta format, the B+tree read and
 //! write paths, transactions, typed database operations, named databases,
-//! ordered forward/reverse iteration, ranges, prefixes, and write-transaction
-//! iteration are implemented. APIs may change while the engine is being built.
+//! ordered forward/reverse iteration, ranges, prefixes, write-transaction
+//! iteration, and offline compaction are implemented. APIs may change while
+//! the engine is being built.
 //!
 //! # Example
 //!

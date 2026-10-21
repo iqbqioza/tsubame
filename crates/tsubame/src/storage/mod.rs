@@ -5,6 +5,7 @@
 
 pub(crate) mod btree;
 pub(crate) mod commit;
+pub(crate) mod compact;
 pub(crate) mod io;
 pub(crate) mod meta;
 pub(crate) mod mmap;
