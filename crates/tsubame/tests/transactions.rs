@@ -175,6 +175,29 @@ fn concurrent_readers_do_not_block_a_writer() -> Result<()> {
 }
 
 #[test]
+fn pending_values_cross_the_inline_threshold() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Bytes>(&mut wtxn, None)?;
+    for len in [0usize, 1, 31, 32, 33, 1_000] {
+        let value = vec![b'x'; len];
+        db.put(&mut wtxn, &format!("key-{len}"), value.as_slice())?;
+    }
+    wtxn.commit()?;
+
+    let rtxn = env.read_txn()?;
+    for len in [0usize, 1, 31, 32, 33, 1_000] {
+        assert_eq!(
+            db.get(&rtxn, &format!("key-{len}"))?,
+            Some(vec![b'x'; len].as_slice())
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn batch_insert_reuses_transaction_pages() -> Result<()> {
     let dir = tempdir()?;
     let env = options().open(dir.path())?;

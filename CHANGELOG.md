@@ -35,6 +35,7 @@ All notable changes to this project are documented here.
 - Leaves with changed-length values shift a packed cell block in place instead
   of rebuilding the page entry by entry, and adjacent dirty pages are written
   in batches.
+- Small pending values are stored inline, removing a heap allocation per put.
 
 ### Fixed
 

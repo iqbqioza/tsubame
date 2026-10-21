@@ -466,7 +466,7 @@ impl<KC, DC> Database<KC, DC> {
                 "key is {} bytes, maximum is {MAX_KEY_SIZE}",
                 key.len()
             );
-            txn.put_raw(self.kind.clone(), key.into_owned(), value.into_owned());
+            txn.put_raw(self.kind.clone(), key.into_owned(), value.as_ref());
             Ok(())
         })();
 
