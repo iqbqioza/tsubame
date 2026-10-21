@@ -15,6 +15,8 @@ All notable changes to this project are documented here.
 - `get_rw`, `range_rw`, `rev_iter_rw`, `rev_range_rw`, `prefix_rw`, and
   `rev_prefix_rw` on write transactions, including staged puts and deletes.
 - Clearing a database now releases its old tree pages for reuse.
+- `Env::compact_online` for exclusive compaction while a writable environment
+  remains open. Transactions and database handles must be dropped first.
 - Environment-wide custom key comparators through `KeyComparator` and
   `EnvOpenOptions::comparator`. A comparator ID is persisted in
   `comparator.tsubame` and checked on reopen and compaction; custom-order

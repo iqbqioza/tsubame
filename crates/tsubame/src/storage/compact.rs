@@ -103,18 +103,6 @@ pub(crate) fn compact_with(
     let mut chosen = None;
     let mut errors = Vec::new();
     for candidate in candidates {
-        let required = candidate
-            .meta
-            .page_count
-            .checked_mul(PAGE_SIZE as u64)
-            .context("committed page count is too large")?;
-        if required > data_len {
-            errors.push(format!(
-                "slot {}: data file is shorter than the committed page count",
-                candidate.slot
-            ));
-            continue;
-        }
         match commit::validate(map_slice, &candidate.meta) {
             Ok(()) => {
                 chosen = Some(candidate.meta);

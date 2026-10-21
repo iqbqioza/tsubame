@@ -8,8 +8,8 @@ inspired by [heed].
 > [!WARNING]
 > Tsubame is pre-1.0. The current codebase includes the environment format,
 > B+tree, transactions, named databases, crash-safe commit records, ordered
-> iteration, serde codecs, in-process page reuse, and offline compaction. APIs
-> may still change before 1.0.
+> iteration, serde codecs, in-process page reuse, exclusive online compaction,
+> and offline compaction. APIs may still change before 1.0.
 
 ## Why Tsubame
 
@@ -52,6 +52,7 @@ added without changing the main API.
 - [x] Read-only environments with shared locks
 - [x] Concurrent writer and read-only processes (`multi_process`)
 - [x] Custom key comparators
+- [x] Exclusive online compaction while an environment remains open
 - [x] Offline compaction
 
 ## Codec features
@@ -151,7 +152,10 @@ The examples use a temporary directory and clean up after themselves.
   ```rust
   Env::compact("/path/to/env")?;
   ```
-  The environment must be closed while compaction runs.
+  The environment must be closed while offline compaction runs.
+- `Env::compact_online` keeps an open writable environment mapped to the
+  compacted file, but all transactions and `Database` handles must be dropped
+  first. It is exclusive, not concurrent with application reads or writes.
 - Custom key comparators are environment-wide and must be supplied again on
   every open and offline compaction. A stable comparator ID is persisted in
   `comparator.tsubame` and must match. Prefix iteration requires lexicographic

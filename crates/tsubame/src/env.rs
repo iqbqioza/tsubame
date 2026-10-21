@@ -221,6 +221,126 @@ impl Env {
     ) -> Result<()> {
         crate::storage::compact::compact_with(path.as_ref(), comparator, comparator_id)
     }
+
+    /// Compacts this environment while it remains open.
+    ///
+    /// This is an exclusive operation: all transactions must be finished and
+    /// all [`Database`] handles must be dropped first. The environment is
+    /// remapped to the compacted file before this method returns.
+    ///
+    /// Unlike [`Env::compact`], this does not require closing and reopening the
+    /// environment, but it does not run concurrently with active database
+    /// handles.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for read-only or multi-process environments, when
+    /// database handles remain, or when the replacement file cannot be built or
+    /// mapped.
+    pub fn compact_online(&mut self) -> Result<()> {
+        ensure!(
+            !self.inner.read_only,
+            "read-only environments cannot be compacted online"
+        );
+        ensure!(
+            !self.inner.multi_process,
+            "multi-process environments must be compacted offline"
+        );
+        let inner = Arc::get_mut(&mut self.inner)
+            .context("drop all Database handles before compacting online")?;
+
+        let temp_dir = inner.path.join(".tsubame-online-compact");
+        if temp_dir.exists() {
+            fs::remove_dir_all(&temp_dir)
+                .with_context(|| format!("failed to clear `{}`", temp_dir.display()))?;
+        }
+        fs::create_dir(&temp_dir)
+            .with_context(|| format!("failed to create `{}`", temp_dir.display()))?;
+
+        let result = (|| {
+            let data_path = inner.path.join(DATA_FILE);
+            let temp_data = temp_dir.join(DATA_FILE);
+            fs::copy(&data_path, &temp_data).with_context(|| {
+                format!(
+                    "failed to copy `{}` to `{}`",
+                    data_path.display(),
+                    temp_data.display()
+                )
+            })?;
+            let comparator_file = inner.path.join(COMPARATOR_FILE);
+            if comparator_file.is_file() {
+                fs::copy(&comparator_file, temp_dir.join(COMPARATOR_FILE))?;
+            }
+            crate::storage::compact::compact_with(
+                &temp_dir,
+                inner.comparator,
+                &inner.comparator_id,
+            )?;
+
+            let new_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&temp_data)
+                .with_context(|| format!("failed to open `{}`", temp_data.display()))?;
+            #[cfg(windows)]
+            {
+                if new_file.metadata()?.len() < inner.map_size as u64 {
+                    new_file.set_len(inner.map_size as u64)?;
+                    new_file.sync_data()?;
+                }
+            }
+            let mapped_len = inner
+                .map_size
+                .checked_sub(2 * PAGE_SIZE)
+                .context("map size is too small")?;
+            let new_mmap = if mapped_len == 0 {
+                mmap::map_empty().context("failed to map an empty data region")?
+            } else {
+                mmap::map_data(&new_file, (2 * PAGE_SIZE) as u64, mapped_len)
+                    .with_context(|| format!("failed to map `{}`", temp_data.display()))?
+            };
+
+            let candidates = meta::load_all(&new_file, &temp_data)?;
+            let mut chosen = None;
+            for candidate in candidates {
+                if commit::validate(&new_mmap, &candidate.meta).is_ok() {
+                    chosen = Some(candidate);
+                    break;
+                }
+            }
+            let chosen = chosen.context("compacted data has no recoverable commit")?;
+
+            fs::rename(&temp_data, &data_path).with_context(|| {
+                format!(
+                    "failed to replace `{}` with `{}`",
+                    data_path.display(),
+                    temp_data.display()
+                )
+            })?;
+
+            let verified_words = (inner.map_size / PAGE_SIZE).div_ceil(64);
+            inner.data = new_file;
+            inner.mmap = new_mmap;
+            inner.verified = (0..verified_words).map(|_| AtomicU64::new(0)).collect();
+            *inner
+                .committed
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Committed {
+                meta: chosen.meta,
+                slot: chosen.slot,
+            };
+            inner
+                .free_pool
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+            inner.free_pool_ready.store(false, Ordering::Release);
+            Ok(())
+        })();
+
+        let _ = fs::remove_dir_all(&temp_dir);
+        result
+    }
 }
 
 impl fmt::Debug for Env {
