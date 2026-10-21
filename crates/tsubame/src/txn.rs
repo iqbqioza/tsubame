@@ -133,6 +133,16 @@ impl Pending {
         }
     }
 
+    fn get(&self, key: &[u8]) -> Option<Option<&[u8]>> {
+        match self {
+            Self::Empty => None,
+            Self::One(pending_key, value) => {
+                (pending_key.as_slice() == key).then_some(value.as_deref())
+            }
+            Self::Map(map) => map.get(key).map(|value| value.as_deref()),
+        }
+    }
+
     fn iter(&self) -> PendingIter<'_> {
         match self {
             Self::Empty => Box::new(std::iter::empty()),
@@ -143,9 +153,22 @@ impl Pending {
             ),
         }
     }
+
+    fn iter_rev(&self) -> PendingRevIter<'_> {
+        match self {
+            Self::Empty => Box::new(std::iter::empty()),
+            Self::One(key, value) => Box::new(std::iter::once((key.as_slice(), value.as_deref()))),
+            Self::Map(map) => Box::new(
+                map.iter()
+                    .rev()
+                    .map(|(key, value)| (key.as_slice(), value.as_deref())),
+            ),
+        }
+    }
 }
 
 pub(crate) type PendingIter<'a> = Box<dyn Iterator<Item = (&'a [u8], Option<&'a [u8]>)> + 'a>;
+pub(crate) type PendingRevIter<'a> = Box<dyn Iterator<Item = (&'a [u8], Option<&'a [u8]>)> + 'a>;
 
 /// A read-only transaction.
 ///
@@ -386,6 +409,39 @@ impl<'env> RwTxn<'env> {
                 .map(Pending::iter)
                 .unwrap_or_else(|| Box::new(std::iter::empty())),
         }
+    }
+
+    pub(crate) fn pending_for_rev<'a>(&'a self, kind: &DatabaseKind) -> PendingRevIter<'a> {
+        match kind {
+            DatabaseKind::Unnamed => self.unnamed_pending.iter_rev(),
+            DatabaseKind::Named(name) => self
+                .named_pending
+                .get(name.as_ref())
+                .map(Pending::iter_rev)
+                .unwrap_or_else(|| Box::new(std::iter::empty())),
+        }
+    }
+
+    pub(crate) fn pending_get(&self, kind: &DatabaseKind, key: &[u8]) -> Option<Option<&[u8]>> {
+        match kind {
+            DatabaseKind::Unnamed => self.unnamed_pending.get(key),
+            DatabaseKind::Named(name) => self
+                .named_pending
+                .get(name.as_ref())
+                .and_then(|pending| pending.get(key)),
+        }
+    }
+
+    pub(crate) fn get_raw<'a>(
+        &'a self,
+        kind: &DatabaseKind,
+        key: &[u8],
+    ) -> Result<Option<&'a [u8]>> {
+        if let Some(value) = self.pending_get(kind, key) {
+            return Ok(value);
+        }
+        let root = self.read_root(kind)?;
+        btree::get(self, root, key)
     }
 
     pub(crate) fn increment_database_count(&mut self) -> Result<()> {

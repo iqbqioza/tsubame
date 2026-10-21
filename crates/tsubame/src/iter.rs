@@ -10,7 +10,7 @@ use anyhow::{Result, bail, ensure};
 use crate::storage::btree::PageSource;
 use crate::storage::page::{LeafValue, Page, PageType};
 use crate::traits::BytesDecode;
-use crate::txn::{PendingIter, RoTxn, RwTxn};
+use crate::txn::{PendingIter, PendingRevIter, RoTxn, RwTxn};
 
 /// The maximum branch depth followed by a cursor.
 const MAX_DEPTH: usize = 64;
@@ -374,6 +374,22 @@ where
     }
 }
 
+fn before_start(bound: &Bound<Vec<u8>>, key: &[u8]) -> bool {
+    match bound {
+        Bound::Unbounded => false,
+        Bound::Included(start) => key < start.as_slice(),
+        Bound::Excluded(start) => key <= start.as_slice(),
+    }
+}
+
+fn past_end(bound: &Bound<Vec<u8>>, key: &[u8]) -> bool {
+    match bound {
+        Bound::Unbounded => false,
+        Bound::Included(end) => key > end.as_slice(),
+        Bound::Excluded(end) => key >= end.as_slice(),
+    }
+}
+
 /// An ordered iterator over a write transaction, including staged writes.
 ///
 /// The iterator merges the committed snapshot with the transaction's pending
@@ -381,6 +397,8 @@ where
 pub struct RwIter<'txn, 'env, KC, DC> {
     cursor: Cursor<'txn, RwTxn<'env>>,
     pending: Peekable<PendingIter<'txn>>,
+    start: Bound<Vec<u8>>,
+    end: Bound<Vec<u8>>,
     done: bool,
     _codecs: PhantomData<(KC, DC)>,
 }
@@ -391,11 +409,33 @@ impl<'txn, 'env, KC, DC> RwIter<'txn, 'env, KC, DC> {
         root: u64,
         pending: PendingIter<'txn>,
     ) -> Result<Self> {
+        Self::range(source, root, pending, Bound::Unbounded, Bound::Unbounded)
+    }
+
+    pub(crate) fn range(
+        source: &'txn RwTxn<'env>,
+        root: u64,
+        pending: PendingIter<'txn>,
+        start: Bound<Vec<u8>>,
+        end: Bound<Vec<u8>>,
+    ) -> Result<Self> {
         let mut cursor = Cursor::new(source);
-        cursor.seek_first(root)?;
+        match &start {
+            Bound::Unbounded => cursor.seek_first(root)?,
+            Bound::Included(key) => cursor.seek_forward(root, key)?,
+            Bound::Excluded(key) => {
+                cursor.seek_forward(root, key)?;
+                if cursor.current_key()?.is_some_and(|current| current == key) {
+                    cursor.next()?;
+                }
+            }
+        }
+
         Ok(Self {
             cursor,
             pending: pending.peekable(),
+            start,
+            end,
             done: false,
             _codecs: PhantomData,
         })
@@ -415,6 +455,14 @@ where
         }
 
         loop {
+            while let Some((key, _)) = self.pending.peek().copied() {
+                if before_start(&self.start, key) {
+                    self.pending.next();
+                } else {
+                    break;
+                }
+            }
+
             let base = match self.cursor.current() {
                 Ok(current) => current,
                 Err(error) => {
@@ -422,7 +470,15 @@ where
                     return Some(Err(error));
                 }
             };
-            let pending = self.pending.peek().copied();
+            let base = match base {
+                Some((key, _)) if past_end(&self.end, key) => None,
+                base => base,
+            };
+
+            let pending = match self.pending.peek().copied() {
+                Some((key, _)) if past_end(&self.end, key) => None,
+                pending => pending,
+            };
 
             match (base, pending) {
                 (None, None) => {
@@ -475,6 +531,146 @@ where
         }
     }
 }
+
+/// A reverse iterator over a write transaction, including staged writes.
+pub struct RwRevIter<'txn, 'env, KC, DC> {
+    cursor: Cursor<'txn, RwTxn<'env>>,
+    pending: Peekable<PendingRevIter<'txn>>,
+    start: Bound<Vec<u8>>,
+    end: Bound<Vec<u8>>,
+    done: bool,
+    _codecs: PhantomData<(KC, DC)>,
+}
+
+impl<'txn, 'env, KC, DC> RwRevIter<'txn, 'env, KC, DC> {
+    pub(crate) fn new(
+        source: &'txn RwTxn<'env>,
+        root: u64,
+        pending: PendingRevIter<'txn>,
+        start: Bound<Vec<u8>>,
+        end: Bound<Vec<u8>>,
+    ) -> Result<Self> {
+        let mut cursor = Cursor::new(source);
+        match &end {
+            Bound::Unbounded => cursor.seek_last(root)?,
+            Bound::Included(key) => cursor.seek_reverse(root, key)?,
+            Bound::Excluded(key) => {
+                cursor.seek_reverse(root, key)?;
+                if cursor.current_key()?.is_some_and(|current| current == key) {
+                    cursor.prev()?;
+                }
+            }
+        }
+
+        Ok(Self {
+            cursor,
+            pending: pending.peekable(),
+            start,
+            end,
+            done: false,
+            _codecs: PhantomData,
+        })
+    }
+}
+
+impl<'txn, 'env, KC, DC> Iterator for RwRevIter<'txn, 'env, KC, DC>
+where
+    KC: BytesDecode<'txn>,
+    DC: BytesDecode<'txn>,
+{
+    type Item = Result<(KC::DItem, DC::DItem)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+
+        loop {
+            while let Some((key, _)) = self.pending.peek().copied() {
+                if past_end(&self.end, key) || before_start(&self.start, key) {
+                    self.pending.next();
+                } else {
+                    break;
+                }
+            }
+
+            let base = match self.cursor.current() {
+                Ok(current) => current,
+                Err(error) => {
+                    self.done = true;
+                    return Some(Err(error));
+                }
+            };
+            let base = match base {
+                Some((key, _)) if before_start(&self.start, key) => None,
+                base => base,
+            };
+
+            let pending = match self.pending.peek().copied() {
+                Some((key, _)) if past_end(&self.end, key) => None,
+                pending => pending,
+            };
+
+            match (base, pending) {
+                (None, None) => {
+                    self.done = true;
+                    return None;
+                }
+                (Some((key, value)), None) => {
+                    let item = decode::<KC, DC>(key, value);
+                    if let Err(error) = self.cursor.prev() {
+                        self.done = true;
+                        return Some(Err(error));
+                    }
+                    return Some(item);
+                }
+                (None, Some((key, value))) => {
+                    self.pending.next();
+                    if let Some(value) = value {
+                        return Some(decode::<KC, DC>(key, value));
+                    }
+                }
+                (Some((base_key, base_value)), Some((pending_key, pending_value))) => {
+                    match pending_key.cmp(base_key) {
+                        Ordering::Greater => {
+                            self.pending.next();
+                            if let Some(value) = pending_value {
+                                return Some(decode::<KC, DC>(pending_key, value));
+                            }
+                        }
+                        Ordering::Equal => {
+                            self.pending.next();
+                            if let Err(error) = self.cursor.prev() {
+                                self.done = true;
+                                return Some(Err(error));
+                            }
+                            if let Some(value) = pending_value {
+                                return Some(decode::<KC, DC>(pending_key, value));
+                            }
+                        }
+                        Ordering::Less => {
+                            let item = decode::<KC, DC>(base_key, base_value);
+                            if let Err(error) = self.cursor.prev() {
+                                self.done = true;
+                                return Some(Err(error));
+                            }
+                            return Some(item);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A forward range iterator over a write transaction.
+pub type RwRange<'txn, 'env, KC, DC> = RwIter<'txn, 'env, KC, DC>;
+/// A forward prefix iterator over a write transaction.
+pub type RwPrefix<'txn, 'env, KC, DC> = RwIter<'txn, 'env, KC, DC>;
+/// A reverse range iterator over a write transaction.
+pub type RwRevRange<'txn, 'env, KC, DC> = RwRevIter<'txn, 'env, KC, DC>;
+/// A reverse prefix iterator over a write transaction.
+pub type RwRevPrefix<'txn, 'env, KC, DC> = RwRevIter<'txn, 'env, KC, DC>;
 
 /// A forward range iterator.
 pub struct RoRange<'txn, 'env, KC, DC> {

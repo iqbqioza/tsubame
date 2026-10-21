@@ -602,6 +602,233 @@ fn write_txn_iteration_includes_pending_changes() -> Result<()> {
 }
 
 #[test]
+fn write_txn_read_api_merges_pending_writes() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, Some("rw-api"))?;
+    for (key, value) in [("a", "1"), ("b", "2"), ("c", "3"), ("d", "4")] {
+        db.put(&mut wtxn, key, value)?;
+    }
+    wtxn.commit()?;
+
+    let mut wtxn = env.write_txn()?;
+    let db = env.open_database::<Str, Str>(&env.read_txn()?, Some("rw-api"))?;
+    db.put(&mut wtxn, "b", "20")?;
+    db.put(&mut wtxn, "c2", "new")?;
+    db.put(&mut wtxn, "e", "5")?;
+    db.delete(&mut wtxn, "c")?;
+
+    assert_eq!(db.get_rw(&wtxn, "a")?, Some("1"));
+    assert_eq!(db.get_rw(&wtxn, "b")?, Some("20"));
+    assert_eq!(db.get_rw(&wtxn, "c")?, None);
+    assert_eq!(db.get_rw(&wtxn, "c2")?, Some("new"));
+    assert_eq!(db.get_rw(&wtxn, "e")?, Some("5"));
+    assert_eq!(db.get_rw(&wtxn, "missing")?, None);
+
+    let forward: Vec<_> = db
+        .iter_rw(&wtxn)?
+        .map(|item| item.map(|(key, value)| (key.to_owned(), value.to_owned())))
+        .collect::<std::result::Result<_, _>>()?;
+    assert_eq!(
+        forward,
+        [
+            ("a".to_owned(), "1".to_owned()),
+            ("b".to_owned(), "20".to_owned()),
+            ("c2".to_owned(), "new".to_owned()),
+            ("d".to_owned(), "4".to_owned()),
+            ("e".to_owned(), "5".to_owned()),
+        ]
+    );
+
+    let reverse: Vec<_> = db
+        .rev_iter_rw(&wtxn)?
+        .map(|item| item.map(|(key, value)| (key.to_owned(), value.to_owned())))
+        .collect::<std::result::Result<_, _>>()?;
+    assert_eq!(
+        reverse,
+        [
+            ("e".to_owned(), "5".to_owned()),
+            ("d".to_owned(), "4".to_owned()),
+            ("c2".to_owned(), "new".to_owned()),
+            ("b".to_owned(), "20".to_owned()),
+            ("a".to_owned(), "1".to_owned()),
+        ]
+    );
+
+    let range: Vec<_> = db
+        .range_rw(&wtxn, Bound::Included("b"), Bound::Excluded("e"))?
+        .map(|item| item.map(|(key, value)| (key.to_owned(), value.to_owned())))
+        .collect::<std::result::Result<_, _>>()?;
+    assert_eq!(
+        range,
+        [
+            ("b".to_owned(), "20".to_owned()),
+            ("c2".to_owned(), "new".to_owned()),
+            ("d".to_owned(), "4".to_owned()),
+        ]
+    );
+
+    let rev_range: Vec<_> = db
+        .rev_range_rw(&wtxn, Bound::Included("b"), Bound::Excluded("e"))?
+        .map(|item| item.map(|(key, value)| (key.to_owned(), value.to_owned())))
+        .collect::<std::result::Result<_, _>>()?;
+    assert_eq!(
+        rev_range,
+        [
+            ("d".to_owned(), "4".to_owned()),
+            ("c2".to_owned(), "new".to_owned()),
+            ("b".to_owned(), "20".to_owned()),
+        ]
+    );
+
+    let prefix: Vec<_> = db
+        .prefix_rw(&wtxn, "c")?
+        .map(|item| item.map(|(key, value)| (key.to_owned(), value.to_owned())))
+        .collect::<std::result::Result<_, _>>()?;
+    assert_eq!(prefix, [("c2".to_owned(), "new".to_owned())]);
+    let rev_prefix: Vec<_> = db
+        .rev_prefix_rw(&wtxn, "c")?
+        .map(|item| item.map(|(key, value)| (key.to_owned(), value.to_owned())))
+        .collect::<std::result::Result<_, _>>()?;
+    assert_eq!(rev_prefix, [("c2".to_owned(), "new".to_owned())]);
+
+    db.clear(&mut wtxn)?;
+    assert_eq!(db.get_rw(&wtxn, "a")?, None);
+    let empty: Vec<_> = db
+        .range_rw(&wtxn, Bound::<&str>::Unbounded, Bound::<&str>::Unbounded)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert!(empty.is_empty());
+
+    db.put(&mut wtxn, "x", "9")?;
+    assert_eq!(db.get_rw(&wtxn, "x")?, Some("9"));
+    let after_clear: Vec<_> = db
+        .rev_iter_rw(&wtxn)?
+        .map(|item| item.map(|(key, value)| (key.to_owned(), value.to_owned())))
+        .collect::<std::result::Result<_, _>>()?;
+    assert_eq!(after_clear, [("x".to_owned(), "9".to_owned())]);
+
+    wtxn.abort()?;
+    let rtxn = env.read_txn()?;
+    assert_eq!(db.get(&rtxn, "a")?, Some("1"));
+    assert_eq!(db.get(&rtxn, "c")?, Some("3"));
+    assert_eq!(db.get(&rtxn, "e")?, None);
+
+    Ok(())
+}
+
+#[test]
+fn write_txn_ranges_match_btreemap() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+    let base = [("a", "0"), ("b", "1"), ("c", "2"), ("d", "3"), ("e", "4")];
+    for (key, value) in base {
+        db.put(&mut wtxn, key, value)?;
+    }
+    wtxn.commit()?;
+
+    let mut expected: BTreeMap<String, String> = base
+        .iter()
+        .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+        .collect();
+
+    let mut wtxn = env.write_txn()?;
+    for (key, value) in [("b", "10"), ("c2", "20"), ("f", "50")] {
+        db.put(&mut wtxn, key, value)?;
+        expected.insert(key.to_owned(), value.to_owned());
+    }
+    db.delete(&mut wtxn, "c")?;
+    expected.remove("c");
+    db.delete(&mut wtxn, "e")?;
+    expected.remove("e");
+
+    let bounds = [
+        Bound::Unbounded,
+        Bound::Included(""),
+        Bound::Excluded(""),
+        Bound::Included("a"),
+        Bound::Excluded("a"),
+        Bound::Included("b"),
+        Bound::Excluded("c"),
+        Bound::Included("c2"),
+        Bound::Excluded("d"),
+        Bound::Included("e"),
+        Bound::Excluded("f"),
+        Bound::Included("z"),
+    ];
+
+    for start in bounds {
+        for end in bounds {
+            let wanted: Vec<_> = expected
+                .iter()
+                .filter(|(key, _)| {
+                    let after_start = match start {
+                        Bound::Unbounded => true,
+                        Bound::Included(start) => key.as_str() >= start,
+                        Bound::Excluded(start) => key.as_str() > start,
+                    };
+                    let before_end = match end {
+                        Bound::Unbounded => true,
+                        Bound::Included(end) => key.as_str() <= end,
+                        Bound::Excluded(end) => key.as_str() < end,
+                    };
+                    after_start && before_end
+                })
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            let actual: Vec<_> = db
+                .range_rw(&wtxn, start, end)?
+                .map(|item| item.map(|(key, value)| (key.to_owned(), value.to_owned())))
+                .collect::<std::result::Result<_, _>>()?;
+            assert_eq!(actual, wanted, "forward range {start:?}..{end:?}");
+
+            let mut reverse = wanted.clone();
+            reverse.reverse();
+            let actual: Vec<_> = db
+                .rev_range_rw(&wtxn, start, end)?
+                .map(|item| item.map(|(key, value)| (key.to_owned(), value.to_owned())))
+                .collect::<std::result::Result<_, _>>()?;
+            assert_eq!(actual, reverse, "reverse range {start:?}..{end:?}");
+        }
+    }
+
+    for prefix in ["", "a", "b", "c", "c2", "d", "e", "f", "z"] {
+        let wanted: Vec<_> = expected
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let actual: Vec<_> = db
+            .prefix_rw(&wtxn, prefix)?
+            .map(|item| item.map(|(key, value)| (key.to_owned(), value.to_owned())))
+            .collect::<std::result::Result<_, _>>()?;
+        assert_eq!(actual, wanted, "prefix {prefix:?}");
+
+        let mut reverse = wanted;
+        reverse.reverse();
+        let actual: Vec<_> = db
+            .rev_prefix_rw(&wtxn, prefix)?
+            .map(|item| item.map(|(key, value)| (key.to_owned(), value.to_owned())))
+            .collect::<std::result::Result<_, _>>()?;
+        assert_eq!(actual, reverse, "reverse prefix {prefix:?}");
+    }
+
+    for index in 0..26u8 {
+        let key = ((b'a' + index) as char).to_string();
+        assert_eq!(
+            db.get_rw(&wtxn, &key)?,
+            expected.get(&key).map(String::as_str),
+            "get_rw {key}"
+        );
+    }
+
+    wtxn.abort()?;
+    Ok(())
+}
+
+#[test]
 fn write_txn_iteration_after_clear() -> Result<()> {
     let dir = tempdir()?;
     let env = options().open(dir.path())?;
