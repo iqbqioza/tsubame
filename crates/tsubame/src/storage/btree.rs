@@ -1,8 +1,18 @@
-//! Read-only B+tree traversal.
+//! B+tree traversal and copy-on-write mutation.
+//!
+//! The write path is wired into transactions in the next milestone; until then
+//! some entry points are only exercised by the storage tests.
 
-use anyhow::{Result, bail, ensure};
+#![allow(dead_code)]
 
-use super::page::{Page, PageType};
+use anyhow::{Context, Result, bail, ensure};
+
+use super::PAGE_SIZE;
+use super::overflow::{self, OverflowRef};
+use super::page::{
+    self, HEADER_SIZE, INLINE_BUDGET, LeafValue, MAX_KEY_SIZE, Page, PageType, SLOT_SIZE,
+};
+use super::store::PageStore;
 
 /// The maximum number of branch levels followed by a lookup.
 ///
@@ -13,6 +23,9 @@ const MAX_DEPTH: usize = 64;
 pub(crate) trait PageSource {
     /// Returns the page with the given ID.
     fn page(&self, page_id: u64) -> Result<Page<'_>>;
+
+    /// Returns the payload of an overflow extent.
+    fn overflow(&self, reference: OverflowRef) -> Result<&[u8]>;
 }
 
 /// Looks up `key` in the tree rooted at `root`.
@@ -36,126 +49,676 @@ pub(crate) fn get<'a, S: PageSource>(
                 page_id = page.branch_child(key)?;
                 ensure!(page_id >= 2, "branch points at reserved page ID {page_id}");
             }
-            PageType::Leaf => return page.leaf_get(key),
+            PageType::Leaf => {
+                let Some(index) = page.leaf_index(key)? else {
+                    return Ok(None);
+                };
+                return match page.leaf_value(index)? {
+                    LeafValue::Inline(value) => Ok(Some(value)),
+                    LeafValue::Overflow(reference) => Ok(Some(source.overflow(reference)?)),
+                };
+            }
         }
     }
 
     bail!("B+tree depth exceeded {MAX_DEPTH}; the page chain may contain a cycle")
 }
 
+/// Inserts or replaces `key` and returns the new root page ID.
+pub(crate) fn insert<S: PageStore>(
+    store: &mut S,
+    root: u64,
+    key: &[u8],
+    value: &[u8],
+    txn_id: u64,
+) -> Result<u64> {
+    ensure!(
+        key.len() <= MAX_KEY_SIZE,
+        "key is {} bytes, maximum is {MAX_KEY_SIZE}",
+        key.len()
+    );
+
+    if root == 0 {
+        let value = make_value(store, key.len(), value)?;
+        let entry = OwnedLeafEntry {
+            key: key.to_vec(),
+            value,
+        };
+        return allocate_leaf(store, &[entry], txn_id);
+    }
+
+    let result = insert_into(store, root, key, value, txn_id)?;
+    if let Some(split) = result.split {
+        let entries = vec![(Vec::new(), result.page_id), (split.separator, split.right)];
+        allocate_branch(store, &entries, txn_id)
+    } else {
+        Ok(result.page_id)
+    }
+}
+
+/// Deletes `key` and returns the new root page ID.
+pub(crate) fn delete<S: PageStore>(
+    store: &mut S,
+    root: u64,
+    key: &[u8],
+    txn_id: u64,
+) -> Result<u64> {
+    if root == 0 {
+        return Ok(0);
+    }
+
+    let result = delete_into(store, root, key, txn_id)?;
+    Ok(result.page_id)
+}
+
+struct Split {
+    separator: Vec<u8>,
+    right: u64,
+}
+
+struct InsertResult {
+    page_id: u64,
+    split: Option<Split>,
+}
+
+#[derive(Debug)]
+struct OwnedLeafEntry {
+    key: Vec<u8>,
+    value: OwnedValue,
+}
+
+#[derive(Debug, Clone)]
+enum OwnedValue {
+    Inline(Vec<u8>),
+    Overflow(OverflowRef),
+}
+
+impl OwnedValue {
+    fn encoded_len(&self) -> usize {
+        match self {
+            Self::Inline(value) => value.len(),
+            Self::Overflow(_) => overflow::OVERFLOW_REF_SIZE,
+        }
+    }
+
+    fn as_leaf_value(&self) -> LeafValue<'_> {
+        match self {
+            Self::Inline(value) => LeafValue::Inline(value),
+            Self::Overflow(reference) => LeafValue::Overflow(*reference),
+        }
+    }
+}
+
+fn insert_into<S: PageStore>(
+    store: &mut S,
+    page_id: u64,
+    key: &[u8],
+    value: &[u8],
+    txn_id: u64,
+) -> Result<InsertResult> {
+    let bytes = store.read_page(page_id)?;
+    let page = Page::parse(&bytes, Some(page_id))?;
+
+    match page.page_type() {
+        PageType::Leaf => insert_leaf(store, page_id, &page, key, value, txn_id),
+        PageType::Branch => insert_branch(store, page_id, &page, key, value, txn_id),
+    }
+}
+
+fn insert_leaf<S: PageStore>(
+    store: &mut S,
+    page_id: u64,
+    page: &Page<'_>,
+    key: &[u8],
+    value: &[u8],
+    txn_id: u64,
+) -> Result<InsertResult> {
+    let mut entries = collect_leaf(page)?;
+    let index = entries
+        .binary_search_by(|entry| entry.key.as_slice().cmp(key))
+        .unwrap_or_else(|index| index);
+
+    let replaced = if index < entries.len() {
+        let new_value = make_value(store, key.len(), value)?;
+        Some(std::mem::replace(&mut entries[index].value, new_value))
+    } else {
+        let new_value = make_value(store, key.len(), value)?;
+        entries.insert(
+            index,
+            OwnedLeafEntry {
+                key: key.to_vec(),
+                value: new_value,
+            },
+        );
+        None
+    };
+
+    let result = store_leaf(store, page_id, entries, txn_id)?;
+    if let Some(old_value) = replaced {
+        free_value(store, &old_value)?;
+    }
+
+    Ok(result)
+}
+
+fn insert_branch<S: PageStore>(
+    store: &mut S,
+    page_id: u64,
+    page: &Page<'_>,
+    key: &[u8],
+    value: &[u8],
+    txn_id: u64,
+) -> Result<InsertResult> {
+    let mut entries = collect_branch(page)?;
+    let index = page.branch_child_index(key)?;
+    let result = insert_into(store, entries[index].1, key, value, txn_id)?;
+
+    entries[index].1 = result.page_id;
+    if let Some(split) = result.split {
+        entries.insert(index + 1, (split.separator, split.right));
+    }
+
+    store_branch(store, page_id, entries, txn_id)
+}
+
+fn delete_into<S: PageStore>(
+    store: &mut S,
+    page_id: u64,
+    key: &[u8],
+    txn_id: u64,
+) -> Result<DeleteResult> {
+    let bytes = store.read_page(page_id)?;
+    let page = Page::parse(&bytes, Some(page_id))?;
+
+    match page.page_type() {
+        PageType::Leaf => delete_leaf(store, page_id, &page, key, txn_id),
+        PageType::Branch => delete_branch(store, page_id, &page, key, txn_id),
+    }
+}
+
+struct DeleteResult {
+    page_id: u64,
+    changed: bool,
+}
+
+fn delete_leaf<S: PageStore>(
+    store: &mut S,
+    page_id: u64,
+    page: &Page<'_>,
+    key: &[u8],
+    txn_id: u64,
+) -> Result<DeleteResult> {
+    let mut entries = collect_leaf(page)?;
+    let Ok(index) = entries.binary_search_by(|entry| entry.key.as_slice().cmp(key)) else {
+        return Ok(DeleteResult {
+            page_id,
+            changed: false,
+        });
+    };
+
+    let removed = entries.remove(index);
+    if entries.is_empty() {
+        store.free_pages(page_id, 1)?;
+        free_value(store, &removed.value)?;
+        return Ok(DeleteResult {
+            page_id: 0,
+            changed: true,
+        });
+    }
+
+    let new_page = allocate_leaf(store, &entries, txn_id)?;
+    store.free_pages(page_id, 1)?;
+    free_value(store, &removed.value)?;
+
+    Ok(DeleteResult {
+        page_id: new_page,
+        changed: true,
+    })
+}
+
+fn delete_branch<S: PageStore>(
+    store: &mut S,
+    page_id: u64,
+    page: &Page<'_>,
+    key: &[u8],
+    txn_id: u64,
+) -> Result<DeleteResult> {
+    let mut entries = collect_branch(page)?;
+    let index = page.branch_child_index(key)?;
+    let result = delete_into(store, entries[index].1, key, txn_id)?;
+
+    if !result.changed {
+        return Ok(DeleteResult {
+            page_id,
+            changed: false,
+        });
+    }
+
+    if result.page_id == 0 {
+        entries.remove(index);
+    } else {
+        entries[index].1 = result.page_id;
+    }
+
+    if entries.is_empty() {
+        store.free_pages(page_id, 1)?;
+        return Ok(DeleteResult {
+            page_id: 0,
+            changed: true,
+        });
+    }
+
+    entries[0].0.clear();
+
+    if entries.len() == 1 {
+        let child = entries[0].1;
+        store.free_pages(page_id, 1)?;
+        return Ok(DeleteResult {
+            page_id: child,
+            changed: true,
+        });
+    }
+
+    let new_page = allocate_branch(store, &entries, txn_id)?;
+    store.free_pages(page_id, 1)?;
+
+    Ok(DeleteResult {
+        page_id: new_page,
+        changed: true,
+    })
+}
+
+fn collect_leaf(page: &Page<'_>) -> Result<Vec<OwnedLeafEntry>> {
+    let mut entries = Vec::with_capacity(page.slot_count());
+    for index in 0..page.slot_count() {
+        let key = page.key(index)?.to_vec();
+        let value = match page.leaf_value(index)? {
+            LeafValue::Inline(value) => OwnedValue::Inline(value.to_vec()),
+            LeafValue::Overflow(reference) => OwnedValue::Overflow(reference),
+        };
+        entries.push(OwnedLeafEntry { key, value });
+    }
+    Ok(entries)
+}
+
+fn collect_branch(page: &Page<'_>) -> Result<Vec<(Vec<u8>, u64)>> {
+    let mut entries = Vec::with_capacity(page.slot_count());
+    for index in 0..page.slot_count() {
+        entries.push((page.key(index)?.to_vec(), page.child(index)?));
+    }
+    Ok(entries)
+}
+
+fn store_leaf<S: PageStore>(
+    store: &mut S,
+    old_page: u64,
+    mut entries: Vec<OwnedLeafEntry>,
+    txn_id: u64,
+) -> Result<InsertResult> {
+    if leaf_page_size(&entries) <= PAGE_SIZE {
+        let page_id = allocate_leaf(store, &entries, txn_id)?;
+        store.free_pages(old_page, 1)?;
+        return Ok(InsertResult {
+            page_id,
+            split: None,
+        });
+    }
+
+    let sizes: Vec<usize> = entries
+        .iter()
+        .map(|entry| entry.key.len() + entry.value.encoded_len())
+        .collect();
+    let split = choose_split(&sizes)?;
+    let right = entries.split_off(split);
+    let separator = right[0].key.clone();
+
+    let left_page = allocate_leaf(store, &entries, txn_id)?;
+    let right_page = allocate_leaf(store, &right, txn_id)?;
+    store.free_pages(old_page, 1)?;
+
+    Ok(InsertResult {
+        page_id: left_page,
+        split: Some(Split {
+            separator,
+            right: right_page,
+        }),
+    })
+}
+
+fn store_branch<S: PageStore>(
+    store: &mut S,
+    old_page: u64,
+    mut entries: Vec<(Vec<u8>, u64)>,
+    txn_id: u64,
+) -> Result<InsertResult> {
+    ensure!(
+        entries.first().is_some_and(|(key, _)| key.is_empty()),
+        "branch page must start with an empty key"
+    );
+
+    if branch_page_size(&entries) <= PAGE_SIZE {
+        let page_id = allocate_branch(store, &entries, txn_id)?;
+        store.free_pages(old_page, 1)?;
+        return Ok(InsertResult {
+            page_id,
+            split: None,
+        });
+    }
+
+    let sizes: Vec<usize> = entries
+        .iter()
+        .map(|(key, _)| key.len() + std::mem::size_of::<u64>())
+        .collect();
+    let split = choose_split(&sizes)?;
+    let mut right = entries.split_off(split);
+    let separator = right[0].0.clone();
+    right[0].0.clear();
+
+    let left_page = allocate_branch(store, &entries, txn_id)?;
+    let right_page = allocate_branch(store, &right, txn_id)?;
+    store.free_pages(old_page, 1)?;
+
+    Ok(InsertResult {
+        page_id: left_page,
+        split: Some(Split {
+            separator,
+            right: right_page,
+        }),
+    })
+}
+
+fn allocate_leaf<S: PageStore>(
+    store: &mut S,
+    entries: &[OwnedLeafEntry],
+    txn_id: u64,
+) -> Result<u64> {
+    ensure!(
+        leaf_page_size(entries) <= PAGE_SIZE,
+        "leaf entries do not fit in a page"
+    );
+    let page_id = store.allocate_pages(1)?;
+    let refs: Vec<(&[u8], LeafValue<'_>)> = entries
+        .iter()
+        .map(|entry| (entry.key.as_slice(), entry.value.as_leaf_value()))
+        .collect();
+    let page = page::build_leaf_entries(page_id, txn_id, &refs)?;
+    store.write_page(page_id, page)?;
+    Ok(page_id)
+}
+
+fn allocate_branch<S: PageStore>(
+    store: &mut S,
+    entries: &[(Vec<u8>, u64)],
+    txn_id: u64,
+) -> Result<u64> {
+    ensure!(
+        branch_page_size(entries) <= PAGE_SIZE,
+        "branch entries do not fit in a page"
+    );
+    let page_id = store.allocate_pages(1)?;
+    let refs: Vec<(&[u8], u64)> = entries
+        .iter()
+        .map(|(key, child)| (key.as_slice(), *child))
+        .collect();
+    let page = page::build_branch(page_id, txn_id, &refs)?;
+    store.write_page(page_id, page)?;
+    Ok(page_id)
+}
+
+fn make_value<S: PageStore>(store: &mut S, key_len: usize, value: &[u8]) -> Result<OwnedValue> {
+    if SLOT_SIZE + key_len + value.len() <= INLINE_BUDGET {
+        return Ok(OwnedValue::Inline(value.to_vec()));
+    }
+
+    let total_len = u32::try_from(value.len()).context("value is larger than 4 GiB")?;
+    let pages = overflow::pages_for(value.len())?;
+    let start_page = store.allocate_pages(pages)?;
+    let reference = OverflowRef {
+        total_len,
+        start_page,
+        page_count: pages,
+    };
+    let bytes = overflow::encode_extent(reference, value)?;
+    store.write_extent(start_page, &bytes)?;
+
+    Ok(OwnedValue::Overflow(reference))
+}
+
+fn free_value<S: PageStore>(store: &mut S, value: &OwnedValue) -> Result<()> {
+    if let OwnedValue::Overflow(reference) = value {
+        store.free_pages(reference.start_page, reference.page_count)?;
+    }
+    Ok(())
+}
+
+fn leaf_page_size(entries: &[OwnedLeafEntry]) -> usize {
+    HEADER_SIZE
+        + entries.len() * SLOT_SIZE
+        + entries
+            .iter()
+            .map(|entry| entry.key.len() + entry.value.encoded_len())
+            .sum::<usize>()
+}
+
+fn branch_page_size(entries: &[(Vec<u8>, u64)]) -> usize {
+    HEADER_SIZE
+        + entries.len() * SLOT_SIZE
+        + entries
+            .iter()
+            .map(|(key, _)| key.len() + std::mem::size_of::<u64>())
+            .sum::<usize>()
+}
+
+fn choose_split(sizes: &[usize]) -> Result<usize> {
+    ensure!(
+        sizes.len() >= 2,
+        "cannot split a page with fewer than two entries"
+    );
+
+    let total: usize = sizes.iter().sum();
+    let mut left_payload = 0;
+    let mut best: Option<(usize, usize)> = None;
+
+    for split in 1..sizes.len() {
+        left_payload += sizes[split - 1];
+        let left_size = HEADER_SIZE + split * SLOT_SIZE + left_payload;
+        let right_size = HEADER_SIZE + (sizes.len() - split) * SLOT_SIZE + (total - left_payload);
+
+        if left_size <= PAGE_SIZE && right_size <= PAGE_SIZE {
+            let difference = left_size.abs_diff(right_size);
+            if best.is_none_or(|(_, best_difference)| difference < best_difference) {
+                best = Some((split, difference));
+            }
+        }
+    }
+
+    best.map(|(split, _)| split)
+        .context("no split point keeps both pages within the page size")
+}
+
+/// Compares two encoded keys in lexicographic order.
+#[cfg(test)]
+fn compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    a.cmp(b)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
-    use anyhow::Context;
-
     use super::*;
-    use crate::storage::PAGE_SIZE;
-    use crate::storage::page::{build_branch, build_leaf};
+    use crate::storage::store::memory::MemoryStore;
 
-    struct MemorySource {
-        pages: BTreeMap<u64, [u8; PAGE_SIZE]>,
+    fn insert_map(
+        store: &mut MemoryStore,
+        root: &mut u64,
+        map: &mut BTreeMap<Vec<u8>, Vec<u8>>,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) {
+        *root = insert(store, *root, &key, &value, 1).unwrap();
+        map.insert(key, value);
     }
 
-    impl MemorySource {
-        fn new() -> Self {
-            Self {
-                pages: BTreeMap::new(),
-            }
-        }
-
-        fn insert(&mut self, page_id: u64, page: [u8; PAGE_SIZE]) {
-            self.pages.insert(page_id, page);
-        }
-    }
-
-    impl PageSource for MemorySource {
-        fn page(&self, page_id: u64) -> Result<Page<'_>> {
-            let page = self
-                .pages
-                .get(&page_id)
-                .with_context(|| format!("page {page_id} not found"))?;
-            Page::parse(page, Some(page_id))
+    fn check_map(store: &MemoryStore, root: u64, map: &BTreeMap<Vec<u8>, Vec<u8>>) {
+        for (key, value) in map {
+            assert_eq!(get(store, root, key).unwrap(), Some(value.as_slice()));
         }
     }
 
     #[test]
     fn empty_tree_has_no_values() {
-        let source = MemorySource::new();
+        let store = MemoryStore::new();
 
-        assert_eq!(get(&source, 0, b"key").unwrap(), None);
+        assert_eq!(get(&store, 0, b"key").unwrap(), None);
     }
 
     #[test]
     fn finds_values_in_a_single_leaf() {
-        let mut source = MemorySource::new();
-        source.insert(
-            2,
-            build_leaf(2, 1, &[(b"a", b"1"), (b"c", b"3"), (b"e", b"5")]).unwrap(),
-        );
+        let mut store = MemoryStore::new();
+        let root = insert(&mut store, 0, b"a", b"1", 1).unwrap();
 
-        assert_eq!(get(&source, 2, b"a").unwrap(), Some(&b"1"[..]));
-        assert_eq!(get(&source, 2, b"c").unwrap(), Some(&b"3"[..]));
-        assert_eq!(get(&source, 2, b"e").unwrap(), Some(&b"5"[..]));
-        assert_eq!(get(&source, 2, b"b").unwrap(), None);
-        assert_eq!(get(&source, 2, b"z").unwrap(), None);
+        assert_eq!(get(&store, root, b"a").unwrap(), Some(&b"1"[..]));
+        assert_eq!(get(&store, root, b"b").unwrap(), None);
+    }
+
+    #[test]
+    fn inserts_update_and_delete_into_one_leaf() {
+        let mut store = MemoryStore::new();
+        let mut root = 0;
+        for (key, value) in [("a", "1"), ("b", "2"), ("c", "3")] {
+            root = insert(&mut store, root, key.as_bytes(), value.as_bytes(), 1).unwrap();
+        }
+
+        assert_eq!(get(&store, root, b"a").unwrap(), Some(&b"1"[..]));
+        assert_eq!(get(&store, root, b"b").unwrap(), Some(&b"2"[..]));
+        assert_eq!(get(&store, root, b"c").unwrap(), Some(&b"3"[..]));
+
+        root = insert(&mut store, root, b"b", b"20", 2).unwrap();
+        assert_eq!(get(&store, root, b"b").unwrap(), Some(&b"20"[..]));
+
+        root = delete(&mut store, root, b"b", 3).unwrap();
+        assert_eq!(get(&store, root, b"b").unwrap(), None);
+        assert_eq!(get(&store, root, b"a").unwrap(), Some(&b"1"[..]));
     }
 
     #[test]
     fn traverses_branch_pages() {
-        let mut source = MemorySource::new();
-        source.insert(
-            2,
-            build_leaf(2, 1, &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3")]).unwrap(),
-        );
-        source.insert(
-            3,
-            build_leaf(3, 1, &[(b"d", b"4"), (b"e", b"5"), (b"f", b"6")]).unwrap(),
-        );
-        source.insert(
-            4,
-            build_leaf(4, 1, &[(b"g", b"7"), (b"h", b"8"), (b"i", b"9")]).unwrap(),
-        );
-        source.insert(
-            5,
-            build_branch(5, 1, &[(b"", 2), (b"d", 3), (b"g", 4)]).unwrap(),
-        );
+        let mut store = MemoryStore::new();
+        let mut root = 0;
+        for key in ["a", "b", "c", "d", "e", "f", "g", "h", "i"] {
+            root = insert(&mut store, root, key.as_bytes(), key.as_bytes(), 1).unwrap();
+        }
 
-        assert_eq!(get(&source, 5, b"a").unwrap(), Some(&b"1"[..]));
-        assert_eq!(get(&source, 5, b"e").unwrap(), Some(&b"5"[..]));
-        assert_eq!(get(&source, 5, b"i").unwrap(), Some(&b"9"[..]));
-        assert_eq!(get(&source, 5, b"c1").unwrap(), None);
-        assert_eq!(get(&source, 5, b"z").unwrap(), None);
+        for key in ["a", "b", "c", "d", "e", "f", "g", "h", "i"] {
+            assert_eq!(
+                get(&store, root, key.as_bytes()).unwrap(),
+                Some(key.as_bytes())
+            );
+        }
+        assert_eq!(get(&store, root, b"z").unwrap(), None);
     }
 
     #[test]
-    fn rejects_cycles() {
-        let mut source = MemorySource::new();
-        source.insert(2, build_branch(2, 1, &[(b"", 2)]).unwrap());
-
-        let error = get(&source, 2, b"key").unwrap_err();
-        assert!(error.to_string().contains("depth exceeded"));
-    }
-
-    #[test]
-    fn matches_btreemap_in_a_single_leaf() {
+    fn matches_btreemap_under_many_operations() {
+        let mut store = MemoryStore::new();
         let mut map = BTreeMap::new();
-        for i in 0..200u32 {
-            map.insert(i.to_be_bytes().to_vec(), vec![i as u8]);
+        let mut root = 0;
+
+        for i in 0..1_500u32 {
+            let key = i.to_be_bytes().to_vec();
+            let value = format!("value-{i}").into_bytes();
+            insert_map(&mut store, &mut root, &mut map, key, value);
+        }
+        check_map(&store, root, &map);
+
+        for i in (0..1_500u32).step_by(3) {
+            let key = i.to_be_bytes().to_vec();
+            let value = format!("updated-{i}").into_bytes();
+            insert_map(&mut store, &mut root, &mut map, key, value);
+        }
+        check_map(&store, root, &map);
+
+        for i in (0..1_500u32).step_by(2) {
+            let key = i.to_be_bytes().to_vec();
+            root = delete(&mut store, root, &key, 2).unwrap();
+            map.remove(&key);
+        }
+        check_map(&store, root, &map);
+
+        for i in (0..1_500u32).step_by(2) {
+            assert_eq!(get(&store, root, &i.to_be_bytes()).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn splits_internal_branches() {
+        let mut store = MemoryStore::new();
+        let mut map = BTreeMap::new();
+        let mut root = 0;
+        let value = vec![0x42; 700];
+
+        for i in 0..3_000u32 {
+            insert_map(
+                &mut store,
+                &mut root,
+                &mut map,
+                i.to_be_bytes().to_vec(),
+                value.clone(),
+            );
+        }
+        check_map(&store, root, &map);
+
+        for i in (0..3_000u32).step_by(2) {
+            let key = i.to_be_bytes().to_vec();
+            root = delete(&mut store, root, &key, 2).unwrap();
+            map.remove(&key);
+        }
+        check_map(&store, root, &map);
+    }
+
+    #[test]
+    fn deletes_everything_and_collapses_the_root() {
+        let mut store = MemoryStore::new();
+        let mut root = 0;
+        for i in 0..100u32 {
+            root = insert(&mut store, root, &i.to_be_bytes(), b"value", 1).unwrap();
         }
 
-        let entries: Vec<(&[u8], &[u8])> = map
-            .iter()
-            .map(|(key, value)| (key.as_slice(), value.as_slice()))
-            .collect();
-        let mut source = MemorySource::new();
-        source.insert(2, build_leaf(2, 1, &entries).unwrap());
+        for i in 0..100u32 {
+            root = delete(&mut store, root, &i.to_be_bytes(), 2).unwrap();
+        }
 
-        for (key, value) in &map {
-            assert_eq!(get(&source, 2, key).unwrap(), Some(value.as_slice()));
-        }
-        for i in 200..300u32 {
-            assert_eq!(get(&source, 2, &i.to_be_bytes()).unwrap(), None);
-        }
+        assert_eq!(root, 0);
+        assert_eq!(get(&store, 0, &0u32.to_be_bytes()).unwrap(), None);
+    }
+
+    #[test]
+    fn overflow_values_round_trip_and_are_freed() {
+        let mut store = MemoryStore::new();
+        let key = b"large";
+        let value = vec![0x5a; 10_000];
+
+        let root = insert(&mut store, 0, key, &value, 1).unwrap();
+        assert_eq!(get(&store, root, key).unwrap(), Some(value.as_slice()));
+
+        let replacement = vec![0x33; 20_000];
+        let root = insert(&mut store, root, key, &replacement, 2).unwrap();
+        assert_eq!(
+            get(&store, root, key).unwrap(),
+            Some(replacement.as_slice())
+        );
+        assert!(store.freed.len() >= 2);
+
+        let root = delete(&mut store, root, key, 3).unwrap();
+        assert_eq!(get(&store, root, key).unwrap(), None);
+    }
+
+    #[test]
+    fn missing_delete_is_a_noop() {
+        let mut store = MemoryStore::new();
+        let root = insert(&mut store, 0, b"a", b"1", 1).unwrap();
+
+        assert_eq!(delete(&mut store, root, b"missing", 2).unwrap(), root);
     }
 }
