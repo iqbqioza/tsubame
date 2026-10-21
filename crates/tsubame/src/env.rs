@@ -7,11 +7,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{Context, bail, ensure};
+use byteorder::{ByteOrder, LittleEndian};
 use fs4::TryLockError;
 use memmap2::Mmap;
 
@@ -35,6 +37,10 @@ const DATA_FILE: &str = "data.tsubame";
 const LOCK_FILE: &str = "lock.tsubame";
 const WRITER_LOCK_FILE: &str = "writer.tsubame.lock";
 const CLEAN_FILE: &str = "clean.tsubame";
+const COMPARATOR_FILE: &str = "comparator.tsubame";
+const COMPARATOR_MAGIC: [u8; 8] = *b"TSUBCMP\0";
+const COMPARATOR_VERSION: u32 = 1;
+const MAX_COMPARATOR_ID_LEN: usize = 1024;
 const MIN_MAP_SIZE: usize = 3 * PAGE_SIZE;
 const CLEAN_MAGIC: [u8; 8] = *b"TSUBCLN\0";
 const CLEAN_LEN: usize = 32;
@@ -66,6 +72,11 @@ impl Env {
     /// Returns the key order used by this environment.
     pub fn comparator(&self) -> KeyComparator {
         self.inner.comparator
+    }
+
+    /// Returns the persisted comparator identifier used by this environment.
+    pub fn comparator_id(&self) -> &str {
+        &self.inner.comparator_id
     }
 
     /// Returns a consistent snapshot of the environment metadata.
@@ -192,15 +203,23 @@ impl Env {
     /// Returns an error if the environment is open, its commit cannot be
     /// validated, or the replacement file cannot be written.
     pub fn compact(path: impl AsRef<Path>) -> Result<()> {
-        crate::storage::compact::compact_with(path.as_ref(), KeyComparator::lexicographic())
+        crate::storage::compact::compact_with(
+            path.as_ref(),
+            KeyComparator::lexicographic(),
+            "lexicographic",
+        )
     }
 
     /// Compacts an environment that uses a custom key comparator.
     ///
-    /// The same comparator must be used when the compacted environment is
-    /// reopened.
-    pub fn compact_with(path: impl AsRef<Path>, comparator: KeyComparator) -> Result<()> {
-        crate::storage::compact::compact_with(path.as_ref(), comparator)
+    /// The same comparator and identifier must be used when the compacted
+    /// environment is reopened.
+    pub fn compact_with(
+        path: impl AsRef<Path>,
+        comparator: KeyComparator,
+        comparator_id: &str,
+    ) -> Result<()> {
+        crate::storage::compact::compact_with(path.as_ref(), comparator, comparator_id)
     }
 }
 
@@ -441,6 +460,7 @@ pub(crate) struct EnvInner {
     pub(crate) multi_process: bool,
     pub(crate) page_reuse: bool,
     pub(crate) comparator: KeyComparator,
+    pub(crate) comparator_id: String,
     pub(crate) committed: RwLock<Committed>,
     pub(crate) writer: Mutex<()>,
     pub(crate) readers: Mutex<BTreeMap<u64, usize>>,
@@ -709,6 +729,74 @@ impl Drop for EnvInner {
     }
 }
 
+/// Reads the persisted comparator identifier.
+pub(crate) fn read_comparator_id(path: &Path) -> Result<Option<String>> {
+    let file_path = path.join(COMPARATOR_FILE);
+    let bytes = match fs::read(&file_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read `{}`", file_path.display()));
+        }
+    };
+    ensure!(bytes.len() >= 20, "comparator identity file is truncated");
+    ensure!(
+        &bytes[0..8] == COMPARATOR_MAGIC.as_slice(),
+        "invalid comparator identity magic"
+    );
+    ensure!(
+        LittleEndian::read_u32(&bytes[8..12]) == COMPARATOR_VERSION,
+        "unsupported comparator identity version"
+    );
+    let id_len = LittleEndian::read_u32(&bytes[12..16]) as usize;
+    ensure!(
+        id_len > 0 && id_len <= MAX_COMPARATOR_ID_LEN,
+        "invalid comparator identifier length"
+    );
+    let total = 16usize
+        .checked_add(id_len)
+        .and_then(|size| size.checked_add(4))
+        .context("comparator identity length overflow")?;
+    ensure!(
+        bytes.len() == total,
+        "comparator identity file has trailing data"
+    );
+    let stored = LittleEndian::read_u32(&bytes[total - 4..]);
+    let actual = crc32c::crc32c(&bytes[..total - 4]);
+    ensure!(stored == actual, "comparator identity checksum mismatch");
+    let id = std::str::from_utf8(&bytes[16..16 + id_len])
+        .context("comparator identifier is not UTF-8")?;
+    Ok(Some(id.to_owned()))
+}
+
+pub(crate) fn write_comparator_id(path: &Path, comparator_id: &str) -> Result<()> {
+    ensure!(
+        !comparator_id.is_empty() && comparator_id.len() <= MAX_COMPARATOR_ID_LEN,
+        "invalid comparator identifier"
+    );
+    let file_path = path.join(COMPARATOR_FILE);
+    let mut bytes = Vec::with_capacity(16 + comparator_id.len() + 4);
+    bytes.extend_from_slice(&COMPARATOR_MAGIC);
+    bytes.extend_from_slice(&COMPARATOR_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&(comparator_id.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(comparator_id.as_bytes());
+    let checksum = crc32c::crc32c(&bytes);
+    bytes.extend_from_slice(&checksum.to_le_bytes());
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&file_path)
+        .with_context(|| format!("failed to create `{}`", file_path.display()))?;
+    file.write_all(&bytes)
+        .with_context(|| format!("failed to write `{}`", file_path.display()))?;
+    file.sync_data()
+        .with_context(|| format!("failed to sync `{}`", file_path.display()))?;
+    io::sync_dir(path).with_context(|| format!("failed to sync `{}`", path.display()))?;
+    Ok(())
+}
+
 /// Reads the clean-shutdown marker, if it is present and valid.
 fn read_clean_marker(path: &Path) -> Option<u64> {
     let bytes = fs::read(path.join(CLEAN_FILE)).ok()?;
@@ -773,6 +861,9 @@ pub struct EnvOpenOptions {
     pub multi_process: bool,
     /// Key order used by every database in the environment.
     pub comparator: KeyComparator,
+    /// Stable identifier stored beside the data file to detect comparator
+    /// mismatches on later opens.
+    pub comparator_id: Option<String>,
 }
 
 impl Default for EnvOpenOptions {
@@ -783,6 +874,7 @@ impl Default for EnvOpenOptions {
             read_only: false,
             multi_process: false,
             comparator: KeyComparator::lexicographic(),
+            comparator_id: None,
         }
     }
 }
@@ -829,10 +921,21 @@ impl EnvOpenOptions {
     /// Sets the key order used by every database in the environment.
     ///
     /// The same comparator must be supplied whenever the environment is
-    /// reopened and when it is compacted. Prefix iteration is only available
-    /// with the default lexicographic comparator.
+    /// reopened and when it is compacted. Use [`Self::comparator_id`] to set
+    /// a stable identifier; it is persisted and checked on later opens.
+    /// Prefix iteration is only available with the default lexicographic
+    /// comparator.
     pub fn comparator(&mut self, comparator: KeyComparator) -> &mut Self {
         self.comparator = comparator;
+        self
+    }
+
+    /// Sets the stable identifier persisted for the key comparator.
+    ///
+    /// The default is `"lexicographic"`. A custom comparator must provide a
+    /// non-empty identifier that is used again on every open and compaction.
+    pub fn comparator_id(&mut self, comparator_id: impl Into<String>) -> &mut Self {
+        self.comparator_id = Some(comparator_id.into());
         self
     }
 
@@ -849,6 +952,21 @@ impl EnvOpenOptions {
     /// invalid, or the data file cannot be mapped.
     pub fn open(&self, path: impl AsRef<Path>) -> Result<Env> {
         let path = path.as_ref();
+        let comparator_id = self.comparator_id.clone().unwrap_or_else(|| {
+            if self.comparator.is_lexicographic() {
+                "lexicographic".to_owned()
+            } else {
+                String::new()
+            }
+        });
+        ensure!(
+            !comparator_id.is_empty(),
+            "a custom comparator requires a non-empty comparator_id"
+        );
+        ensure!(
+            comparator_id.len() <= MAX_COMPARATOR_ID_LEN,
+            "comparator_id is too long"
+        );
         if self.read_only {
             ensure!(
                 path.is_dir(),
@@ -946,6 +1064,19 @@ impl EnvOpenOptions {
             .with_context(|| format!("failed to inspect `{}`", data_path.display()))?
             .len();
         let requested_map_size = normalize_map_size(self.map_size)?;
+
+        let stored_comparator_id = read_comparator_id(path)?;
+        match &stored_comparator_id {
+            Some(stored) => ensure!(
+                stored == &comparator_id,
+                "comparator id mismatch: data file uses `{stored}`, requested `{comparator_id}`"
+            ),
+            None => ensure!(
+                existing_len == 0
+                    || (self.comparator.is_lexicographic() && comparator_id == "lexicographic"),
+                "comparator identity is missing for a custom comparator"
+            ),
+        }
 
         let (candidates, map_size, file_covers_newest) = if self.read_only {
             ensure!(
@@ -1045,6 +1176,10 @@ impl EnvOpenOptions {
         let meta = chosen.meta;
         let meta_slot = chosen.slot;
 
+        if stored_comparator_id.is_none() && !self.read_only {
+            write_comparator_id(path, &comparator_id)?;
+        }
+
         let verified_words = (map_size / PAGE_SIZE).div_ceil(64);
         let verified = (0..verified_words).map(|_| AtomicU64::new(0)).collect();
 
@@ -1058,6 +1193,7 @@ impl EnvOpenOptions {
             multi_process: self.multi_process && !self.read_only,
             page_reuse: !self.read_only && !self.multi_process,
             comparator: self.comparator,
+            comparator_id,
             committed: RwLock::new(Committed {
                 meta,
                 slot: meta_slot,
@@ -1134,6 +1270,7 @@ mod tests {
         assert!(!options.read_only);
         assert!(!options.multi_process);
         assert!(options.comparator.is_lexicographic());
+        assert!(options.comparator_id.is_none());
     }
 
     #[test]
@@ -1150,6 +1287,8 @@ mod tests {
         assert!(options.read_only);
         assert!(options.multi_process);
         assert!(options.comparator.is_lexicographic());
+        assert!(options.comparator_id.is_none());
+        assert!(options.comparator_id.is_none());
     }
 
     #[test]

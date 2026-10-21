@@ -1822,7 +1822,7 @@ fn custom_comparator_orders_reads_and_compaction() -> Result<()> {
     let dir = tempdir()?;
     let comparator = KeyComparator::custom(reverse_bytes);
     let mut options = options();
-    options.comparator(comparator);
+    options.comparator(comparator).comparator_id("reverse-v1");
 
     {
         let env = options.open(dir.path())?;
@@ -1874,7 +1874,7 @@ fn custom_comparator_orders_reads_and_compaction() -> Result<()> {
         wtxn.commit()?;
     }
 
-    Env::compact_with(dir.path(), comparator)?;
+    Env::compact_with(dir.path(), comparator, "reverse-v1")?;
     let env = options.open(dir.path())?;
     let rtxn = env.read_txn()?;
     let db = env.open_database::<Str, Str>(&rtxn, None)?;
@@ -1898,7 +1898,9 @@ fn custom_comparator_orders_reads_and_compaction() -> Result<()> {
 fn custom_comparator_bulk_load_and_write_ranges() -> Result<()> {
     let dir = tempdir()?;
     let mut options = options();
-    options.comparator(KeyComparator::custom(reverse_bytes));
+    options
+        .comparator(KeyComparator::custom(reverse_bytes))
+        .comparator_id("reverse-v1");
     let env = options.open(dir.path())?;
 
     let mut wtxn = env.write_txn()?;
@@ -1937,6 +1939,60 @@ fn custom_comparator_bulk_load_and_write_ranges() -> Result<()> {
     assert_eq!(range.first().map(String::as_str), Some("key-0600"));
     assert_eq!(range.last().map(String::as_str), Some("key-0400"));
     wtxn.abort()?;
+
+    Ok(())
+}
+
+#[test]
+fn comparator_identity_is_persisted_and_checked() -> Result<()> {
+    let dir = tempdir()?;
+    let comparator = KeyComparator::custom(reverse_bytes);
+    {
+        let mut options = options();
+        options.comparator(comparator).comparator_id("reverse-v1");
+        let env = options.open(dir.path())?;
+        let mut wtxn = env.write_txn()?;
+        let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+        db.put(&mut wtxn, "a", "1")?;
+        wtxn.commit()?;
+        assert_eq!(env.comparator_id(), "reverse-v1");
+    }
+
+    let mut correct = options();
+    correct.comparator(comparator).comparator_id("reverse-v1");
+    let env = correct.open(dir.path())?;
+    let rtxn = env.read_txn()?;
+    let db = env.open_database::<Str, Str>(&rtxn, None)?;
+    assert_eq!(db.get(&rtxn, "a")?, Some("1"));
+    drop(rtxn);
+    drop(db);
+    drop(env);
+
+    let mut wrong = options();
+    wrong.comparator(comparator).comparator_id("reverse-v2");
+    let error = wrong.open(dir.path()).unwrap_err();
+    assert!(error.to_string().contains("comparator id mismatch"));
+
+    let mut missing_id = options();
+    missing_id.comparator(comparator);
+    let error = missing_id.open(dir.path()).unwrap_err();
+    assert!(error.to_string().contains("comparator_id"));
+
+    assert!(Env::compact_with(dir.path(), comparator, "reverse-v2").is_err());
+
+    let legacy = tempdir()?;
+    {
+        let env = options().open(legacy.path())?;
+        let mut wtxn = env.write_txn()?;
+        let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+        db.put(&mut wtxn, "key", "value")?;
+        wtxn.commit()?;
+    }
+    std::fs::remove_file(legacy.path().join("comparator.tsubame"))?;
+    let env = options().open(legacy.path())?;
+    assert_eq!(env.comparator_id(), "lexicographic");
+    drop(env);
+    assert!(legacy.path().join("comparator.tsubame").is_file());
 
     Ok(())
 }

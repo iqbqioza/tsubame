@@ -27,8 +27,22 @@ const LOCK_FILE: &str = "lock.tsubame";
 const COMPACT_FILE: &str = "data.tsubame.compact";
 
 /// Rewrites an environment into a compact data file.
-pub(crate) fn compact_with(path: &Path, comparator: KeyComparator) -> Result<()> {
+pub(crate) fn compact_with(
+    path: &Path,
+    comparator: KeyComparator,
+    comparator_id: &str,
+) -> Result<()> {
     ensure!(path.is_dir(), "`{}` is not a directory", path.display());
+    match crate::env::read_comparator_id(path)? {
+        Some(stored) => ensure!(
+            stored == comparator_id,
+            "comparator id mismatch: data file uses `{stored}`, requested `{comparator_id}`"
+        ),
+        None => ensure!(
+            comparator.is_lexicographic() && comparator_id == "lexicographic",
+            "comparator identity is missing for a custom comparator"
+        ),
+    }
     let data_path = path.join(DATA_FILE);
     ensure!(
         data_path.is_file(),

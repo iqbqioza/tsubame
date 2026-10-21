@@ -111,13 +111,16 @@ fn reverse(left: &[u8], right: &[u8]) -> Ordering {
 
 fn main() -> tsubame::Result<()> {
     let mut options = EnvOpenOptions::new();
-    options.comparator(KeyComparator::custom(reverse));
+    options
+        .comparator(KeyComparator::custom(reverse))
+        .comparator_id("reverse-v1");
     let env = options.open("/tmp/tsubame-reverse")?;
     Ok(())
 }
 ```
 
-The same comparator must be passed to `Env::compact_with` when compacting.
+The comparator identifier is persisted in `comparator.tsubame`. The same ID
+must be supplied on every reopen and to `Env::compact_with`.
 
 ## Examples
 
@@ -150,8 +153,9 @@ The examples use a temporary directory and clean up after themselves.
   ```
   The environment must be closed while compaction runs.
 - Custom key comparators are environment-wide and must be supplied again on
-  every open and offline compaction. They are not stored in the data file.
-  Prefix iteration requires lexicographic order.
+  every open and offline compaction. A stable comparator ID is persisted in
+  `comparator.tsubame` and must match. Prefix iteration requires lexicographic
+  order.
 - Performance is benchmarked rather than assumed; see [`benchmarks`](benchmarks).
 
 ## Development
