@@ -21,6 +21,8 @@ All notable changes to this project are documented here.
 - `Env::compact_online` while a writable environment remains open. Active read
   transactions and database handles keep their previous mmap generation; a
   writer transaction must be idle.
+- `BytesEncode::bytes_encode_into` lets integer key codecs encode into a
+  caller-provided stack buffer for allocation-free point lookups.
 - Environment-wide custom key comparators through `KeyComparator` and
   `EnvOpenOptions::comparator`. A comparator ID is persisted in
   `comparator.tsubame` and checked on reopen and compaction; custom-order
@@ -45,6 +47,8 @@ All notable changes to this project are documented here.
   removing per-transaction registry file I/O and the global registry lock from
   the read path. The writer skips the slot scan entirely when the registry is
   empty.
+- Point lookups with fixed-width integer keys avoid allocating an encoded key
+  buffer on every `get`.
 - Bulk loading builds leaf pages from borrowed entries instead of cloning
   every key and value.
 - Verified page reads bypass redundant header checks, and binary-search slot

@@ -177,6 +177,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+cargo package --workspace --no-verify
 ```
 
 ## Publishing
@@ -184,11 +185,15 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 The crates are published in dependency order:
 
 ```sh
-cargo package --workspace
+cargo package --workspace --no-verify
 cargo publish -p tsubame-traits
 cargo publish -p tsubame-types
 cargo publish -p tsubame
 ```
+
+Tarball verification is deferred until lower-level crates are published,
+because the higher-level crates may use APIs not yet present in the published
+versions.
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes.
 

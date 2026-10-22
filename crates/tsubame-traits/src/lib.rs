@@ -29,6 +29,23 @@ pub trait BytesEncode<'a> {
     ///
     /// Returns an error when the item cannot be represented as bytes.
     fn bytes_encode(item: &'a Self::EItem) -> Result<Cow<'a, [u8]>, BoxedError>;
+
+    /// Encodes `item` into a caller-provided buffer when possible.
+    ///
+    /// Codecs that can write into `buffer` should override this method to
+    /// avoid an allocation on hot lookup paths. Return `None` when the codec
+    /// cannot use the buffer (for example, when it needs more space); callers
+    /// then fall back to [`Self::bytes_encode`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the item cannot be represented as bytes.
+    fn bytes_encode_into<'b>(
+        _item: &'a Self::EItem,
+        _buffer: &'b mut [u8],
+    ) -> Result<Option<&'b [u8]>, BoxedError> {
+        Ok(None)
+    }
 }
 
 /// Decodes a typed item from a byte slice.
