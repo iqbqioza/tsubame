@@ -20,6 +20,9 @@ All notable changes to this project are documented here.
 - `Database::first`, `last`, `len`, and `is_empty` inspection helpers, plus
   `first_rw`, `last_rw`, `len_rw`, and `is_empty_rw` for staged transaction
   views.
+- `PutFlags`, `Database::put_with_flags`, and
+  `Database::get_or_put_with_flags`. `NO_OVERWRITE` is supported; append and
+  duplicate-data flags are reserved and return an error.
 - `Database::get_or_put` inserts only when a key is absent and returns the
   existing decoded value without overwriting it. Staged puts and deletes are
   respected.

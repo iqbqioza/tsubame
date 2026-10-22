@@ -14,6 +14,7 @@ use anyhow::{Context, ensure};
 
 use crate::Result;
 use crate::env::EnvInner;
+use crate::flags::PutFlags;
 use crate::iter::{
     RoIter, RoPrefix, RoRange, RoRevIter, RoRevPrefix, RoRevRange, RwIter, RwPrefix, RwRange,
     RwRevIter, RwRevPrefix, RwRevRange, prefix_successor,
@@ -27,6 +28,15 @@ use crate::txn::{RoTxn, RwTxn};
 /// Converts a codec error into an `anyhow` error with context.
 fn codec_error(context: &str, error: BoxedError) -> anyhow::Error {
     anyhow::anyhow!("{context}: {error}")
+}
+
+fn ensure_supported_put_flags(flags: PutFlags) -> Result<()> {
+    let supported = PutFlags::NO_OVERWRITE.bits();
+    ensure!(
+        flags.bits() & !supported == 0,
+        "APPEND, APPEND_DUP, and NO_DUP_DATA are not supported"
+    );
+    Ok(())
 }
 
 /// The identity of a database inside an environment.
@@ -847,6 +857,76 @@ impl<KC, DC> Database<KC, DC> {
             txn.mark_failed();
         }
         result
+    }
+
+    /// Stores `data` under `key`, applying supported write flags.
+    ///
+    /// [`PutFlags::NO_OVERWRITE`] refuses to replace an existing key and leaves
+    /// the transaction usable. The append and duplicate-data flags are
+    /// reserved for API compatibility and currently return an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a flag is unsupported, the key exists with
+    /// `NO_OVERWRITE`, a codec fails, or the transaction cannot stage the
+    /// write. A staging failure marks the transaction as failed; a
+    /// `NO_OVERWRITE` conflict leaves it usable.
+    pub fn put_with_flags<'a>(
+        &self,
+        txn: &mut RwTxn<'_>,
+        flags: PutFlags,
+        key: &'a KC::EItem,
+        data: &'a DC::EItem,
+    ) -> Result<()>
+    where
+        KC: BytesEncode<'a>,
+        DC: BytesEncode<'a>,
+    {
+        ensure_supported_put_flags(flags)?;
+        ensure!(
+            txn.belongs_to(&self.env),
+            "transaction belongs to a different environment"
+        );
+
+        if flags.contains(PutFlags::NO_OVERWRITE) {
+            let mut key_buffer = [0u8; KEY_ENCODE_BUFFER];
+            let key = encode_key::<KC>(key, &mut key_buffer)?;
+            ensure!(
+                key.as_slice().len() <= MAX_KEY_SIZE,
+                "key is {} bytes, maximum is {MAX_KEY_SIZE}",
+                key.as_slice().len()
+            );
+            ensure!(
+                !txn.contains_raw(&self.kind, key.as_slice())?,
+                "key already exists"
+            );
+        }
+
+        self.put(txn, key, data)
+    }
+
+    /// Inserts `data` only when `key` is absent, with write flags.
+    ///
+    /// [`PutFlags::NO_OVERWRITE`] is implicit. The append and duplicate-data
+    /// flags are reserved for API compatibility and currently return an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a flag is unsupported, a codec fails, or the
+    /// transaction cannot stage the write.
+    pub fn get_or_put_with_flags<'a, 'txn>(
+        &self,
+        txn: &'txn mut RwTxn<'_>,
+        flags: PutFlags,
+        key: &'a KC::EItem,
+        data: &'a DC::EItem,
+    ) -> Result<Option<DC::DItem>>
+    where
+        KC: BytesEncode<'a>,
+        DC: BytesEncode<'a> + BytesDecode<'txn>,
+    {
+        ensure_supported_put_flags(flags)?;
+        self.get_or_put(txn, key, data)
     }
 
     /// Deletes the entry stored under `key`.
