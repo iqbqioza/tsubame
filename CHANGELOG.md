@@ -20,6 +20,10 @@ All notable changes to this project are documented here.
 - `Database::first`, `last`, `len`, and `is_empty` inspection helpers, plus
   `first_rw`, `last_rw`, `len_rw`, and `is_empty_rw` for staged transaction
   views.
+- `Env::copy_to_path` creates a consistent backup of the committed snapshot
+  into an empty directory. It copies only the committed page range and the
+  comparator identity; free-list and reader sidecars are reconstructed when the
+  backup is opened.
 - Clearing a database now releases its old tree pages for reuse.
 - `Env::compact_online` while a writable environment remains open. Active read
   transactions and database handles keep their previous mmap generation; a
