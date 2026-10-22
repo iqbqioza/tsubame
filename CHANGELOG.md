@@ -115,6 +115,9 @@ All notable changes to this project are documented here.
   of a temporary full-value buffer, and verified overflow extents return their
   payload without re-reading extent headers. Large-value point reads and writes
   avoid an extra full-value copy and repeated header validation.
+- Ordered iteration keeps the current leaf page in the cursor instead of looking
+  it up again for every entry. Range, prefix, and reverse scans avoid one page
+  lookup per key.
 
 ### Fixed
 

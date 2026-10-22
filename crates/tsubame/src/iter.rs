@@ -5,7 +5,7 @@ use std::iter::Peekable;
 use std::marker::PhantomData;
 use std::ops::Bound;
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 
 use crate::comparator::KeyComparator;
 use crate::storage::btree::PageSource;
@@ -21,6 +21,7 @@ pub(crate) struct Cursor<'a, S: PageSource> {
     comparator: KeyComparator,
     stack: Vec<(u64, usize)>,
     leaf: Option<u64>,
+    leaf_page: Option<Page<'a>>,
     slot: usize,
 }
 
@@ -31,6 +32,7 @@ impl<'a, S: PageSource> Cursor<'a, S> {
             comparator: *source.comparator(),
             stack: Vec::new(),
             leaf: None,
+            leaf_page: None,
             slot: 0,
         }
     }
@@ -46,6 +48,7 @@ impl<'a, S: PageSource> Cursor<'a, S> {
     pub(crate) fn seek_first(&mut self, root: u64) -> Result<()> {
         self.stack.clear();
         self.leaf = None;
+        self.leaf_page = None;
         if root != 0 {
             self.descend_leftmost(root)?;
         }
@@ -55,6 +58,7 @@ impl<'a, S: PageSource> Cursor<'a, S> {
     fn seek_last(&mut self, root: u64) -> Result<()> {
         self.stack.clear();
         self.leaf = None;
+        self.leaf_page = None;
         if root != 0 {
             self.descend_rightmost(root)?;
         }
@@ -64,6 +68,7 @@ impl<'a, S: PageSource> Cursor<'a, S> {
     fn seek_forward(&mut self, root: u64, key: &[u8]) -> Result<()> {
         self.stack.clear();
         self.leaf = None;
+        self.leaf_page = None;
         if root == 0 {
             return Ok(());
         }
@@ -83,9 +88,11 @@ impl<'a, S: PageSource> Cursor<'a, S> {
                 }
                 PageType::Leaf => {
                     let slot = page.lower_bound_with(key, &self.comparator)?;
+                    let slot_count = page.slot_count();
                     self.leaf = Some(page_id);
                     self.slot = slot;
-                    if slot >= page.slot_count() {
+                    self.leaf_page = Some(page);
+                    if slot >= slot_count {
                         self.advance_leaf()?;
                     }
                     return Ok(());
@@ -99,6 +106,7 @@ impl<'a, S: PageSource> Cursor<'a, S> {
     fn seek_reverse(&mut self, root: u64, key: &[u8]) -> Result<()> {
         self.stack.clear();
         self.leaf = None;
+        self.leaf_page = None;
         if root == 0 {
             return Ok(());
         }
@@ -119,6 +127,7 @@ impl<'a, S: PageSource> Cursor<'a, S> {
                 PageType::Leaf => {
                     let slot = page.upper_bound_with(key, &self.comparator)?;
                     self.leaf = Some(page_id);
+                    self.leaf_page = Some(page);
                     if slot > 0 {
                         self.slot = slot - 1;
                     } else {
@@ -146,6 +155,7 @@ impl<'a, S: PageSource> Cursor<'a, S> {
                 }
                 PageType::Leaf => {
                     self.leaf = Some(page_id);
+                    self.leaf_page = Some(page);
                     self.slot = 0;
                     return Ok(());
                 }
@@ -172,6 +182,7 @@ impl<'a, S: PageSource> Cursor<'a, S> {
                     ensure!(page.slot_count() > 0, "leaf page {page_id} is empty");
                     self.leaf = Some(page_id);
                     self.slot = page.slot_count() - 1;
+                    self.leaf_page = Some(page);
                     return Ok(());
                 }
             }
@@ -182,6 +193,7 @@ impl<'a, S: PageSource> Cursor<'a, S> {
 
     fn advance_leaf(&mut self) -> Result<()> {
         self.leaf = None;
+        self.leaf_page = None;
 
         loop {
             let depth = self.stack.len();
@@ -205,6 +217,7 @@ impl<'a, S: PageSource> Cursor<'a, S> {
 
     fn retreat_leaf(&mut self) -> Result<()> {
         self.leaf = None;
+        self.leaf_page = None;
 
         loop {
             let depth = self.stack.len();
@@ -225,10 +238,13 @@ impl<'a, S: PageSource> Cursor<'a, S> {
     }
 
     pub(crate) fn current(&self) -> Result<Option<(&'a [u8], &'a [u8])>> {
-        let Some(leaf_id) = self.leaf else {
+        if self.leaf.is_none() {
             return Ok(None);
-        };
-        let page = self.page(leaf_id)?;
+        }
+        let page = self
+            .leaf_page
+            .as_ref()
+            .context("cursor leaf page is not loaded")?;
         if self.slot >= page.slot_count() {
             return Ok(None);
         }
@@ -243,10 +259,13 @@ impl<'a, S: PageSource> Cursor<'a, S> {
     }
 
     fn current_key(&self) -> Result<Option<&'a [u8]>> {
-        let Some(leaf_id) = self.leaf else {
+        if self.leaf.is_none() {
             return Ok(None);
-        };
-        let page = self.page(leaf_id)?;
+        }
+        let page = self
+            .leaf_page
+            .as_ref()
+            .context("cursor leaf page is not loaded")?;
         if self.slot >= page.slot_count() {
             return Ok(None);
         }
@@ -254,11 +273,15 @@ impl<'a, S: PageSource> Cursor<'a, S> {
     }
 
     pub(crate) fn next(&mut self) -> Result<()> {
-        let Some(leaf_id) = self.leaf else {
+        if self.leaf.is_none() {
             return Ok(());
-        };
-        let page = self.page(leaf_id)?;
-        if self.slot + 1 < page.slot_count() {
+        }
+        let slot_count = self
+            .leaf_page
+            .as_ref()
+            .context("cursor leaf page is not loaded")?
+            .slot_count();
+        if self.slot + 1 < slot_count {
             self.slot += 1;
             Ok(())
         } else {

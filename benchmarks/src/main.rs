@@ -43,7 +43,9 @@ type HeedDb = heed::Database<HeedU64<HeedEndian>, HeedStr>;
 struct Report {
     insert: Duration,
     read: Duration,
+    range: Duration,
     commit: Duration,
+    delete: Duration,
     reopen: Duration,
 }
 
@@ -92,12 +94,20 @@ fn main() -> Result<()> {
         "ns/op",
     );
     print_row(
+        "range scan",
+        tsubame.range,
+        heed.range,
+        config.entries,
+        "ns/op",
+    );
+    print_row(
         "durable commit",
         tsubame.commit,
         heed.commit,
         config.commits,
         "us/op",
     );
+    print_row("bulk delete (1 txn)", tsubame.delete, heed.delete, 1, "ms");
     print_row("reopen", tsubame.reopen, heed.reopen, 1, "ms");
 
     Ok(())
@@ -151,6 +161,16 @@ fn run_tsubame() -> Result<Report> {
     }
     let read = start.elapsed();
 
+    let start = Instant::now();
+    let mut scanned = 0u64;
+    for item in db.iter(&rtxn)? {
+        let (key, value) = item?;
+        black_box((key, value));
+        scanned += 1;
+    }
+    black_box(scanned);
+    let range = start.elapsed();
+
     drop(rtxn);
     drop(db);
     drop(env);
@@ -166,11 +186,14 @@ fn run_tsubame() -> Result<Report> {
     drop(env);
 
     let commit = bench_tsubame_commit(dir.path(), &mut options)?;
+    let delete = bench_tsubame_delete(dir.path(), &mut options)?;
 
     Ok(Report {
         insert,
         read,
+        range,
         commit,
+        delete,
         reopen,
     })
 }
@@ -189,6 +212,22 @@ fn bench_tsubame_commit(path: &std::path::Path, options: &mut TsubameOptions) ->
         wtxn.commit()?;
     }
 
+    Ok(start.elapsed())
+}
+
+fn bench_tsubame_delete(path: &std::path::Path, options: &mut TsubameOptions) -> Result<Duration> {
+    let config = config();
+    let env = options.open(path)?;
+    let rtxn = env.read_txn()?;
+    let db: TsubameDb = env.open_database(&rtxn, None)?;
+    drop(rtxn);
+
+    let start = Instant::now();
+    let mut wtxn = env.write_txn()?;
+    for i in (0..config.entries).step_by(2) {
+        db.delete(&mut wtxn, &i)?;
+    }
+    wtxn.commit()?;
     Ok(start.elapsed())
 }
 
@@ -226,6 +265,16 @@ fn run_heed() -> Result<Report> {
     }
     let read = start.elapsed();
 
+    let start = Instant::now();
+    let mut scanned = 0u64;
+    for item in db.iter(&rtxn)? {
+        let (key, value) = item?;
+        black_box((key, value));
+        scanned += 1;
+    }
+    black_box(scanned);
+    let range = start.elapsed();
+
     drop(rtxn);
     drop(env);
 
@@ -247,11 +296,14 @@ fn run_heed() -> Result<Report> {
     drop(env);
 
     let commit = bench_heed_commit(dir.path())?;
+    let delete = bench_heed_delete(dir.path())?;
 
     Ok(Report {
         insert,
         read,
+        range,
         commit,
+        delete,
         reopen,
     })
 }
@@ -276,6 +328,30 @@ fn bench_heed_commit(path: &std::path::Path) -> Result<Duration> {
         wtxn.commit()?;
     }
 
+    Ok(start.elapsed())
+}
+
+fn bench_heed_delete(path: &std::path::Path) -> Result<Duration> {
+    let config = config();
+    // SAFETY: this benchmark owns the directory.
+    let env = unsafe {
+        HeedOptions::new()
+            .map_size(MAP_SIZE)
+            .max_dbs(1)
+            .open(path)?
+    };
+    let rtxn = env.read_txn()?;
+    let db: HeedDb = env
+        .open_database(&rtxn, None)?
+        .context("unnamed database is missing")?;
+    drop(rtxn);
+
+    let start = Instant::now();
+    let mut wtxn = env.write_txn()?;
+    for i in (0..config.entries).step_by(2) {
+        db.delete(&mut wtxn, &i)?;
+    }
+    wtxn.commit()?;
     Ok(start.elapsed())
 }
 
