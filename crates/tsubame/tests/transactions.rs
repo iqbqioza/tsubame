@@ -367,6 +367,33 @@ fn directional_lookups_follow_key_order() -> Result<()> {
 }
 
 #[test]
+fn delete_checked_reports_the_visible_key_state() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+
+    assert!(!db.delete_checked(&mut wtxn, "missing")?);
+    db.put(&mut wtxn, "a", "value")?;
+    assert!(db.delete_checked(&mut wtxn, "a")?);
+    assert!(!db.delete_checked(&mut wtxn, "a")?);
+    wtxn.commit()?;
+
+    let mut wtxn = env.write_txn()?;
+    db.put(&mut wtxn, "b", "value")?;
+    wtxn.commit()?;
+    let mut wtxn = env.write_txn()?;
+    db.delete(&mut wtxn, "b")?;
+    assert!(!db.delete_checked(&mut wtxn, "b")?);
+    wtxn.commit()?;
+
+    let rtxn = env.read_txn()?;
+    assert!(db.is_empty(&rtxn)?);
+
+    Ok(())
+}
+
+#[test]
 fn delete_range_respects_bounds_and_staged_changes() -> Result<()> {
     let dir = tempdir()?;
     let env = options().open(dir.path())?;

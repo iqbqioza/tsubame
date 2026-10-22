@@ -1102,6 +1102,45 @@ impl<KC, DC> Database<KC, DC> {
         result
     }
 
+    /// Deletes the entry stored under `key` and reports whether it existed.
+    ///
+    /// This performs an existence lookup before staging the delete. Use
+    /// [`Database::delete`] when the return value is not needed, since that
+    /// path avoids the extra lookup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key cannot be encoded, the existence lookup
+    /// fails, or the transaction cannot stage the write. A failed delete marks
+    /// the transaction as failed; it can only be aborted.
+    pub fn delete_checked<'a>(&self, txn: &mut RwTxn<'_>, key: &'a KC::EItem) -> Result<bool>
+    where
+        KC: BytesEncode<'a>,
+    {
+        ensure!(
+            txn.belongs_to(&self.env),
+            "transaction belongs to a different environment"
+        );
+
+        let result = (|| {
+            let mut key_buffer = [0u8; KEY_ENCODE_BUFFER];
+            let key = encode_key::<KC>(key, &mut key_buffer)?;
+            ensure!(
+                key.as_slice().len() <= MAX_KEY_SIZE,
+                "key is {} bytes, maximum is {MAX_KEY_SIZE}",
+                key.as_slice().len()
+            );
+            let existed = txn.contains_raw(&self.kind, key.as_slice())?;
+            txn.delete_raw(self.kind.clone(), key.as_slice())?;
+            Ok(existed)
+        })();
+
+        if result.is_err() {
+            txn.mark_failed();
+        }
+        result
+    }
+
     /// Deletes every entry whose key falls inside `range` and returns how many
     /// entries were removed.
     ///

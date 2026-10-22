@@ -28,6 +28,8 @@ All notable changes to this project are documented here.
 - `PutFlags`, `Database::put_with_flags`, and
   `Database::get_or_put_with_flags`. `NO_OVERWRITE` is supported; append and
   duplicate-data flags are reserved and return an error.
+- `Database::delete_checked` returns whether the key existed while keeping the
+  regular `delete` staging path allocation-free.
 - `Database::get_or_put` inserts only when a key is absent and returns the
   existing decoded value without overwriting it. Staged puts and deletes are
   respected.

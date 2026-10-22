@@ -62,6 +62,7 @@ added without changing the main API.
 - [x] Environment statistics and `Env::non_free_pages_size`
 - [x] Allocated-size reporting with `Env::real_disk_size`
 - [x] On-demand stale reader cleanup with `Env::clear_stale_readers`
+- [x] Checked deletion with `Database::delete_checked`
 - [x] Heed-style write-transaction iterator aliases and `Env::force_sync`
 - [x] Range deletion with `Database::delete_range`
 - [x] Conditional insertion with `Database::get_or_put`
