@@ -30,6 +30,9 @@ All notable changes to this project are documented here.
   `rev_iter_mut`, `rev_range_mut`, `prefix_iter_mut`, and `rev_prefix_iter_mut`.
 - `Env::force_sync` flushes committed data and the environment directory while
   ensuring no write transaction is active.
+- `EnvOpenOptions::max_readers` and `Env::max_readers` configure the number of
+  read-only transaction slots used by multi-process readers. The limit is also
+  exposed through `EnvInfo`.
 - `Database::stat` reports page size, depth, branch/leaf/overflow page counts,
   and entry count for a database snapshot.
 - `Database::get_greater_than`, `get_greater_than_or_equal_to`,

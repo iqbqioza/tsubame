@@ -1719,6 +1719,40 @@ fn compaction_preserves_overflow_values() -> Result<()> {
 }
 
 #[test]
+fn max_readers_limits_read_only_transaction_slots() -> Result<()> {
+    let dir = tempdir()?;
+    {
+        let env = options().open(dir.path())?;
+        let mut wtxn = env.write_txn()?;
+        let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+        db.put(&mut wtxn, "key", "value")?;
+        wtxn.commit()?;
+    }
+
+    let mut read_options = options();
+    read_options.read_only(true).max_readers(1);
+    let first = read_options.open(dir.path())?;
+    let second = read_options.open(dir.path())?;
+    assert_eq!(first.max_readers(), 1);
+    assert_eq!(first.info().max_readers, 1);
+
+    let rtxn = first.read_txn()?;
+    assert!(second.read_txn().is_err());
+    drop(rtxn);
+    let rtxn = second.read_txn()?;
+    drop(rtxn);
+
+    let mut invalid = options();
+    invalid.max_readers(0);
+    assert!(invalid.open(dir.path()).is_err());
+    let mut too_many = options();
+    too_many.max_readers(4_097);
+    assert!(too_many.open(dir.path()).is_err());
+
+    Ok(())
+}
+
+#[test]
 fn read_only_environments_share_and_block_writers() -> Result<()> {
     let dir = tempdir()?;
     {

@@ -36,6 +36,9 @@ pub const DEFAULT_MAP_SIZE: usize = 1024 * 1024 * 1024;
 /// The default maximum number of named databases in an environment.
 pub const DEFAULT_MAX_DBS: usize = 10;
 
+/// The default maximum number of concurrent read-only transaction slots.
+pub const DEFAULT_MAX_READERS: u32 = 4096;
+
 const DATA_FILE: &str = "data.tsubame";
 const LOCK_FILE: &str = "lock.tsubame";
 const WRITER_LOCK_FILE: &str = "writer.tsubame.lock";
@@ -85,6 +88,11 @@ impl Env {
     /// Returns whether this writable environment allows concurrent readers.
     pub fn is_multi_process(&self) -> bool {
         self.inner.multi_process
+    }
+
+    /// Returns the configured maximum number of read-only transaction slots.
+    pub fn max_readers(&self) -> u32 {
+        self.inner.max_readers
     }
 
     /// Returns the key order used by this environment.
@@ -140,6 +148,7 @@ impl Env {
             txn_id: committed.meta.txn_id,
             database_count: committed.meta.database_count,
             max_dbs: self.inner.max_dbs,
+            max_readers: self.inner.max_readers,
             format_version: meta::FORMAT_VERSION,
             read_only: self.inner.read_only,
             multi_process: self.inner.multi_process,
@@ -578,6 +587,8 @@ pub struct EnvInfo {
     pub database_count: u32,
     /// The configured maximum number of named databases.
     pub max_dbs: usize,
+    /// The configured maximum number of read-only transaction slots.
+    pub max_readers: u32,
     /// The on-disk format version.
     pub format_version: u32,
     /// Whether this environment was opened read-only.
@@ -1251,6 +1262,7 @@ impl EnvState {
 pub(crate) struct EnvInner {
     pub(crate) path: PathBuf,
     pub(crate) max_dbs: usize,
+    pub(crate) max_readers: u32,
     pub(crate) state: RwLock<Arc<EnvState>>,
     pub(crate) read_only: bool,
     pub(crate) multi_process: bool,
@@ -1406,7 +1418,7 @@ impl EnvInner {
     }
 
     pub(crate) fn reserve_external_reader(&self) -> Result<u64> {
-        for index in 0..READER_SLOTS {
+        for index in 0..self.max_readers as usize {
             if self
                 .reader_slots
                 .try_claim(READER_SLOT_BASE + index, READER_RESERVED)
@@ -1904,6 +1916,8 @@ pub struct EnvOpenOptions {
     pub map_size: usize,
     /// The maximum number of named databases that can be created.
     pub max_dbs: usize,
+    /// The maximum number of concurrent read-only transaction slots.
+    pub max_readers: u32,
     /// Whether the environment is opened read-only.
     pub read_only: bool,
     /// Whether a writable environment may coexist with read-only processes.
@@ -1923,6 +1937,7 @@ impl Default for EnvOpenOptions {
         Self {
             map_size: DEFAULT_MAP_SIZE,
             max_dbs: DEFAULT_MAX_DBS,
+            max_readers: DEFAULT_MAX_READERS,
             read_only: false,
             multi_process: false,
             comparator: KeyComparator::lexicographic(),
@@ -1950,6 +1965,16 @@ impl EnvOpenOptions {
         self
     }
 
+    /// Sets the maximum number of concurrent read-only transaction slots.
+    ///
+    /// This limit applies to read-only environments that publish reader
+    /// reservations in `readers.tsubame`. It must be between 1 and the
+    /// environment's fixed registry capacity.
+    pub fn max_readers(&mut self, max_readers: u32) -> &mut Self {
+        self.max_readers = max_readers;
+        self
+    }
+
     /// Opens the environment without write access.
     ///
     /// Read-only environments take a shared file lock. Multiple read-only
@@ -1964,10 +1989,11 @@ impl EnvOpenOptions {
     ///
     /// Cross-process page reuse remains enabled. Read-only transactions record
     /// their snapshots in `readers.tsubame`; pages needed by those snapshots
-    /// are not recycled. A fixed number of reader slots is available, and
-    /// stale slots left by a crash conservatively block reuse until offline
-    /// compaction clears them. Read-only environments need write access to
-    /// the environment directory for the registry sidecar.
+    /// are not recycled. The number of reader slots can be configured with
+    /// [`Self::max_readers`], and stale slots left by a crash conservatively
+    /// block reuse until offline compaction clears them. Read-only
+    /// environments need write access to the environment directory for the
+    /// registry sidecar.
     pub fn multi_process(&mut self, multi_process: bool) -> &mut Self {
         self.multi_process = multi_process;
         self
@@ -2010,6 +2036,11 @@ impl EnvOpenOptions {
     /// be mapped.
     pub fn open(&self, path: impl AsRef<Path>) -> Result<Env> {
         let path = path.as_ref();
+        ensure!(self.max_readers > 0, "max_readers must be at least 1");
+        ensure!(
+            self.max_readers as usize <= READER_SLOTS,
+            "max_readers is larger than the reader registry capacity"
+        );
         let comparator_id = self.comparator_id.clone().unwrap_or_else(|| {
             if self.comparator.is_lexicographic() {
                 "lexicographic".to_owned()
@@ -2300,6 +2331,7 @@ impl EnvOpenOptions {
         let inner = EnvInner {
             path: path.to_path_buf(),
             max_dbs: self.max_dbs,
+            max_readers: self.max_readers,
             state: RwLock::new(Arc::new(state)),
             read_only: self.read_only,
             multi_process: self.multi_process && !self.read_only,

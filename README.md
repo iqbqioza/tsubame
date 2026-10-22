@@ -62,6 +62,7 @@ added without changing the main API.
 - [x] Heed-style write-transaction iterator aliases and `Env::force_sync`
 - [x] Range deletion with `Database::delete_range`
 - [x] Conditional insertion with `Database::get_or_put`
+- [x] Configurable multi-process reader slot limit
 
 ## Codec features
 
@@ -148,7 +149,8 @@ The examples use a temporary directory and clean up after themselves.
   `multi_process(true)`. Readers advertise their snapshots through
   `readers.tsubame`, and the writer only recycles pages that no advertised
   snapshot can still need. The registry supports up to 4096 simultaneous
-  cross-process readers. Stale slots left by a crashed reader conservatively
+  cross-process readers, and `EnvOpenOptions::max_readers` can lower the
+  per-environment limit. Stale slots left by a crashed reader conservatively
   block reuse while another environment remains open; a multi-process writer
   clears them once it can acquire the lifecycle lock exclusively, and offline
   compaction always clears them. Read-only environments therefore need write
