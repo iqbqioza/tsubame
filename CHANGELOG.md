@@ -111,6 +111,10 @@ All notable changes to this project are documented here.
 - In-place page edits defer checksum recomputation until commit, so repeated
   changes to a transaction-owned page hash it only once. Dirty and unsealed
   page IDs use identity-hashed sets to keep the update path allocation-light.
+- Large overflow values are encoded directly into the writable mapping instead
+  of a temporary full-value buffer, and verified overflow extents return their
+  payload without re-reading extent headers. Large-value point reads and writes
+  avoid an extra full-value copy and repeated header validation.
 
 ### Fixed
 

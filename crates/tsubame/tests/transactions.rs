@@ -149,6 +149,45 @@ fn overflow_values_survive_reopen() -> Result<()> {
 }
 
 #[test]
+fn single_page_overflow_extents_can_be_replaced_and_deleted() -> Result<()> {
+    let dir = tempdir()?;
+    let first = vec![0x11; 2_000];
+    let second = vec![0x22; 2_500];
+    {
+        let env = options().open(dir.path())?;
+        let mut wtxn = env.write_txn()?;
+        let db = env.create_database::<Str, Bytes>(&mut wtxn, None)?;
+        db.put(&mut wtxn, "value", first.as_slice())?;
+        wtxn.commit()?;
+
+        let mut wtxn = env.write_txn()?;
+        let db = env.open_database::<Str, Bytes>(&env.read_txn()?, None)?;
+        db.put(&mut wtxn, "value", second.as_slice())?;
+        wtxn.commit()?;
+    }
+
+    {
+        let env = options().open(dir.path())?;
+        let rtxn = env.read_txn()?;
+        let db = env.open_database::<Str, Bytes>(&rtxn, None)?;
+        assert_eq!(db.get(&rtxn, "value")?, Some(second.as_slice()));
+        drop(rtxn);
+
+        let mut wtxn = env.write_txn()?;
+        let db = env.open_database::<Str, Bytes>(&env.read_txn()?, None)?;
+        db.delete(&mut wtxn, "value")?;
+        wtxn.commit()?;
+    }
+
+    let env = options().open(dir.path())?;
+    let rtxn = env.read_txn()?;
+    let db = env.open_database::<Str, Bytes>(&rtxn, None)?;
+    assert_eq!(db.get(&rtxn, "value")?, None);
+
+    Ok(())
+}
+
+#[test]
 fn concurrent_readers_do_not_block_a_writer() -> Result<()> {
     let dir = tempdir()?;
     let env = Arc::new(options().open(dir.path())?);
