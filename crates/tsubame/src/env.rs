@@ -931,7 +931,21 @@ impl EnvInner {
         }
 
         *pool = retained;
-        reusable
+        reusable.sort_unstable_by_key(|extent| extent.start_page);
+        let mut merged: Vec<FreeExtent> = Vec::with_capacity(reusable.len());
+        for extent in reusable {
+            if let Some(last) = merged.last_mut()
+                && last.start_page + last.pages == extent.start_page
+            {
+                last.pages += extent.pages;
+                // The merged extent is only reusable once the later
+                // generation has also become safe.
+                last.freed_txn = last.freed_txn.max(extent.freed_txn);
+            } else {
+                merged.push(extent);
+            }
+        }
+        merged
     }
 
     pub(crate) fn return_free(&self, extents: impl IntoIterator<Item = FreeExtent>) {

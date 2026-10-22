@@ -52,6 +52,10 @@ All notable changes to this project are documented here.
 - Staged pending keys up to 16 bytes are stored inline instead of allocating a
   `Vec` per write, and bulk loading borrows staged keys instead of first
   converting every key to an owned buffer.
+- Reusable free runs are coalesced when adjacent, and the smallest larger run
+  is split only when no exact-size run is available. This lets small leaf and
+  branch allocations reclaim space left by large overflow values without
+  sacrificing every contiguous extent.
 - Small commits build inline commit descriptors directly without allocating a
   `CommitEntry` vector or cloning it. Pages written by a successful commit are
   marked verified to avoid rechecking their checksums on the next writer read.

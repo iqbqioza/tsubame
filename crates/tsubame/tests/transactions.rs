@@ -1405,6 +1405,40 @@ fn online_page_reuse_keeps_growth_bounded() -> Result<()> {
 }
 
 #[test]
+fn reuse_splits_large_free_runs_for_small_pages() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Bytes>(&mut wtxn, None)?;
+    let large = vec![0x5a; 1024 * 1024];
+    db.put(&mut wtxn, "large", large.as_slice())?;
+    wtxn.commit()?;
+    let base_pages = env.info().page_count;
+
+    let mut wtxn = env.write_txn()?;
+    db.delete(&mut wtxn, "large")?;
+    wtxn.commit()?;
+
+    let mut wtxn = env.write_txn()?;
+    for i in 0..500u32 {
+        db.put(&mut wtxn, &format!("key-{i:04}"), b"small".as_slice())?;
+    }
+    wtxn.commit()?;
+
+    let after_pages = env.info().page_count;
+    assert!(
+        after_pages <= base_pages + 32,
+        "small allocations did not reuse the large free run: {base_pages} -> {after_pages}"
+    );
+
+    let rtxn = env.read_txn()?;
+    assert_eq!(db.get(&rtxn, "key-0000")?, Some(b"small".as_slice()));
+    assert_eq!(db.get(&rtxn, "key-0499")?, Some(b"small".as_slice()));
+
+    Ok(())
+}
+
+#[test]
 fn online_page_reuse_reclaims_overflow_extents() -> Result<()> {
     let dir = tempdir()?;
     let env = options().open(dir.path())?;

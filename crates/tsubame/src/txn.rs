@@ -1025,17 +1025,16 @@ impl PageStore for RwTxn<'_> {
     fn allocate_pages(&mut self, pages: u64) -> Result<u64> {
         ensure!(pages > 0, "allocation must contain at least one page");
 
-        // Reuse only exact-size runs. Splitting a larger run for a small
-        // allocation can destroy the contiguity that overflow extents need;
-        // reserving exact runs keeps repeated updates from fragmenting the
-        // free pool into unusable pieces. Offline compaction reclaims any
-        // sizes that are no longer requested.
-        if pages == 1 {
-            if let Some(page) = self.free_single.pop_first() {
-                self.owned_pages.insert(page);
-                return Ok(page);
-            }
-        } else {
+        // Prefer exact-size reusable runs. If none exists, split the smallest
+        // larger run. This reclaims small leaves and branches from runs left by
+        // larger values without destroying every contiguous extent.
+        if pages == 1
+            && let Some(page) = self.free_single.pop_first()
+        {
+            self.owned_pages.insert(page);
+            return Ok(page);
+        }
+        if pages > 1 {
             let run = self
                 .free_runs
                 .iter()
@@ -1056,6 +1055,46 @@ impl PageStore for RwTxn<'_> {
             .map(|(index, extent)| (index, extent.start_page, extent.freed_txn));
         if let Some((index, start, freed_txn)) = cross {
             self.cross_free.remove(index);
+            self.cross_allocated.push(FreeExtent {
+                start_page: start,
+                pages,
+                freed_txn,
+            });
+            self.owned_pages.extend(start..start + pages);
+            return Ok(start);
+        }
+
+        let run = self
+            .free_runs
+            .iter()
+            .filter(|(_, len)| **len >= pages)
+            .min_by_key(|(_, len)| **len)
+            .map(|(&start, &len)| (start, len));
+        if let Some((start, len)) = run {
+            self.free_runs.remove(&start);
+            if len > pages {
+                self.free_runs.insert(start + pages, len - pages);
+            }
+            self.owned_pages.extend(start..start + pages);
+            return Ok(start);
+        }
+
+        let cross = self
+            .cross_free
+            .iter()
+            .enumerate()
+            .filter(|(_, extent)| extent.pages >= pages)
+            .min_by_key(|(_, extent)| extent.pages)
+            .map(|(index, extent)| (index, extent.start_page, extent.pages, extent.freed_txn));
+        if let Some((index, start, len, freed_txn)) = cross {
+            self.cross_free.remove(index);
+            if len > pages {
+                self.cross_free.push(FreeExtent {
+                    start_page: start + pages,
+                    pages: len - pages,
+                    freed_txn,
+                });
+            }
             self.cross_allocated.push(FreeExtent {
                 start_page: start,
                 pages,
