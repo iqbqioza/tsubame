@@ -23,7 +23,7 @@ const CHECKSUM_OFFSET: usize = 64;
 pub(crate) const INLINE_COMMIT_CAPACITY: usize = 16;
 
 /// Bytes of a meta page that actually carry metadata.
-const ENCODED_LEN: usize = 80 + INLINE_COMMIT_CAPACITY * 16;
+pub(crate) const ENCODED_LEN: usize = 80 + INLINE_COMMIT_CAPACITY * 16;
 
 /// One inline commit descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

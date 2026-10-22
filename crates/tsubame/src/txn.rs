@@ -1187,6 +1187,31 @@ impl PageSource for RwTxn<'_> {
 }
 
 impl PageStore for RwTxn<'_> {
+    fn with_page<R>(&self, page_id: u64, visit: impl FnOnce(&Page<'_>) -> Result<R>) -> Result<R> {
+        let page = <Self as PageSource>::page(self, page_id)?;
+        visit(&page)
+    }
+
+    fn update_page<F>(&mut self, old_page_id: u64, new_page_id: u64, edit: F) -> Result<()>
+    where
+        F: FnOnce(&mut [u8; PAGE_SIZE]) -> Result<()>,
+    {
+        ensure!(
+            new_page_id >= 2 && new_page_id < self.next_page,
+            "page {new_page_id} is outside the transaction allocation range"
+        );
+        if self.state.has_write_mmap() {
+            self.state
+                .update_page_direct(old_page_id, new_page_id, edit)?;
+            self.dirty_pages.insert(new_page_id);
+        } else {
+            let mut page = self.read_page(old_page_id)?;
+            edit(&mut page)?;
+            self.write_page(new_page_id, page)?;
+        }
+        Ok(())
+    }
+
     fn read_page(&self, page_id: u64) -> Result<[u8; PAGE_SIZE]> {
         if let Some(page) = self.overlay.get(page_id) {
             return Ok(*page);
