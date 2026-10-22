@@ -12,7 +12,7 @@ use super::io;
 const MAGIC: [u8; 8] = *b"TSUBAME\0";
 
 /// The on-disk format version implemented by this crate.
-pub(crate) const FORMAT_VERSION: u32 = 3;
+pub(crate) const FORMAT_VERSION: u32 = 4;
 
 /// The number of meta slots stored at the start of the data file.
 const META_SLOTS: usize = 2;
@@ -47,7 +47,7 @@ pub(crate) struct Meta {
     pub(crate) page_count: u64,
     /// Number of named databases.
     pub(crate) database_count: u32,
-    /// Reserved flags. Must be zero in format version 3.
+    /// Reserved flags. Must be zero in format version 4.
     pub(crate) flags: u32,
     /// First page of the commit record chain, or 0 when there are no new pages.
     pub(crate) commit_record: u64,
@@ -108,7 +108,7 @@ impl Meta {
             LittleEndian::write_u64(&mut page[offset + 8..offset + 16], entry.page_count);
         }
 
-        let checksum = checksum_mod::hash(page);
+        let checksum = checksum_mod::hash(&page[..ENCODED_LEN]);
         LittleEndian::write_u32(&mut page[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4], checksum);
     }
 
@@ -121,13 +121,6 @@ impl Meta {
         );
         ensure!(&bytes[0..8] == MAGIC.as_slice(), "invalid meta magic");
 
-        let stored = LittleEndian::read_u32(&bytes[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4]);
-        let actual = checksum(bytes);
-        ensure!(
-            stored == actual,
-            "meta checksum mismatch (stored {stored:#010x}, computed {actual:#010x})"
-        );
-
         let version = LittleEndian::read_u32(&bytes[8..12]);
         ensure!(
             version == FORMAT_VERSION,
@@ -138,6 +131,13 @@ impl Meta {
         ensure!(
             page_size as usize == PAGE_SIZE,
             "unsupported page size {page_size}, expected {PAGE_SIZE}"
+        );
+
+        let stored = LittleEndian::read_u32(&bytes[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4]);
+        let actual = checksum(&bytes[..ENCODED_LEN]);
+        ensure!(
+            stored == actual,
+            "meta checksum mismatch (stored {stored:#010x}, computed {actual:#010x})"
         );
 
         let meta = Self {
@@ -258,7 +258,8 @@ fn validate_root(name: &str, root: u64, page_count: u64) -> Result<()> {
     Ok(())
 }
 
-/// Computes the checksum of a page with its checksum field treated as zero.
+/// Computes the checksum of the used meta prefix with its checksum field
+/// treated as zero.
 fn checksum(page: &[u8]) -> u32 {
     checksum_mod::hash_zeroed(page, CHECKSUM_OFFSET, CHECKSUM_OFFSET + 4)
 }

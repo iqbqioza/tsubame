@@ -66,7 +66,8 @@ impl CommitPage {
             LittleEndian::write_u64(&mut page[offset + 8..offset + 16], page_count);
         }
 
-        let checksum = checksum_mod::hash(&page);
+        let used_len = HEADER_SIZE + self.entries.len() * ENTRY_SIZE;
+        let checksum = checksum_mod::hash(&page[..used_len]);
         LittleEndian::write_u32(&mut page[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4], checksum);
 
         Ok(page)
@@ -83,13 +84,6 @@ impl CommitPage {
             "unsupported commit record version"
         );
 
-        let stored = LittleEndian::read_u32(&page[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4]);
-        let actual = checksum(page);
-        ensure!(
-            stored == actual,
-            "commit record checksum mismatch (stored {stored:#010x}, computed {actual:#010x})"
-        );
-
         let txn_id = LittleEndian::read_u64(&page[16..24]);
         ensure!(txn_id > 0, "commit record txn ID must be non-zero");
         let next_page = LittleEndian::read_u64(&page[24..32]);
@@ -101,6 +95,13 @@ impl CommitPage {
         ensure!(
             entry_count <= CAPACITY,
             "commit record has too many entries"
+        );
+        let used_len = HEADER_SIZE + entry_count * ENTRY_SIZE;
+        let stored = LittleEndian::read_u32(&page[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4]);
+        let actual = checksum(&page[..used_len]);
+        ensure!(
+            stored == actual,
+            "commit record checksum mismatch (stored {stored:#010x}, computed {actual:#010x})"
         );
 
         let mut entries = Vec::with_capacity(entry_count);

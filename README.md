@@ -176,7 +176,11 @@ The examples use a temporary directory and clean up after themselves.
   every open and offline compaction. A stable comparator ID is persisted in
   `comparator.tsubame` and must match. Prefix iteration requires lexicographic
   order.
-- The on-disk format is version 3. Earlier format versions are rejected and are
+- Writable environments preallocate the data file to `map_size` so committed
+  pages can be written through a writable mapping. The file is sparse on Unix,
+  but tools that copy the file may copy its logical size rather than its used
+  pages.
+- The on-disk format is version 4. Earlier format versions are rejected and are
   not migrated in place.
 - Performance is benchmarked rather than assumed; see [`benchmarks`](benchmarks).
 
