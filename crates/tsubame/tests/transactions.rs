@@ -163,6 +163,77 @@ fn environment_statistics_match_the_unnamed_database() -> Result<()> {
 }
 
 #[test]
+fn reserved_writes_fill_exact_buffers() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Bytes>(&mut wtxn, None)?;
+    let large = vec![0x5a; 10_000];
+
+    db.put_reserved(&mut wtxn, "large", large.len(), |reserved| {
+        assert_eq!(reserved.size(), large.len());
+        reserved.write_all(&large)
+    })?;
+    assert_eq!(db.get_rw(&wtxn, "large")?, Some(large.as_slice()));
+
+    assert_eq!(
+        db.get_or_put_reserved(&mut wtxn, "large", large.len(), |_| unreachable!())?,
+        Some(large.as_slice())
+    );
+    assert_eq!(
+        db.get_or_put_reserved(&mut wtxn, "new", 3, |reserved| {
+            reserved.write_all(b"new")
+        })?,
+        None
+    );
+    assert_eq!(db.get_rw(&wtxn, "new")?, Some(b"new".as_slice()));
+
+    assert!(
+        db.put_reserved(&mut wtxn, "short", 10, |reserved| {
+            reserved.write_all(b"short")
+        })
+        .is_err()
+    );
+    assert_eq!(db.get_rw(&wtxn, "short")?, None);
+
+    db.put_reserved(&mut wtxn, "zero-filled", 16, |reserved| {
+        reserved.write_all(b"prefix")?;
+        reserved.fill_zeroes();
+        Ok(())
+    })?;
+    assert_eq!(
+        db.get_rw(&wtxn, "zero-filled")?,
+        Some(b"prefix\0\0\0\0\0\0\0\0\0\0".as_slice())
+    );
+
+    assert!(
+        db.get_or_put_reserved_with_flags(&mut wtxn, PutFlags::APPEND, "flags", 1, |reserved| {
+            reserved.write_all(b"x")
+        })
+        .is_err()
+    );
+    assert_eq!(
+        db.get_or_put_reserved_with_flags(
+            &mut wtxn,
+            PutFlags::NO_OVERWRITE,
+            "flags",
+            1,
+            |reserved| { reserved.write_all(b"y") },
+        )?,
+        None
+    );
+    assert_eq!(db.get_rw(&wtxn, "flags")?, Some(b"y".as_slice()));
+
+    wtxn.commit()?;
+    let rtxn = env.read_txn()?;
+    assert_eq!(db.get(&rtxn, "large")?, Some(large.as_slice()));
+    assert_eq!(db.get(&rtxn, "new")?, Some(b"new".as_slice()));
+    assert_eq!(db.get(&rtxn, "short")?, None);
+
+    Ok(())
+}
+
+#[test]
 fn put_with_flags_honors_no_overwrite() -> Result<()> {
     let dir = tempdir()?;
     let env = options().open(dir.path())?;

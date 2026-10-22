@@ -65,6 +65,7 @@ added without changing the main API.
 - [x] Conditional insertion with `Database::get_or_put`
 - [x] Heed-compatible `PutFlags` and conditional writes
 - [x] Codec remapping for database handles
+- [x] Reserved-value writes with `ReservedSpace`
 - [x] Configurable multi-process reader slot limit
 
 ## Codec features
