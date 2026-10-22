@@ -49,6 +49,9 @@ All notable changes to this project are documented here.
   empty.
 - Point lookups with fixed-width integer keys avoid allocating an encoded key
   buffer on every `get`.
+- Staged pending keys up to 16 bytes are stored inline instead of allocating a
+  `Vec` per write, and bulk loading borrows staged keys instead of first
+  converting every key to an owned buffer.
 - Bulk loading builds leaf pages from borrowed entries instead of cloning
   every key and value.
 - Verified page reads bypass redundant header checks, and binary-search slot
