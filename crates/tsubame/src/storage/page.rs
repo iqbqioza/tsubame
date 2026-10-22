@@ -428,7 +428,9 @@ impl<'a> Page<'a> {
         if comparator.is_lexicographic() {
             while left < right {
                 let mid = (left + right) / 2;
-                if self.key_at(mid) <= key {
+                if crate::comparator::compare_lexicographic(self.key_at(mid), key)
+                    != Ordering::Greater
+                {
                     left = mid + 1;
                 } else {
                     right = mid;
