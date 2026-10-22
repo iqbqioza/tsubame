@@ -6,6 +6,7 @@
 
 use std::borrow::Cow;
 use std::fmt;
+use std::io;
 use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
@@ -19,6 +20,7 @@ use crate::iter::{
     RoIter, RoPrefix, RoRange, RoRevIter, RoRevPrefix, RoRevRange, RwIter, RwPrefix, RwRange,
     RwRevIter, RwRevPrefix, RwRevRange, prefix_successor,
 };
+use crate::reserved::ReservedSpace;
 use crate::storage::PAGE_SIZE;
 use crate::storage::btree;
 use crate::storage::page::MAX_KEY_SIZE;
@@ -28,6 +30,22 @@ use crate::txn::{RoTxn, RwTxn};
 /// Converts a codec error into an `anyhow` error with context.
 fn codec_error(context: &str, error: BoxedError) -> anyhow::Error {
     anyhow::anyhow!("{context}: {error}")
+}
+
+fn fill_reserved<F>(data_size: usize, write_func: F) -> Result<Vec<u8>>
+where
+    F: FnOnce(&mut ReservedSpace<'_>) -> io::Result<()>,
+{
+    let mut value = vec![0u8; data_size];
+    let mut reserved = ReservedSpace::new(&mut value);
+    write_func(&mut reserved)
+        .map_err(|error| anyhow::anyhow!("reserved value write failed: {error}"))?;
+    ensure!(
+        reserved.remaining() == 0,
+        "reserved value has {} unwritten bytes",
+        reserved.remaining()
+    );
+    Ok(value)
 }
 
 fn ensure_supported_put_flags(flags: PutFlags) -> Result<()> {
@@ -927,6 +945,125 @@ impl<KC, DC> Database<KC, DC> {
     {
         ensure_supported_put_flags(flags)?;
         self.get_or_put(txn, key, data)
+    }
+
+    /// Stores a value written by `write_func` under `key`.
+    ///
+    /// The closure receives a buffer of exactly `data_size` bytes and must fill
+    /// it completely. This avoids encoding the value through the value codec,
+    /// which is useful for large or externally serialized values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key cannot be encoded, the closure fails or
+    /// leaves bytes unwritten, or the transaction cannot stage the write. A
+    /// staging failure marks the transaction as failed; closure errors leave
+    /// it usable.
+    pub fn put_reserved<'a, F>(
+        &self,
+        txn: &mut RwTxn<'_>,
+        key: &'a KC::EItem,
+        data_size: usize,
+        write_func: F,
+    ) -> Result<()>
+    where
+        KC: BytesEncode<'a>,
+        F: FnOnce(&mut ReservedSpace<'_>) -> io::Result<()>,
+    {
+        ensure!(
+            txn.belongs_to(&self.env),
+            "transaction belongs to a different environment"
+        );
+
+        let mut key_buffer = [0u8; KEY_ENCODE_BUFFER];
+        let key = encode_key::<KC>(key, &mut key_buffer)?;
+        ensure!(
+            key.as_slice().len() <= MAX_KEY_SIZE,
+            "key is {} bytes, maximum is {MAX_KEY_SIZE}",
+            key.as_slice().len()
+        );
+        let value = fill_reserved(data_size, write_func)?;
+        let result = txn.put_raw(self.kind.clone(), key.as_slice(), &value);
+        if result.is_err() {
+            txn.mark_failed();
+        }
+        result
+    }
+
+    /// Inserts a value written by `write_func` only when `key` is absent,
+    /// returning the previous value.
+    ///
+    /// This is the reserved-space equivalent of [`Database::get_or_put`]. The
+    /// closure is not called when the key already exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key cannot be encoded, the value cannot be
+    /// decoded, the closure fails or leaves bytes unwritten, or the
+    /// transaction cannot stage the write.
+    pub fn get_or_put_reserved<'a, 'txn, F>(
+        &self,
+        txn: &'txn mut RwTxn<'_>,
+        key: &'a KC::EItem,
+        data_size: usize,
+        write_func: F,
+    ) -> Result<Option<DC::DItem>>
+    where
+        KC: BytesEncode<'a>,
+        DC: BytesDecode<'txn>,
+        F: FnOnce(&mut ReservedSpace<'_>) -> io::Result<()>,
+    {
+        ensure!(
+            txn.belongs_to(&self.env),
+            "transaction belongs to a different environment"
+        );
+
+        if self.contains_rw(txn, key)? {
+            return self.get_rw(txn, key);
+        }
+
+        let mut key_buffer = [0u8; KEY_ENCODE_BUFFER];
+        let key = encode_key::<KC>(key, &mut key_buffer)?;
+        ensure!(
+            key.as_slice().len() <= MAX_KEY_SIZE,
+            "key is {} bytes, maximum is {MAX_KEY_SIZE}",
+            key.as_slice().len()
+        );
+        let value = fill_reserved(data_size, write_func)?;
+        let result = txn.put_raw(self.kind.clone(), key.as_slice(), &value);
+        if result.is_err() {
+            txn.mark_failed();
+            return result.map(|()| None);
+        }
+        Ok(None)
+    }
+
+    /// Inserts a value written by `write_func` only when `key` is absent,
+    /// applying supported write flags.
+    ///
+    /// [`PutFlags::NO_OVERWRITE`] is implicit. Unsupported flags return an
+    /// error without invoking the closure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a flag is unsupported, a codec fails, the closure
+    /// fails or leaves bytes unwritten, or the transaction cannot stage the
+    /// write.
+    pub fn get_or_put_reserved_with_flags<'a, 'txn, F>(
+        &self,
+        txn: &'txn mut RwTxn<'_>,
+        flags: PutFlags,
+        key: &'a KC::EItem,
+        data_size: usize,
+        write_func: F,
+    ) -> Result<Option<DC::DItem>>
+    where
+        KC: BytesEncode<'a>,
+        DC: BytesDecode<'txn>,
+        F: FnOnce(&mut ReservedSpace<'_>) -> io::Result<()>,
+    {
+        ensure_supported_put_flags(flags)?;
+        self.get_or_put_reserved(txn, key, data_size, write_func)
     }
 
     /// Deletes the entry stored under `key`.
