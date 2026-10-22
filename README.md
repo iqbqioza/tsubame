@@ -61,6 +61,7 @@ added without changing the main API.
 - [x] Database structural statistics
 - [x] Environment statistics and `Env::non_free_pages_size`
 - [x] Allocated-size reporting with `Env::real_disk_size`
+- [x] On-demand stale reader cleanup with `Env::clear_stale_readers`
 - [x] Heed-style write-transaction iterator aliases and `Env::force_sync`
 - [x] Range deletion with `Database::delete_range`
 - [x] Conditional insertion with `Database::get_or_put`
@@ -157,8 +158,9 @@ The examples use a temporary directory and clean up after themselves.
   cross-process readers, and `EnvOpenOptions::max_readers` can lower the
   per-environment limit. Stale slots left by a crashed reader conservatively
   block reuse while another environment remains open; a multi-process writer
-  clears them once it can acquire the lifecycle lock exclusively, and offline
-  compaction always clears them. Read-only environments therefore need write
+  clears them once it can acquire the lifecycle lock exclusively, or on demand
+  through `Env::clear_stale_readers`, and offline compaction always clears
+  them. Read-only environments therefore need write
   access to their directory for the registry sidecar.
 - Freed pages are reused across transactions once the two recoverable meta
   snapshots no longer reference them and no active reader, in any process, can

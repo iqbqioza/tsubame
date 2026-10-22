@@ -41,6 +41,8 @@ All notable changes to this project are documented here.
 - `EnvOpenOptions::max_readers` and `Env::max_readers` configure the number of
   read-only transaction slots used by multi-process readers. The limit is also
   exposed through `EnvInfo`.
+- `Env::clear_stale_readers` clears stale cross-process reader slots when the
+  calling writable multi-process environment is the only one open.
 - `Env::real_disk_size` reports the data file's allocated bytes on disk.
 - `Env::stat` reports the same structural statistics for the unnamed
   database, with `Env::non_free_pages_size` and `Env::max_key_size` helpers.
