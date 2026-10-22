@@ -853,6 +853,32 @@ fn write_txn_ranges_match_btreemap() -> Result<()> {
 }
 
 #[test]
+fn write_txn_large_pending_reads_and_updates() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+    for round in 0..2u32 {
+        for i in 0..1000u32 {
+            db.put(&mut wtxn, &format!("key-{i:04}"), &format!("round-{round}"))?;
+        }
+        if round == 0 {
+            assert_eq!(db.get_rw(&wtxn, "key-0500")?, Some("round-0"));
+        }
+    }
+    assert_eq!(db.get_rw(&wtxn, "key-0500")?, Some("round-1"));
+    db.put(&mut wtxn, "key-0500", "updated")?;
+    assert_eq!(db.get_rw(&wtxn, "key-0500")?, Some("updated"));
+    assert_eq!(db.iter_rw(&wtxn)?.count(), 1000);
+    wtxn.commit()?;
+
+    let rtxn = env.read_txn()?;
+    assert_eq!(db.get(&rtxn, "key-0500")?, Some("updated"));
+    assert_eq!(db.iter(&rtxn)?.count(), 1000);
+    Ok(())
+}
+
+#[test]
 fn write_txn_iteration_after_clear() -> Result<()> {
     let dir = tempdir()?;
     let env = options().open(dir.path())?;
