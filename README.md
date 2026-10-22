@@ -140,9 +140,11 @@ The examples use a temporary directory and clean up after themselves.
   `multi_process(true)`. Readers advertise their snapshots through
   `readers.tsubame`, and the writer only recycles pages that no advertised
   snapshot can still need. The registry supports up to 4096 simultaneous
-  cross-process readers; stale slots left by a crashed reader conservatively
-  block reuse until offline compaction clears them. Read-only environments
-  therefore need write access to their directory for the registry sidecar.
+  cross-process readers. Stale slots left by a crashed reader conservatively
+  block reuse while another environment remains open; a multi-process writer
+  clears them once it is the only environment, and offline compaction always
+  clears them. Read-only environments therefore need write access to their
+  directory for the registry sidecar.
 - Freed pages are reused across transactions once the two recoverable meta
   snapshots no longer reference them and no active reader, in any process, can
   still observe them. Readers reserve a registry slot before loading a
