@@ -7,7 +7,7 @@
 use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, MutexGuard};
+use std::sync::{Arc, MutexGuard, OnceLock};
 
 use anyhow::{Context, Result, bail, ensure};
 
@@ -157,6 +157,7 @@ impl AsRef<[u8]> for PendingValue {
 const INLINE_PENDING_KEY: usize = 16;
 
 /// A staged key that stays inline for short keys such as fixed-width integers.
+#[derive(Clone)]
 enum PendingKey {
     Inline {
         bytes: [u8; INLINE_PENDING_KEY],
@@ -219,10 +220,30 @@ impl Ord for PendingKey {
     }
 }
 
+const UNORDERED_PENDING_THRESHOLD: usize = 1024;
+
+struct UnorderedPending {
+    entries: Vec<(PendingKey, Option<PendingValue>, usize)>,
+    materialized: OnceLock<BTreeMap<PendingKey, Option<PendingValue>>>,
+}
+
+impl UnorderedPending {
+    fn materialized(&self) -> &BTreeMap<PendingKey, Option<PendingValue>> {
+        self.materialized.get_or_init(|| {
+            let mut map = BTreeMap::new();
+            for (key, value, _) in &self.entries {
+                map.insert(key.clone(), value.clone());
+            }
+            map
+        })
+    }
+}
+
 enum Pending {
     Empty,
     One(PendingKey, Option<PendingValue>),
     Map(BTreeMap<PendingKey, Option<PendingValue>>),
+    Unordered(UnorderedPending),
 }
 
 impl Pending {
@@ -245,7 +266,27 @@ impl Pending {
             }
             Self::Map(mut map) => {
                 map.insert(key, value);
-                *self = Self::Map(map);
+                if map.len() >= UNORDERED_PENDING_THRESHOLD {
+                    let entries = map
+                        .into_iter()
+                        .enumerate()
+                        .map(|(sequence, (key, value))| (key, value, sequence))
+                        .collect();
+                    *self = Self::Unordered(UnorderedPending {
+                        entries,
+                        materialized: OnceLock::new(),
+                    });
+                } else {
+                    *self = Self::Map(map);
+                }
+            }
+            Self::Unordered(mut pending) => {
+                let sequence = pending.entries.len();
+                if let Some(map) = pending.materialized.get_mut() {
+                    map.insert(key.clone(), value.clone());
+                }
+                pending.entries.push((key, value, sequence));
+                *self = Self::Unordered(pending);
             }
         }
     }
@@ -258,10 +299,14 @@ impl Pending {
             Self::Map(map) => map
                 .get(key)
                 .map(|value| value.as_ref().map(PendingValue::as_slice)),
+            Self::Unordered(pending) => pending
+                .materialized()
+                .get(key)
+                .map(|value| value.as_ref().map(PendingValue::as_slice)),
         }
     }
 
-    fn iter(&self) -> PendingIter<'_> {
+    fn iter(&self, _comparator: KeyComparator) -> PendingIter<'_> {
         match self {
             Self::Empty => Box::new(std::iter::empty()),
             Self::One(key, value) => Box::new(std::iter::once((
@@ -273,10 +318,15 @@ impl Pending {
                     (key.as_slice(), value.as_ref().map(PendingValue::as_slice))
                 }))
             }
+            Self::Unordered(pending) => {
+                Box::new(pending.materialized().iter().map(|(key, value)| {
+                    (key.as_slice(), value.as_ref().map(PendingValue::as_slice))
+                }))
+            }
         }
     }
 
-    fn iter_rev(&self) -> PendingRevIter<'_> {
+    fn iter_rev(&self, _comparator: KeyComparator) -> PendingRevIter<'_> {
         match self {
             Self::Empty => Box::new(std::iter::empty()),
             Self::One(key, value) => Box::new(std::iter::once((
@@ -288,8 +338,72 @@ impl Pending {
                     (key.as_slice(), value.as_ref().map(PendingValue::as_slice))
                 }))
             }
+            Self::Unordered(pending) => {
+                Box::new(pending.materialized().iter().rev().map(|(key, value)| {
+                    (key.as_slice(), value.as_ref().map(PendingValue::as_slice))
+                }))
+            }
         }
     }
+}
+
+fn fixed_key_u64(key: &[u8]) -> u64 {
+    let mut bytes = [0u8; 8];
+    bytes[..key.len()].copy_from_slice(key);
+    u64::from_be_bytes(bytes)
+}
+
+fn sort_unordered_entries(
+    entries: &mut [(PendingKey, Option<PendingValue>, usize)],
+    comparator: KeyComparator,
+) {
+    if comparator.is_lexicographic()
+        && let Some((first, rest)) = entries.split_first()
+    {
+        let key_len = first.0.as_slice().len();
+        let same_length = rest.iter().all(|entry| entry.0.as_slice().len() == key_len);
+        if same_length && key_len <= 8 {
+            entries.sort_by_cached_key(|entry| (fixed_key_u64(entry.0.as_slice()), entry.2));
+            return;
+        }
+        if same_length && key_len == 16 {
+            entries.sort_by_cached_key(|entry| {
+                let mut key = [0u8; 16];
+                key.copy_from_slice(entry.0.as_slice());
+                (u128::from_be_bytes(key), entry.2)
+            });
+            return;
+        }
+    }
+
+    if comparator.is_lexicographic() {
+        entries.sort_unstable_by(|left, right| {
+            left.0.cmp(&right.0).then_with(|| left.2.cmp(&right.2))
+        });
+    } else {
+        entries.sort_unstable_by(|left, right| {
+            comparator
+                .compare(left.0.as_slice(), right.0.as_slice())
+                .then_with(|| left.2.cmp(&right.2))
+        });
+    }
+}
+
+fn deduplicate_unordered(
+    entries: Vec<(PendingKey, Option<PendingValue>, usize)>,
+) -> Vec<(PendingKey, Option<PendingValue>)> {
+    let mut deduplicated: Vec<(PendingKey, Option<PendingValue>)> =
+        Vec::with_capacity(entries.len());
+    for (key, value, _) in entries {
+        if let Some((last_key, last_value)) = deduplicated.last_mut()
+            && *last_key == key
+        {
+            *last_value = value;
+            continue;
+        }
+        deduplicated.push((key, value));
+    }
+    deduplicated
 }
 
 pub(crate) type PendingIter<'a> = Box<dyn Iterator<Item = (&'a [u8], Option<&'a [u8]>)> + 'a>;
@@ -585,11 +699,11 @@ impl<'env> RwTxn<'env> {
         comparator: KeyComparator,
     ) -> PendingIter<'a> {
         let pending: PendingIter<'a> = match kind {
-            DatabaseKind::Unnamed => self.unnamed_pending.iter(),
+            DatabaseKind::Unnamed => self.unnamed_pending.iter(comparator),
             DatabaseKind::Named(name) => self
                 .named_pending
                 .get(name.as_ref())
-                .map(Pending::iter)
+                .map(|pending| pending.iter(comparator))
                 .unwrap_or_else(|| Box::new(std::iter::empty())),
         };
         sort_pending(pending, comparator, false)
@@ -601,11 +715,11 @@ impl<'env> RwTxn<'env> {
         comparator: KeyComparator,
     ) -> PendingRevIter<'a> {
         let pending: PendingRevIter<'a> = match kind {
-            DatabaseKind::Unnamed => self.unnamed_pending.iter_rev(),
+            DatabaseKind::Unnamed => self.unnamed_pending.iter_rev(comparator),
             DatabaseKind::Named(name) => self
                 .named_pending
                 .get(name.as_ref())
-                .map(Pending::iter_rev)
+                .map(|pending| pending.iter_rev(comparator))
                 .unwrap_or_else(|| Box::new(std::iter::empty())),
         };
         sort_pending(pending, comparator, true)
@@ -837,6 +951,24 @@ impl<'env> RwTxn<'env> {
         match pending {
             Pending::Empty => Ok(()),
             Pending::One(key, value) => self.apply_one(root, key, value, comparator),
+            Pending::Unordered(mut pending) => {
+                sort_unordered_entries(&mut pending.entries, comparator);
+                let mut entries = deduplicate_unordered(pending.entries);
+                if *root == 0 && entries.len() >= BULK_LOAD_THRESHOLD {
+                    let entries: Vec<(PendingKey, PendingValue)> = entries
+                        .drain(..)
+                        .filter_map(|(key, value)| value.map(|value| (key, value)))
+                        .collect();
+                    if !entries.is_empty() {
+                        *root = btree::bulk_load_with(self, &entries, self.txn_id, &comparator)?;
+                    }
+                    return Ok(());
+                }
+                for (key, value) in entries {
+                    self.apply_one(root, key, value, comparator)?;
+                }
+                Ok(())
+            }
             Pending::Map(pending) => {
                 if *root == 0 && pending.len() >= BULK_LOAD_THRESHOLD {
                     let mut entries: Vec<(PendingKey, PendingValue)> = pending
