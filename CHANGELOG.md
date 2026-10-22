@@ -20,6 +20,8 @@ All notable changes to this project are documented here.
 - `Database::first`, `last`, `len`, and `is_empty` inspection helpers, plus
   `first_rw`, `last_rw`, `len_rw`, and `is_empty_rw` for staged transaction
   views.
+- `Database::stat` reports page size, depth, branch/leaf/overflow page counts,
+  and entry count for a database snapshot.
 - `Database::get_greater_than`, `get_greater_than_or_equal_to`,
   `get_lower_than`, and `get_lower_than_or_equal_to` directional lookups.
 - `Env::copy_to_path` creates a consistent backup of the committed snapshot

@@ -78,6 +78,35 @@ fn copy_to_path_creates_a_consistent_backup() -> Result<()> {
 }
 
 #[test]
+fn database_stat_reports_tree_structure() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Bytes>(&mut wtxn, None)?;
+    assert_eq!(db.stat(&env.read_txn()?)?.entries, 0);
+    for i in 0..1_000u32 {
+        db.put(
+            &mut wtxn,
+            &format!("key-{i:04}"),
+            format!("value-{i}").as_bytes(),
+        )?;
+    }
+    db.put(&mut wtxn, "large", vec![0x5a; 10_000].as_slice())?;
+    wtxn.commit()?;
+
+    let rtxn = env.read_txn()?;
+    let stat = db.stat(&rtxn)?;
+    assert_eq!(stat.page_size, 4096);
+    assert_eq!(stat.entries, 1_001);
+    assert!(stat.depth >= 2, "unexpected depth {}", stat.depth);
+    assert!(stat.leaf_pages > 0);
+    assert!(stat.branch_pages > 0);
+    assert!(stat.overflow_pages >= 3);
+
+    Ok(())
+}
+
+#[test]
 fn directional_lookups_follow_key_order() -> Result<()> {
     let dir = tempdir()?;
     let env = options().open(dir.path())?;

@@ -169,6 +169,63 @@ fn free_tree_inner<S: PageStore>(
     store.free_pages(page_id, 1)
 }
 
+/// Structural statistics for one B+tree.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TreeStat {
+    pub(crate) depth: usize,
+    pub(crate) branch_pages: u64,
+    pub(crate) leaf_pages: u64,
+    pub(crate) overflow_pages: u64,
+    pub(crate) entries: u64,
+}
+
+/// Walks a tree and returns its structural statistics.
+pub(crate) fn stat<S: PageSource>(source: &S, root: u64) -> Result<TreeStat> {
+    let mut stat = TreeStat::default();
+    if root == 0 {
+        return Ok(stat);
+    }
+    let mut visited = BTreeSet::new();
+    stat_into(source, root, 1, &mut stat, &mut visited)?;
+    Ok(stat)
+}
+
+fn stat_into<S: PageSource>(
+    source: &S,
+    page_id: u64,
+    depth: usize,
+    stat: &mut TreeStat,
+    visited: &mut BTreeSet<u64>,
+) -> Result<()> {
+    ensure!(depth < MAX_DEPTH, "B+tree depth exceeded {MAX_DEPTH}");
+    ensure!(
+        visited.insert(page_id),
+        "tree references page {page_id} more than once"
+    );
+    stat.depth = stat.depth.max(depth);
+    let page = source.page(page_id)?;
+    match page.page_type() {
+        PageType::Branch => {
+            stat.branch_pages = stat.branch_pages.saturating_add(1);
+            for index in 0..page.slot_count() {
+                stat_into(source, page.child(index)?, depth + 1, stat, visited)?;
+            }
+        }
+        PageType::Leaf => {
+            stat.leaf_pages = stat.leaf_pages.saturating_add(1);
+            stat.entries = stat
+                .entries
+                .saturating_add(u64::try_from(page.slot_count()).context("too many entries")?);
+            for index in 0..page.slot_count() {
+                if let LeafValue::Overflow(reference) = page.leaf_value(index)? {
+                    stat.overflow_pages = stat.overflow_pages.saturating_add(reference.page_count);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Inserts or replaces `key` and returns the new root page ID.
 pub(crate) fn insert<S: PageStore>(
     store: &mut S,
