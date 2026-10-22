@@ -41,6 +41,9 @@ All notable changes to this project are documented here.
 - A multi-process writer clears stale reader registry state when it can acquire
   the lifecycle lock exclusively, so crashed read-only processes do not block
   page reuse or online compaction indefinitely.
+- Reopening a multi-process writer advances the reader generation, so existing
+  read-only environments remap after a compaction interrupted before its
+  generation was published.
 
 ### Performance
 

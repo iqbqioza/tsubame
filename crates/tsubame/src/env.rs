@@ -1632,6 +1632,11 @@ impl EnvOpenOptions {
 
         if self.multi_process && !self.read_only {
             reset_registry_if_solo(&lock, &reader_slots, 0)?;
+            // A writer restart can follow a crashed online compaction after
+            // the data file was renamed but before the generation was stored.
+            // Advancing the generation makes existing read-only environments
+            // remap the current file on their next read transaction.
+            reader_slots.fetch_add(GENERATION_INDEX, 1, Ordering::AcqRel);
         }
         reader_slots.fetch_add(ENV_COUNT_INDEX, 1, Ordering::AcqRel);
 
