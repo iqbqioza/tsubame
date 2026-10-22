@@ -49,6 +49,8 @@ type TsubameLargeDb = tsubame::Database<TsubameU64<TsubameEndian>, TsubameBytes>
 type HeedLargeDb = heed::Database<HeedU64<HeedEndian>, HeedBytes>;
 type TsubamePrefixDb = tsubame::Database<TsubameStr, TsubameStr>;
 type HeedPrefixDb = heed::Database<HeedStr, HeedStr>;
+type TsubameMixedDb = tsubame::Database<TsubameStr, TsubameStr>;
+type HeedMixedDb = heed::Database<HeedStr, HeedStr>;
 
 #[derive(Clone, Copy)]
 struct Report {
@@ -59,6 +61,7 @@ struct Report {
     prefix: Duration,
     commit: Duration,
     delete: Duration,
+    mixed: Duration,
     first_write: Duration,
     large_insert: Duration,
     large_read: Duration,
@@ -84,6 +87,34 @@ fn main() -> Result<()> {
                 println!(
                     "heed commit median: {:.2} us/op",
                     duration.as_secs_f64() * 1_000_000.0
+                );
+                return Ok(());
+            }
+            "tsubame-mixed" => {
+                let duration = bench_tsubame_mixed()?;
+                println!("tsubame mixed: {:.3} ms", duration.as_secs_f64() * 1_000.0);
+                return Ok(());
+            }
+            "heed-mixed" => {
+                let duration = bench_heed_mixed()?;
+                println!("heed mixed: {:.3} ms", duration.as_secs_f64() * 1_000.0);
+                return Ok(());
+            }
+            "tsubame-large" => {
+                let (insert, read) = bench_tsubame_large()?;
+                println!(
+                    "tsubame large insert: {:.3} ms read: {:.2} ns/op",
+                    insert.as_secs_f64() * 1_000.0,
+                    read.as_secs_f64() * 1_000_000_000.0 / LARGE_ENTRIES as f64
+                );
+                return Ok(());
+            }
+            "heed-large" => {
+                let (insert, read) = bench_heed_large()?;
+                println!(
+                    "heed large insert: {:.3} ms read: {:.2} ns/op",
+                    insert.as_secs_f64() * 1_000.0,
+                    read.as_secs_f64() * 1_000_000_000.0 / LARGE_ENTRIES as f64
                 );
                 return Ok(());
             }
@@ -158,6 +189,13 @@ fn main() -> Result<()> {
         "us/op",
     );
     print_row("bulk delete (1 txn)", tsubame.delete, heed.delete, 1, "ms");
+    print_row(
+        "mixed updates+deletes (1 txn)",
+        tsubame.mixed,
+        heed.mixed,
+        1,
+        "ms",
+    );
     print_row("reopen", tsubame.reopen, heed.reopen, 1, "ms");
     print_row(
         "startup writes (1000)",
@@ -201,6 +239,7 @@ fn median_report(reports: &[Report]) -> Report {
         prefix: median(reports.iter().map(|report| report.prefix).collect()),
         commit: median(reports.iter().map(|report| report.commit).collect()),
         delete: median(reports.iter().map(|report| report.delete).collect()),
+        mixed: median(reports.iter().map(|report| report.mixed).collect()),
         first_write: median(reports.iter().map(|report| report.first_write).collect()),
         large_insert: median(reports.iter().map(|report| report.large_insert).collect()),
         large_read: median(reports.iter().map(|report| report.large_read).collect()),
@@ -276,6 +315,7 @@ fn run_tsubame() -> Result<Report> {
     let prefix = bench_tsubame_prefix()?;
     let commit = bench_tsubame_commit(dir.path(), &mut options)?;
     let delete = bench_tsubame_delete(dir.path(), &mut options)?;
+    let mixed = bench_tsubame_mixed()?;
     let first_write = bench_tsubame_startup(dir.path(), &mut options)?;
 
     Ok(Report {
@@ -286,6 +326,7 @@ fn run_tsubame() -> Result<Report> {
         prefix,
         commit,
         delete,
+        mixed,
         first_write,
         large_insert,
         large_read,
@@ -323,6 +364,43 @@ fn bench_tsubame_delete(path: &std::path::Path, options: &mut TsubameOptions) ->
     let mut wtxn = env.write_txn()?;
     for i in (0..config.entries).step_by(2) {
         db.delete(&mut wtxn, &i)?;
+    }
+    wtxn.commit()?;
+    Ok(start.elapsed())
+}
+
+fn bench_tsubame_mixed() -> Result<Duration> {
+    let config = config();
+    let updates = (config.entries / 5).max(1);
+    let deletes = (config.entries / 5).max(1);
+    let dir = tempdir()?;
+    let mut options = TsubameOptions::new();
+    options.map_size(MAP_SIZE);
+    let env = options.open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db: TsubameMixedDb = env.create_database(&mut wtxn, None)?;
+    for i in 0..config.entries {
+        db.put(&mut wtxn, &format!("key-{i:06}"), &format!("value-{i:08}"))?;
+    }
+    wtxn.commit()?;
+
+    let keys: Vec<String> = (0..config.entries).map(|i| format!("key-{i:06}")).collect();
+    let updated_values: Vec<String> = (0..updates)
+        .map(|i| format!("updated-{i:08}-{}", "x".repeat(64)))
+        .collect();
+    let delete_start = config.entries - deletes;
+
+    let start = Instant::now();
+    let mut wtxn = env.write_txn()?;
+    for i in 0..updates {
+        db.put(
+            &mut wtxn,
+            keys[i as usize].as_str(),
+            updated_values[i as usize].as_str(),
+        )?;
+    }
+    for i in delete_start..config.entries {
+        db.delete(&mut wtxn, keys[i as usize].as_str())?;
     }
     wtxn.commit()?;
     Ok(start.elapsed())
@@ -406,6 +484,7 @@ fn run_heed() -> Result<Report> {
     let prefix = bench_heed_prefix()?;
     let commit = bench_heed_commit(dir.path())?;
     let delete = bench_heed_delete(dir.path())?;
+    let mixed = bench_heed_mixed()?;
     let first_write = bench_heed_startup(dir.path())?;
 
     Ok(Report {
@@ -416,6 +495,7 @@ fn run_heed() -> Result<Report> {
         prefix,
         commit,
         delete,
+        mixed,
         first_write,
         large_insert,
         large_read,
@@ -483,6 +563,47 @@ fn bench_tsubame_startup(path: &std::path::Path, options: &mut TsubameOptions) -
         db.put(&mut wtxn, &i, "startup-write")?;
         wtxn.commit()?;
     }
+    Ok(start.elapsed())
+}
+
+fn bench_heed_mixed() -> Result<Duration> {
+    let config = config();
+    let updates = (config.entries / 5).max(1);
+    let deletes = (config.entries / 5).max(1);
+    let dir = tempdir()?;
+    // SAFETY: this benchmark owns the directory.
+    let env = unsafe {
+        HeedOptions::new()
+            .map_size(MAP_SIZE)
+            .max_dbs(1)
+            .open(dir.path())?
+    };
+    let mut wtxn = env.write_txn()?;
+    let db: HeedMixedDb = env.create_database(&mut wtxn, None)?;
+    for i in 0..config.entries {
+        db.put(&mut wtxn, &format!("key-{i:06}"), &format!("value-{i:08}"))?;
+    }
+    wtxn.commit()?;
+
+    let keys: Vec<String> = (0..config.entries).map(|i| format!("key-{i:06}")).collect();
+    let updated_values: Vec<String> = (0..updates)
+        .map(|i| format!("updated-{i:08}-{}", "x".repeat(64)))
+        .collect();
+    let delete_start = config.entries - deletes;
+
+    let start = Instant::now();
+    let mut wtxn = env.write_txn()?;
+    for i in 0..updates {
+        db.put(
+            &mut wtxn,
+            keys[i as usize].as_str(),
+            updated_values[i as usize].as_str(),
+        )?;
+    }
+    for i in delete_start..config.entries {
+        db.delete(&mut wtxn, keys[i as usize].as_str())?;
+    }
+    wtxn.commit()?;
     Ok(start.elapsed())
 }
 

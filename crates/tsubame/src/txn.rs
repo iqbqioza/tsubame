@@ -29,6 +29,7 @@ use crate::storage::{PAGE_SIZE, PageSet, io};
 /// build the tree bottom-up instead of inserting one path at a time.
 const BULK_LOAD_THRESHOLD: usize = 1024;
 const BULK_LOAD_BYTES: usize = 1 << 20;
+const BULK_APPLY_THRESHOLD: usize = 8 * 1024;
 
 /// Maximum number of contiguous overlay pages combined into one write.
 const WRITE_BATCH_PAGES: u64 = 256;
@@ -466,12 +467,13 @@ fn sort_unordered_entries(
 
 fn deduplicate_unordered(
     entries: Vec<(PendingKey, Option<PendingValue>, usize)>,
+    comparator: KeyComparator,
 ) -> Vec<(PendingKey, Option<PendingValue>)> {
     let mut deduplicated: Vec<(PendingKey, Option<PendingValue>)> =
         Vec::with_capacity(entries.len());
     for (key, value, _) in entries {
         if let Some((last_key, last_value)) = deduplicated.last_mut()
-            && *last_key == key
+            && comparator.compare(last_key.as_slice(), key.as_slice()) == Ordering::Equal
         {
             *last_value = value;
             continue;
@@ -1131,13 +1133,21 @@ impl<'env> RwTxn<'env> {
             Pending::One(key, value) => self.apply_one(root, key, value, comparator),
             Pending::Unordered(mut pending) => {
                 sort_unordered_entries(&mut pending.entries, comparator);
-                let mut entries = deduplicate_unordered(pending.entries);
+                let mut entries = deduplicate_unordered(pending.entries, comparator);
                 if *root != 0
                     && entries.len() >= BULK_LOAD_THRESHOLD
                     && entries.iter().all(|(_, value)| value.is_none())
                 {
                     let keys: Vec<PendingKey> = entries.into_iter().map(|(key, _)| key).collect();
                     *root = btree::bulk_delete_with(self, *root, &keys, self.txn_id, &comparator)?;
+                    return Ok(());
+                }
+                if *root != 0
+                    && entries.len() >= BULK_APPLY_THRESHOLD
+                    && entries.iter().any(|(_, value)| value.is_some())
+                {
+                    *root =
+                        btree::bulk_apply_with(self, *root, &entries, self.txn_id, &comparator)?;
                     return Ok(());
                 }
                 if *root != 0 && entries.len() >= BULK_LOAD_THRESHOLD {

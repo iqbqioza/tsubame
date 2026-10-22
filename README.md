@@ -219,7 +219,8 @@ See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 The standalone [`benchmarks`](benchmarks) crate compares Tsubame with heed on
 batch inserts, point reads, forward/reverse/prefix scans, large values, durable
-commit latency, startup writes, bulk deletes, and reopen time:
+commit latency, startup writes, bulk deletes, mixed update/delete batches, and
+reopen time:
 
 ```sh
 cd benchmarks

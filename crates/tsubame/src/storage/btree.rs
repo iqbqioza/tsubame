@@ -335,23 +335,50 @@ struct OwnedLeafEntry {
     value: OwnedValue,
 }
 
+const INLINE_OWNED_VALUE: usize = 96;
+
 #[derive(Debug, Clone)]
 enum OwnedValue {
-    Inline(Vec<u8>),
+    Inline {
+        bytes: [u8; INLINE_OWNED_VALUE],
+        len: u8,
+    },
+    Owned(Vec<u8>),
     Overflow(OverflowRef),
 }
 
 impl OwnedValue {
+    fn inline(bytes: &[u8]) -> Self {
+        if bytes.len() <= INLINE_OWNED_VALUE {
+            let mut inline = [0u8; INLINE_OWNED_VALUE];
+            inline[..bytes.len()].copy_from_slice(bytes);
+            Self::Inline {
+                bytes: inline,
+                len: bytes.len() as u8,
+            }
+        } else {
+            Self::Owned(bytes.to_vec())
+        }
+    }
+
+    fn inline_slice(&self) -> &[u8] {
+        match self {
+            Self::Inline { bytes, len } => &bytes[..*len as usize],
+            Self::Owned(value) => value,
+            Self::Overflow(_) => &[],
+        }
+    }
+
     fn encoded_len(&self) -> usize {
         match self {
-            Self::Inline(value) => value.len(),
+            Self::Inline { .. } | Self::Owned(_) => self.inline_slice().len(),
             Self::Overflow(_) => overflow::OVERFLOW_REF_SIZE,
         }
     }
 
     fn as_leaf_value(&self) -> LeafValue<'_> {
         match self {
-            Self::Inline(value) => LeafValue::Inline(value),
+            Self::Inline { .. } | Self::Owned(_) => LeafValue::Inline(self.inline_slice()),
             Self::Overflow(reference) => LeafValue::Overflow(*reference),
         }
     }
@@ -691,7 +718,7 @@ fn collect_leaf(page: &Page<'_>) -> Result<Vec<OwnedLeafEntry>> {
     for index in 0..page.slot_count() {
         let (key, value) = page.leaf_entry(index)?;
         let value = match value {
-            LeafValue::Inline(value) => OwnedValue::Inline(value.to_vec()),
+            LeafValue::Inline(value) => OwnedValue::inline(value),
             LeafValue::Overflow(reference) => OwnedValue::Overflow(reference),
         };
         entries.push(OwnedLeafEntry {
@@ -702,7 +729,7 @@ fn collect_leaf(page: &Page<'_>) -> Result<Vec<OwnedLeafEntry>> {
     Ok(entries)
 }
 
-fn collect_branch(page: &Page<'_>) -> Result<Vec<(Vec<u8>, u64)>> {
+fn collect_branch(page: &Page<'_>) -> Result<Vec<ChildPage>> {
     let mut entries = Vec::with_capacity(page.slot_count());
     for index in 0..page.slot_count() {
         entries.push((page.key(index)?.to_vec(), page.child(index)?));
@@ -949,6 +976,327 @@ fn bulk_delete_branch<S: PageStore, K: AsRef<[u8]>>(
     Ok(Some(new_page))
 }
 
+type ChildPage = (Vec<u8>, u64);
+type ChangedChildren = Option<Vec<ChildPage>>;
+
+/// Applies sorted, unique changes to a tree in one bottom-up pass.
+///
+/// Leaves are rewritten once per affected page and branch pages are rebuilt
+/// from the resulting child list. This is used for large mixed write batches.
+pub(crate) fn bulk_apply_with<S, K, V>(
+    store: &mut S,
+    root: u64,
+    changes: &[(K, Option<V>)],
+    txn_id: u64,
+    comparator: &KeyComparator,
+) -> Result<u64>
+where
+    S: PageStore + PageSource,
+    K: AsRef<[u8]>,
+    V: BulkValue,
+{
+    ensure!(root != 0, "bulk apply requires a non-empty tree");
+    if changes.is_empty() {
+        return Ok(root);
+    }
+
+    let Some(mut level) = bulk_apply_into(store, root, changes, txn_id, 0, comparator, None)?
+    else {
+        return Ok(root);
+    };
+    if level.is_empty() {
+        return Ok(0);
+    }
+    while level.len() > 1 {
+        level = allocate_branch_children(store, level, txn_id)?;
+    }
+    Ok(level[0].1)
+}
+
+fn bulk_apply_into<S, K, V>(
+    store: &mut S,
+    page_id: u64,
+    changes: &[(K, Option<V>)],
+    txn_id: u64,
+    depth: usize,
+    comparator: &KeyComparator,
+    first_key: Option<&[u8]>,
+) -> Result<ChangedChildren>
+where
+    S: PageStore + PageSource,
+    K: AsRef<[u8]>,
+    V: BulkValue,
+{
+    ensure!(
+        depth < MAX_DEPTH,
+        "B+tree depth exceeded {MAX_DEPTH} during bulk apply"
+    );
+    let page_type = store.with_page(page_id, |page| Ok(page.page_type()))?;
+    match page_type {
+        PageType::Leaf => bulk_apply_leaf(store, page_id, changes, txn_id, comparator),
+        PageType::Branch => bulk_apply_branch(
+            store, page_id, changes, txn_id, depth, comparator, first_key,
+        ),
+    }
+}
+
+fn bulk_apply_leaf<S, K, V>(
+    store: &mut S,
+    page_id: u64,
+    changes: &[(K, Option<V>)],
+    txn_id: u64,
+    comparator: &KeyComparator,
+) -> Result<ChangedChildren>
+where
+    S: PageStore + PageSource,
+    K: AsRef<[u8]>,
+    V: BulkValue,
+{
+    let entries = store.with_page(page_id, collect_leaf)?;
+    let mut merged = Vec::with_capacity(entries.len().saturating_add(changes.len()));
+    let mut displaced = Vec::new();
+    let mut changed = false;
+    let mut base = entries.into_iter().peekable();
+    let mut changes = changes.iter().peekable();
+
+    loop {
+        match (base.peek(), changes.peek()) {
+            (Some(entry), Some((key, _))) => {
+                match comparator.compare(entry.key.as_slice(), key.as_ref()) {
+                    Ordering::Less => {
+                        merged.push(base.next().context("base entry disappeared")?);
+                    }
+                    Ordering::Equal => {
+                        let entry = base.next().context("base entry disappeared")?;
+                        let (_, value) = changes.next().context("change disappeared")?;
+                        changed = true;
+                        match value {
+                            Some(value) => {
+                                let value =
+                                    make_value(store, entry.key.len(), value.value_ref(), txn_id)?;
+                                displaced.push(entry.value);
+                                merged.push(OwnedLeafEntry {
+                                    key: entry.key,
+                                    value,
+                                });
+                            }
+                            None => displaced.push(entry.value),
+                        }
+                    }
+                    Ordering::Greater => {
+                        let (key, value) = changes.next().context("change disappeared")?;
+                        if let Some(value) = value {
+                            let value =
+                                make_value(store, key.as_ref().len(), value.value_ref(), txn_id)?;
+                            merged.push(OwnedLeafEntry {
+                                key: key.as_ref().to_vec(),
+                                value,
+                            });
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            (Some(_), None) => {
+                merged.push(base.next().context("base entry disappeared")?);
+            }
+            (None, Some(_)) => {
+                let (key, value) = changes.next().context("change disappeared")?;
+                if let Some(value) = value {
+                    let value = make_value(store, key.as_ref().len(), value.value_ref(), txn_id)?;
+                    merged.push(OwnedLeafEntry {
+                        key: key.as_ref().to_vec(),
+                        value,
+                    });
+                    changed = true;
+                }
+            }
+            (None, None) => break,
+        }
+    }
+
+    if !changed {
+        return Ok(None);
+    }
+
+    let pages = if merged.is_empty() {
+        Vec::new()
+    } else {
+        allocate_leaf_chunks(store, merged, txn_id)?
+    };
+    store.free_pages(page_id, 1)?;
+    for value in displaced {
+        free_value(store, &value)?;
+    }
+    Ok(Some(pages))
+}
+
+fn bulk_apply_branch<S, K, V>(
+    store: &mut S,
+    page_id: u64,
+    changes: &[(K, Option<V>)],
+    txn_id: u64,
+    depth: usize,
+    comparator: &KeyComparator,
+    first_key: Option<&[u8]>,
+) -> Result<ChangedChildren>
+where
+    S: PageStore + PageSource,
+    K: AsRef<[u8]>,
+    V: BulkValue,
+{
+    let entries = store.with_page(page_id, collect_branch)?;
+    let mut next = Vec::with_capacity(entries.len());
+    let mut changed = false;
+
+    for (index, (separator, child)) in entries.iter().enumerate() {
+        let start = if index == 0 {
+            0
+        } else {
+            changes.partition_point(|(key, _)| {
+                comparator.compare(key.as_ref(), separator.as_slice()) == Ordering::Less
+            })
+        };
+        let end = if index + 1 == entries.len() {
+            changes.len()
+        } else {
+            let next_separator = entries[index + 1].0.as_slice();
+            changes.partition_point(|(key, _)| {
+                comparator.compare(key.as_ref(), next_separator) == Ordering::Less
+            })
+        };
+        let child_first = if index == 0 {
+            first_key
+        } else {
+            Some(separator.as_slice())
+        };
+
+        if start < end
+            && let Some(children) = bulk_apply_into(
+                store,
+                *child,
+                &changes[start..end],
+                txn_id,
+                depth + 1,
+                comparator,
+                child_first,
+            )?
+        {
+            changed = true;
+            next.extend(children);
+            continue;
+        }
+
+        if index == 0 {
+            next.push((first_key.map_or_else(Vec::new, <[u8]>::to_vec), *child));
+        } else {
+            next.push((separator.clone(), *child));
+        }
+    }
+
+    if !changed {
+        return Ok(None);
+    }
+
+    let pages = if next.is_empty() {
+        Vec::new()
+    } else {
+        allocate_branch_children(store, next, txn_id)?
+    };
+    store.free_pages(page_id, 1)?;
+    Ok(Some(pages))
+}
+
+fn allocate_leaf_chunks<S: PageStore>(
+    store: &mut S,
+    mut entries: Vec<OwnedLeafEntry>,
+    txn_id: u64,
+) -> Result<Vec<ChildPage>> {
+    let mut chunks = Vec::new();
+    while leaf_page_size(&entries) > PAGE_SIZE {
+        let sizes: Vec<usize> = entries
+            .iter()
+            .map(|entry| entry.key.len() + entry.value.encoded_len())
+            .collect();
+        let split = choose_split(&sizes).or_else(|_| choose_left_split(&sizes))?;
+        let right = entries.split_off(split);
+        chunks.push(entries);
+        entries = right;
+    }
+    chunks.push(entries);
+
+    let mut pages = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let first = chunk[0].key.clone();
+        let page_id = allocate_leaf(store, &chunk, txn_id)?;
+        pages.push((first, page_id));
+    }
+    Ok(pages)
+}
+
+fn allocate_branch_children<S: PageStore + PageSource>(
+    store: &mut S,
+    mut entries: Vec<(Vec<u8>, u64)>,
+    txn_id: u64,
+) -> Result<Vec<ChildPage>> {
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let first_actual = entries[0].0.clone();
+    entries[0].0.clear();
+    let mut chunks = Vec::new();
+    while branch_page_size(&entries) > PAGE_SIZE {
+        let sizes: Vec<usize> = entries
+            .iter()
+            .map(|(key, _)| key.len() + std::mem::size_of::<u64>())
+            .collect();
+        let split = choose_split(&sizes).or_else(|_| choose_left_split(&sizes))?;
+        let right = entries.split_off(split);
+        chunks.push(entries);
+        entries = right;
+    }
+    chunks.push(entries);
+
+    let mut pages = Vec::with_capacity(chunks.len());
+    for (index, mut chunk) in chunks.into_iter().enumerate() {
+        let first = if index == 0 {
+            first_actual.clone()
+        } else {
+            chunk[0].0.clone()
+        };
+        chunk[0].0.clear();
+        let page_id = allocate_branch(store, &chunk, txn_id)?;
+        let first = if first.is_empty() {
+            subtree_first_key(store, page_id)?
+        } else {
+            first
+        };
+        pages.push((first, page_id));
+    }
+    Ok(pages)
+}
+
+fn subtree_first_key<S: PageSource>(source: &S, mut page_id: u64) -> Result<Vec<u8>> {
+    for _ in 0..MAX_DEPTH {
+        let page = source.page(page_id)?;
+        match page.page_type() {
+            PageType::Branch => {
+                ensure!(
+                    page.slot_count() > 0,
+                    "branch page {page_id} has no children"
+                );
+                page_id = page.child(0)?;
+            }
+            PageType::Leaf => {
+                ensure!(page.slot_count() > 0, "leaf page {page_id} is empty");
+                return Ok(page.key(0)?.to_vec());
+            }
+        }
+    }
+    bail!("B+tree depth exceeded {MAX_DEPTH} while finding the first key")
+}
+
 /// Bulk-loads sorted entries into a new tree and returns its root.
 ///
 /// This is used when a transaction writes a large number of entries into an
@@ -1191,7 +1539,7 @@ fn make_value<S: PageStore>(
         ValueRef::Overflow(reference) => Ok(OwnedValue::Overflow(reference)),
         ValueRef::Inline(bytes) => {
             if SLOT_SIZE + key_len + bytes.len() <= INLINE_BUDGET {
-                Ok(OwnedValue::Inline(bytes.to_vec()))
+                Ok(OwnedValue::inline(bytes))
             } else {
                 Ok(OwnedValue::Overflow(make_overflow(store, bytes, txn_id)?))
             }
@@ -1262,6 +1610,26 @@ fn choose_split(sizes: &[usize]) -> Result<usize> {
 
     best.map(|(split, _)| split)
         .context("no split point keeps both pages within the page size")
+}
+
+fn choose_left_split(sizes: &[usize]) -> Result<usize> {
+    ensure!(
+        sizes.len() >= 2,
+        "cannot split a page with fewer than two entries"
+    );
+
+    let mut left_payload = 0;
+    let mut best = None;
+    for split in 1..sizes.len() {
+        left_payload += sizes[split - 1];
+        let left_size = HEADER_SIZE + split * SLOT_SIZE + left_payload;
+        if left_size > PAGE_SIZE {
+            break;
+        }
+        best = Some(split);
+    }
+
+    best.context("no split point keeps the left page within the page size")
 }
 
 /// Compares two encoded keys in lexicographic order.
