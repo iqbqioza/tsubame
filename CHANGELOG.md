@@ -33,6 +33,9 @@ All notable changes to this project are documented here.
 - `EnvOpenOptions::max_readers` and `Env::max_readers` configure the number of
   read-only transaction slots used by multi-process readers. The limit is also
   exposed through `EnvInfo`.
+- `Env::stat` reports the same structural statistics for the unnamed
+  database, with `Env::non_free_pages_size` and `Env::max_key_size` helpers.
+  `EnvStat` is exported for callers that name the result type.
 - `Database::stat` reports page size, depth, branch/leaf/overflow page counts,
   and entry count for a database snapshot.
 - `Database::get_greater_than`, `get_greater_than_or_equal_to`,

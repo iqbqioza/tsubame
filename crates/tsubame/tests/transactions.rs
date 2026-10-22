@@ -107,6 +107,39 @@ fn database_stat_reports_tree_structure() -> Result<()> {
 }
 
 #[test]
+fn environment_statistics_match_the_unnamed_database() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Bytes>(&mut wtxn, None)?;
+    for i in 0..1_000u32 {
+        db.put(
+            &mut wtxn,
+            &format!("key-{i:04}"),
+            format!("value-{i}").as_bytes(),
+        )?;
+    }
+    db.put(&mut wtxn, "large", vec![0x5a; 10_000].as_slice())?;
+    wtxn.commit()?;
+
+    let rtxn = env.read_txn()?;
+    let database_stat = db.stat(&rtxn)?;
+    drop(rtxn);
+
+    let env_stat = env.stat()?;
+    assert_eq!(env_stat, database_stat);
+    let pages =
+        database_stat.branch_pages + database_stat.leaf_pages + database_stat.overflow_pages;
+    assert_eq!(
+        env.non_free_pages_size()?,
+        pages * database_stat.page_size as u64
+    );
+    assert_eq!(env.max_key_size(), 1_024);
+
+    Ok(())
+}
+
+#[test]
 fn get_or_put_returns_the_existing_value_without_overwriting() -> Result<()> {
     let dir = tempdir()?;
     let env = options().open(dir.path())?;

@@ -19,14 +19,15 @@ use memmap2::{Mmap, MmapMut};
 
 use crate::Result;
 use crate::comparator::KeyComparator;
-use crate::database::{Database, DatabaseKind};
+use crate::database::{Database, DatabaseKind, DatabaseStat};
 #[cfg(windows)]
 use crate::storage::PageSet;
+use crate::storage::btree;
 use crate::storage::checksum;
 use crate::storage::commit;
 use crate::storage::meta::{self, Meta};
 use crate::storage::overflow::{self, OverflowRef};
-use crate::storage::page::{LeafValue, Page, PageType};
+use crate::storage::page::{LeafValue, MAX_KEY_SIZE, Page, PageType};
 use crate::storage::{PAGE_SIZE, io, mmap};
 use crate::txn::{RoTxn, RwTxn};
 
@@ -129,6 +130,51 @@ impl Env {
         io::sync_dir(&self.inner.path)
             .with_context(|| format!("failed to sync `{}`", self.inner.path.display()))?;
         Ok(())
+    }
+
+    /// Returns structural statistics for the unnamed database.
+    ///
+    /// The tree is walked to compute depth and page counts; this method is
+    /// intended for diagnostics rather than hot paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a snapshot cannot be read or a page cannot be
+    /// traversed.
+    pub fn stat(&self) -> Result<EnvStat> {
+        let txn = self.read_txn()?;
+        let root = txn.root_for(&DatabaseKind::Unnamed)?;
+        let stat = btree::stat(&txn, root)?;
+        Ok(DatabaseStat {
+            page_size: PAGE_SIZE,
+            depth: stat.depth,
+            branch_pages: stat.branch_pages,
+            leaf_pages: stat.leaf_pages,
+            overflow_pages: stat.overflow_pages,
+            entries: stat.entries,
+        })
+    }
+
+    /// Returns the bytes occupied by reachable tree pages in the unnamed
+    /// database, excluding the meta pages and free space.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the structural statistics cannot be read.
+    pub fn non_free_pages_size(&self) -> Result<u64> {
+        let stat = self.stat()?;
+        let pages = stat
+            .branch_pages
+            .saturating_add(stat.leaf_pages)
+            .saturating_add(stat.overflow_pages);
+        pages
+            .checked_mul(u64::try_from(stat.page_size).context("page size is too large")?)
+            .context("non-free page size overflow")
+    }
+
+    /// Returns the maximum encoded key size accepted by the environment.
+    pub fn max_key_size(&self) -> usize {
+        MAX_KEY_SIZE
     }
 
     /// Returns a consistent snapshot of the environment metadata.
@@ -570,6 +616,9 @@ impl fmt::Debug for Env {
             .finish_non_exhaustive()
     }
 }
+
+/// Structural statistics for the unnamed database.
+pub type EnvStat = DatabaseStat;
 
 /// Metadata about an open [`Env`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
