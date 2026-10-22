@@ -78,6 +78,31 @@ fn copy_to_path_creates_a_consistent_backup() -> Result<()> {
 }
 
 #[test]
+fn directional_lookups_follow_key_order() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+    for key in ["b", "d", "f"] {
+        db.put(&mut wtxn, key, key)?;
+    }
+    wtxn.commit()?;
+
+    let rtxn = env.read_txn()?;
+    assert_eq!(db.get_greater_than(&rtxn, "b")?, Some(("d", "d")));
+    assert_eq!(
+        db.get_greater_than_or_equal_to(&rtxn, "b")?,
+        Some(("b", "b"))
+    );
+    assert_eq!(db.get_lower_than(&rtxn, "d")?, Some(("b", "b")));
+    assert_eq!(db.get_lower_than_or_equal_to(&rtxn, "d")?, Some(("d", "d")));
+    assert_eq!(db.get_greater_than(&rtxn, "f")?, None);
+    assert_eq!(db.get_lower_than(&rtxn, "b")?, None);
+
+    Ok(())
+}
+
+#[test]
 fn database_inspection_helpers_match_the_visible_snapshot() -> Result<()> {
     let dir = tempdir()?;
     let env = options().open(dir.path())?;
