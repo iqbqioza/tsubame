@@ -72,6 +72,8 @@ All notable changes to this project are documented here.
   marked verified to avoid rechecking their checksums on the next writer read.
 - Writer page reads copy validated bytes directly into the owned page buffer
   instead of zero-filling the whole page first.
+- Free-list reconstruction marks the tree pages it validated as verified, so
+  the first writer after reopening does not checksum them again.
 - Bulk loading builds leaf pages from borrowed entries instead of cloning
   every key and value.
 - Verified page reads bypass redundant header checks, and binary-search slot

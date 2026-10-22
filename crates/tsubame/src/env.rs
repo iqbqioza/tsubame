@@ -583,7 +583,7 @@ impl FreeListReconstructor<'_> {
     }
 }
 
-fn reconstruct_free_list(mmap: &[u8], meta: &Meta) -> Result<Vec<FreeExtent>> {
+fn reconstruct_free_list(mmap: &[u8], meta: &Meta) -> Result<(Vec<FreeExtent>, Vec<u64>)> {
     let mut reconstructor = FreeListReconstructor {
         mmap,
         meta,
@@ -639,7 +639,7 @@ fn reconstruct_free_list(mmap: &[u8], meta: &Meta) -> Result<Vec<FreeExtent>> {
         });
     }
 
-    Ok(free)
+    Ok((free, reconstructor.visited.into_iter().collect()))
 }
 
 /// The committed meta state and the slot that contains it.
@@ -1005,7 +1005,11 @@ impl EnvInner {
         // A malformed reachable tree already fails reads. Do not turn that
         // into an open error; leave the pool empty if reconstruction cannot
         // complete.
-        let free = reconstruct_free_list(&state.mmap, &committed.meta).unwrap_or_default();
+        let (free, verified) =
+            reconstruct_free_list(&state.mmap, &committed.meta).unwrap_or_default();
+        for page_id in verified {
+            state.mark_verified(page_id);
+        }
         self.return_free(free);
     }
 
