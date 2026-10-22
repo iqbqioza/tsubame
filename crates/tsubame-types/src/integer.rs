@@ -71,6 +71,19 @@ macro_rules! define_integer {
                 O::$write(&mut buf, *item);
                 Ok(Cow::Owned(buf.to_vec()))
             }
+
+            #[inline]
+            fn bytes_encode_into<'b>(
+                item: &Self::EItem,
+                buffer: &'b mut [u8],
+            ) -> Result<Option<&'b [u8]>, BoxedError> {
+                if buffer.len() < $size {
+                    return Ok(None);
+                }
+                let buf = &mut buffer[..$size];
+                O::$write(buf, *item);
+                Ok(Some(buf))
+            }
         }
 
         impl<O: ByteOrder> BytesDecode<'_> for $name<O> {
@@ -179,6 +192,22 @@ mod tests {
         assert_eq!(&U8::bytes_encode(&7).unwrap()[..], &[7]);
         assert_eq!(U8::bytes_decode(&[7]).unwrap(), 7);
         assert_eq!(I8::bytes_decode(&[0xff]).unwrap(), -1);
+    }
+
+    #[test]
+    fn encodes_into_caller_buffer() {
+        let mut buffer = [0u8; 8];
+        let encoded = U64::<BigEndian>::bytes_encode_into(&0x0102, &mut buffer)
+            .unwrap()
+            .unwrap();
+        assert_eq!(encoded, &[0, 0, 0, 0, 0, 0, 1, 2]);
+
+        let mut too_small = [0u8; 3];
+        assert!(
+            U32::<BigEndian>::bytes_encode_into(&42, &mut too_small)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

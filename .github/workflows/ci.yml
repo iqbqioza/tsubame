@@ -25,4 +25,7 @@ jobs:
       - run: cargo test --workspace --all-features
       - run: cargo test --workspace --all-features --examples
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
-      - run: cargo package --workspace
+      # Higher workspace crates use APIs that are newer than the versions
+      # currently published to crates.io. Tarball verification is deferred
+      # until the crates are published in dependency order.
+      - run: cargo package --workspace --no-verify

@@ -4,6 +4,7 @@
 //! determine how keys and values are stored and in which type they are
 //! returned. Database handles are lightweight and can be cloned freely.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::marker::PhantomData;
 use std::ops::Bound;
@@ -84,10 +85,10 @@ impl<KC, DC> Database<KC, DC> {
             "transaction belongs to a different environment"
         );
 
-        let key =
-            KC::bytes_encode(key).map_err(|error| codec_error("key encoding failed", error))?;
+        let mut key_buffer = [0u8; KEY_ENCODE_BUFFER];
+        let key = encode_key::<KC>(key, &mut key_buffer)?;
         let root = txn.root_for(&self.kind)?;
-        let Some(value) = btree::get_with(txn, root, &key, &txn.comparator())? else {
+        let Some(value) = btree::get_with(txn, root, key.as_slice(), &txn.comparator())? else {
             return Ok(None);
         };
 
@@ -117,9 +118,9 @@ impl<KC, DC> Database<KC, DC> {
             "transaction belongs to a different environment"
         );
 
-        let key =
-            KC::bytes_encode(key).map_err(|error| codec_error("key encoding failed", error))?;
-        let Some(value) = txn.get_raw(&self.kind, &key)? else {
+        let mut key_buffer = [0u8; KEY_ENCODE_BUFFER];
+        let key = encode_key::<KC>(key, &mut key_buffer)?;
+        let Some(value) = txn.get_raw(&self.kind, key.as_slice())? else {
             return Ok(None);
         };
 
@@ -554,6 +555,38 @@ impl<KC, DC> fmt::Debug for Database<KC, DC> {
             .field("data_codec", &std::any::type_name::<DC>())
             .finish()
     }
+}
+
+const KEY_ENCODE_BUFFER: usize = 16;
+
+enum EncodedKey<'item, 'buffer> {
+    Buffer(&'buffer [u8]),
+    Stored(Cow<'item, [u8]>),
+}
+
+impl EncodedKey<'_, '_> {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Buffer(bytes) => bytes,
+            Self::Stored(bytes) => bytes.as_ref(),
+        }
+    }
+}
+
+fn encode_key<'item, 'buffer, KC>(
+    key: &'item KC::EItem,
+    buffer: &'buffer mut [u8],
+) -> Result<EncodedKey<'item, 'buffer>>
+where
+    KC: BytesEncode<'item>,
+{
+    if let Some(bytes) = KC::bytes_encode_into(key, buffer)
+        .map_err(|error| codec_error("key encoding failed", error))?
+    {
+        return Ok(EncodedKey::Buffer(bytes));
+    }
+    let bytes = KC::bytes_encode(key).map_err(|error| codec_error("key encoding failed", error))?;
+    Ok(EncodedKey::Stored(bytes))
 }
 
 fn encode_bound<'a, KC>(bound: Bound<&'a KC::EItem>) -> Result<Bound<Vec<u8>>>
