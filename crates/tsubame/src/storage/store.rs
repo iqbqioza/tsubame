@@ -28,6 +28,27 @@ pub(crate) trait PageStore {
     /// Writes a complete page.
     fn write_page(&mut self, page_id: u64, page: [u8; PAGE_SIZE]) -> Result<()>;
 
+    /// Returns whether this transaction already owns the page and can mutate it
+    /// in place without preserving the previous version.
+    fn owns_page(&self, page_id: u64) -> bool;
+
+    /// Rewrites a page in place when it is already owned by this transaction,
+    /// otherwise allocates a copy-on-write page and frees the old one.
+    fn rewrite_page<F>(&mut self, old_page_id: u64, edit: F) -> Result<u64>
+    where
+        F: FnOnce(u64, &mut [u8; PAGE_SIZE]) -> Result<()>,
+    {
+        if self.owns_page(old_page_id) {
+            self.update_page(old_page_id, old_page_id, |page| edit(old_page_id, page))?;
+            Ok(old_page_id)
+        } else {
+            let new_page_id = self.allocate_pages(1)?;
+            self.update_page(old_page_id, new_page_id, |page| edit(new_page_id, page))?;
+            self.free_pages(old_page_id, 1)?;
+            Ok(new_page_id)
+        }
+    }
+
     /// Writes a complete overflow extent.
     fn write_extent(&mut self, start_page: u64, bytes: &[u8]) -> Result<()>;
 
@@ -102,6 +123,7 @@ pub(crate) mod memory {
                 .get(&old_page_id)
                 .with_context(|| format!("page {old_page_id} not found"))?;
             edit(&mut page)?;
+            crate::storage::page::seal_page(&mut page);
             self.pages.insert(new_page_id, page);
             Ok(())
         }
@@ -119,6 +141,10 @@ pub(crate) mod memory {
         fn write_page(&mut self, page_id: u64, page: [u8; PAGE_SIZE]) -> Result<()> {
             self.pages.insert(page_id, page);
             Ok(())
+        }
+
+        fn owns_page(&self, _page_id: u64) -> bool {
+            false
         }
 
         fn write_extent(&mut self, start_page: u64, bytes: &[u8]) -> Result<()> {

@@ -19,7 +19,7 @@ use crate::storage::commit;
 use crate::storage::meta::{self, Meta};
 use crate::storage::mmap;
 use crate::storage::overflow::{self, OverflowRef};
-use crate::storage::page::Page;
+use crate::storage::page::{self, Page};
 use crate::storage::store::PageStore;
 
 const DATA_FILE: &str = "data.tsubame";
@@ -339,6 +339,7 @@ impl PageStore for CompactStore {
     {
         let mut page = self.read_page(old_page_id)?;
         edit(&mut page)?;
+        page::seal_page(&mut page);
         self.write_page(new_page_id, page)
     }
 
@@ -354,6 +355,10 @@ impl PageStore for CompactStore {
             "compacted environment exceeds its original size"
         );
         Ok(start)
+    }
+
+    fn owns_page(&self, _page_id: u64) -> bool {
+        false
     }
 
     fn write_page(&mut self, page_id: u64, page: [u8; PAGE_SIZE]) -> Result<()> {

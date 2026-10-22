@@ -329,8 +329,7 @@ fn insert_leaf<S: PageStore>(
             LeafEdit::Resized(_, overflow) => overflow,
             LeafEdit::Same(_) | LeafEdit::Append => None,
         };
-        let new_page_id = store.allocate_pages(1)?;
-        store.update_page(page_id, new_page_id, |bytes| match edit {
+        let new_page_id = store.rewrite_page(page_id, |new_page_id, bytes| match edit {
             LeafEdit::Same(position) => {
                 page::replace_value_in_place(bytes, new_page_id, txn_id, position, value, 0)
             }
@@ -344,7 +343,6 @@ fn insert_leaf<S: PageStore>(
         if let Some(reference) = old_overflow {
             store.free_pages(reference.start_page, reference.page_count)?;
         }
-        store.free_pages(page_id, 1)?;
         return Ok(InsertResult {
             page_id: new_page_id,
             split: None,
@@ -393,11 +391,9 @@ fn insert_branch<S: PageStore>(
     let result = insert_into(store, child, key, value, txn_id, depth + 1, comparator)?;
 
     if result.split.is_none() {
-        let new_page_id = store.allocate_pages(1)?;
-        store.update_page(page_id, new_page_id, |bytes| {
+        let new_page_id = store.rewrite_page(page_id, |new_page_id, bytes| {
             page::replace_child_in_place(bytes, new_page_id, txn_id, index, result.page_id)
         })?;
-        store.free_pages(page_id, 1)?;
         return Ok(InsertResult {
             page_id: new_page_id,
             split: None,
@@ -426,12 +422,11 @@ fn delete_into<S: PageStore>(
         "B+tree depth exceeded {MAX_DEPTH} during delete"
     );
 
-    let bytes = store.read_page(page_id)?;
-    let page = Page::parse_trusted(&bytes, Some(page_id))?;
+    let page_type = store.with_page(page_id, |page| Ok(page.page_type()))?;
 
-    match page.page_type() {
-        PageType::Leaf => delete_leaf(store, page_id, &page, key, txn_id, comparator),
-        PageType::Branch => delete_branch(store, page_id, &page, key, txn_id, depth, comparator),
+    match page_type {
+        PageType::Leaf => delete_leaf(store, page_id, key, txn_id, comparator),
+        PageType::Branch => delete_branch(store, page_id, key, txn_id, depth, comparator),
     }
 }
 
@@ -443,36 +438,52 @@ struct DeleteResult {
 fn delete_leaf<S: PageStore>(
     store: &mut S,
     page_id: u64,
-    page: &Page<'_>,
     key: &[u8],
     txn_id: u64,
     comparator: &KeyComparator,
 ) -> Result<DeleteResult> {
-    let mut entries = collect_leaf(page)?;
-    let Ok(index) = entries.binary_search_by(|entry| comparator.compare(entry.key.as_slice(), key))
-    else {
+    let edit = store.with_page(page_id, |page| {
+        let index = page.lower_bound_with(key, comparator)?;
+        if index == page.slot_count()
+            || comparator.compare(page.key(index)?, key) != Ordering::Equal
+        {
+            return Ok(None);
+        }
+        let overflow = match page.leaf_entry(index)?.1 {
+            LeafValue::Overflow(reference) => Some(reference),
+            LeafValue::Inline(_) => None,
+        };
+        Ok(Some((index, overflow, page.slot_count())))
+    })?;
+    let Some((index, overflow, slot_count)) = edit else {
         return Ok(DeleteResult {
             page_id,
             changed: false,
         });
     };
 
-    let removed = entries.remove(index);
-    if entries.is_empty() {
+    if slot_count == 1 {
         store.free_pages(page_id, 1)?;
-        free_value(store, &removed.value)?;
+        if let Some(reference) = overflow {
+            store.free_pages(reference.start_page, reference.page_count)?;
+        }
         return Ok(DeleteResult {
             page_id: 0,
             changed: true,
         });
     }
 
-    let new_page = allocate_leaf(store, &entries, txn_id)?;
-    store.free_pages(page_id, 1)?;
-    free_value(store, &removed.value)?;
+    let new_page_id = store.rewrite_page(page_id, |new_page_id, bytes| {
+        let removed = page::delete_entry_in_place(bytes, new_page_id, txn_id, index)?;
+        debug_assert_eq!(removed.is_some(), overflow.is_some());
+        Ok(())
+    })?;
+    if let Some(reference) = overflow {
+        store.free_pages(reference.start_page, reference.page_count)?;
+    }
 
     Ok(DeleteResult {
-        page_id: new_page,
+        page_id: new_page_id,
         changed: true,
     })
 }
@@ -480,14 +491,15 @@ fn delete_leaf<S: PageStore>(
 fn delete_branch<S: PageStore>(
     store: &mut S,
     page_id: u64,
-    page: &Page<'_>,
     key: &[u8],
     txn_id: u64,
     depth: usize,
     comparator: &KeyComparator,
 ) -> Result<DeleteResult> {
-    let index = page.branch_child_index_with(key, comparator)?;
-    let child = page.child(index)?;
+    let (index, child, slot_count) = store.with_page(page_id, |page| {
+        let index = page.branch_child_index_with(key, comparator)?;
+        Ok((index, page.child(index)?, page.slot_count()))
+    })?;
     let result = delete_into(store, child, key, txn_id, depth + 1, comparator)?;
 
     if !result.changed {
@@ -498,11 +510,10 @@ fn delete_branch<S: PageStore>(
     }
 
     if result.page_id != 0 {
-        if page.slot_count() > 1 {
-            let new_page_id = store.allocate_pages(1)?;
-            let new_page = page.replace_child(new_page_id, txn_id, index, result.page_id)?;
-            store.write_page(new_page_id, new_page)?;
-            store.free_pages(page_id, 1)?;
+        if slot_count > 1 {
+            let new_page_id = store.rewrite_page(page_id, |new_page_id, bytes| {
+                page::replace_child_in_place(bytes, new_page_id, txn_id, index, result.page_id)
+            })?;
             return Ok(DeleteResult {
                 page_id: new_page_id,
                 changed: true,
@@ -516,10 +527,7 @@ fn delete_branch<S: PageStore>(
         });
     }
 
-    let mut entries = collect_branch(page)?;
-    entries.remove(index);
-
-    if entries.is_empty() {
+    if slot_count == 1 {
         store.free_pages(page_id, 1)?;
         return Ok(DeleteResult {
             page_id: 0,
@@ -527,17 +535,29 @@ fn delete_branch<S: PageStore>(
         });
     }
 
-    entries[0].0.clear();
-
-    if entries.len() == 1 {
-        let child = entries[0].1;
+    if slot_count == 2 {
+        let remaining = store.with_page(page_id, |page| page.child(1 - index))?;
         store.free_pages(page_id, 1)?;
         return Ok(DeleteResult {
-            page_id: child,
+            page_id: remaining,
             changed: true,
         });
     }
 
+    if index > 0 {
+        let new_page_id = store.rewrite_page(page_id, |new_page_id, bytes| {
+            page::delete_entry_in_place(bytes, new_page_id, txn_id, index)?;
+            Ok(())
+        })?;
+        return Ok(DeleteResult {
+            page_id: new_page_id,
+            changed: true,
+        });
+    }
+
+    let mut entries = store.with_page(page_id, collect_branch)?;
+    entries.remove(index);
+    entries[0].0.clear();
     let new_page = allocate_branch(store, &entries, txn_id)?;
     store.free_pages(page_id, 1)?;
 
@@ -647,6 +667,147 @@ fn store_branch<S: PageStore>(
             right: right_page,
         }),
     })
+}
+
+/// Deletes many sorted keys in one bottom-up pass over the affected tree.
+///
+/// This is used when a transaction stages a large number of deletes. It avoids
+/// rewriting the same leaf and branch pages for every key while preserving the
+/// existing copy-on-write behavior.
+pub(crate) fn bulk_delete_with<S: PageStore, K: AsRef<[u8]>>(
+    store: &mut S,
+    root: u64,
+    keys: &[K],
+    txn_id: u64,
+    comparator: &KeyComparator,
+) -> Result<u64> {
+    if root == 0 || keys.is_empty() {
+        return Ok(root);
+    }
+    Ok(bulk_delete_into(store, root, keys, txn_id, 0, comparator)?.unwrap_or(root))
+}
+
+fn bulk_delete_into<S: PageStore, K: AsRef<[u8]>>(
+    store: &mut S,
+    page_id: u64,
+    keys: &[K],
+    txn_id: u64,
+    depth: usize,
+    comparator: &KeyComparator,
+) -> Result<Option<u64>> {
+    ensure!(
+        depth < MAX_DEPTH,
+        "B+tree depth exceeded {MAX_DEPTH} during bulk delete"
+    );
+    let page_type = store.with_page(page_id, |page| Ok(page.page_type()))?;
+    match page_type {
+        PageType::Leaf => bulk_delete_leaf(store, page_id, keys, txn_id, comparator),
+        PageType::Branch => bulk_delete_branch(store, page_id, keys, txn_id, depth, comparator),
+    }
+}
+
+fn bulk_delete_leaf<S: PageStore, K: AsRef<[u8]>>(
+    store: &mut S,
+    page_id: u64,
+    keys: &[K],
+    txn_id: u64,
+    comparator: &KeyComparator,
+) -> Result<Option<u64>> {
+    let mut entries = store.with_page(page_id, collect_leaf)?;
+    let mut removed = Vec::new();
+    let mut changed = false;
+    for key in keys {
+        let key = key.as_ref();
+        if let Ok(index) =
+            entries.binary_search_by(|entry| comparator.compare(entry.key.as_slice(), key))
+        {
+            removed.push(entries.remove(index));
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(None);
+    }
+
+    for entry in &removed {
+        free_value(store, &entry.value)?;
+    }
+    if entries.is_empty() {
+        store.free_pages(page_id, 1)?;
+        return Ok(Some(0));
+    }
+
+    let new_page = allocate_leaf(store, &entries, txn_id)?;
+    store.free_pages(page_id, 1)?;
+    Ok(Some(new_page))
+}
+
+fn bulk_delete_branch<S: PageStore, K: AsRef<[u8]>>(
+    store: &mut S,
+    page_id: u64,
+    keys: &[K],
+    txn_id: u64,
+    depth: usize,
+    comparator: &KeyComparator,
+) -> Result<Option<u64>> {
+    let entries = store.with_page(page_id, collect_branch)?;
+    let mut changed = false;
+    let mut next = Vec::with_capacity(entries.len());
+
+    for (index, (separator, child)) in entries.iter().enumerate() {
+        let start = if index == 0 {
+            0
+        } else {
+            keys.partition_point(|key| {
+                comparator.compare(key.as_ref(), separator.as_slice()) == Ordering::Less
+            })
+        };
+        let end = if index + 1 == entries.len() {
+            keys.len()
+        } else {
+            let next_separator = entries[index + 1].0.as_slice();
+            keys.partition_point(|key| {
+                comparator.compare(key.as_ref(), next_separator) == Ordering::Less
+            })
+        };
+        let new_child = if start < end {
+            bulk_delete_into(
+                store,
+                *child,
+                &keys[start..end],
+                txn_id,
+                depth + 1,
+                comparator,
+            )?
+        } else {
+            None
+        };
+        match new_child {
+            Some(0) => changed = true,
+            Some(new_child) => {
+                changed = true;
+                next.push((separator.clone(), new_child));
+            }
+            None => next.push((separator.clone(), *child)),
+        }
+    }
+
+    if !changed {
+        return Ok(None);
+    }
+    if next.is_empty() {
+        store.free_pages(page_id, 1)?;
+        return Ok(Some(0));
+    }
+    if next.len() == 1 {
+        let child = next[0].1;
+        store.free_pages(page_id, 1)?;
+        return Ok(Some(child));
+    }
+    next[0].0.clear();
+    let new_page = allocate_branch(store, &next, txn_id)?;
+    store.free_pages(page_id, 1)?;
+    Ok(Some(new_page))
 }
 
 /// Bulk-loads sorted entries into a new tree and returns its root.

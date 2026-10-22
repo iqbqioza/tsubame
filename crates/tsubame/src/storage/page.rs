@@ -138,15 +138,6 @@ impl<'a> Page<'a> {
         }
     }
 
-    /// Copies the validated page into an owned buffer without first zeroing it.
-    fn copy_page(&self) -> Result<[u8; PAGE_SIZE]> {
-        let bytes: &[u8; PAGE_SIZE] = self
-            .bytes
-            .try_into()
-            .context("page has an unexpected size")?;
-        Ok(*bytes)
-    }
-
     fn parse_inner(
         bytes: &'a [u8],
         expected_id: Option<u64>,
@@ -310,32 +301,6 @@ impl<'a> Page<'a> {
                 .is_some_and(|cell_start| cell_start >= slot_end),
             None => false,
         }
-    }
-
-    /// Replaces a branch child page ID.
-    pub(crate) fn replace_child(
-        &self,
-        page_id: u64,
-        txn_id: u64,
-        index: usize,
-        child: u64,
-    ) -> Result<[u8; PAGE_SIZE]> {
-        ensure!(
-            self.page_type == PageType::Branch,
-            "cannot replace a child in a leaf page"
-        );
-        let (offset, key_len, value_len, _) = self.slot(index)?;
-        ensure!(
-            value_len == BRANCH_CHILD_SIZE,
-            "branch child slot has {value_len} bytes"
-        );
-
-        let mut page = self.copy_page()?;
-        let start = offset + key_len;
-        LittleEndian::write_u64(&mut page[start..start + 8], child);
-
-        reseal(&mut page, page_id, txn_id);
-        Ok(page)
     }
 
     /// Returns the number of slots in the page.
@@ -805,6 +770,74 @@ pub(crate) fn append_entry_in_place(
     Ok(())
 }
 
+/// Removes a leaf or branch entry in place and returns an overflow reference when
+/// the removed value was stored in an extent.
+pub(crate) fn delete_entry_in_place(
+    page: &mut [u8; PAGE_SIZE],
+    page_id: u64,
+    txn_id: u64,
+    index: usize,
+) -> Result<Option<OverflowRef>> {
+    let (slot_count, free_end, offset, key_len, value_len, flags) = {
+        let parsed = Page::parse_trusted(page, None)?;
+        let (offset, key_len, value_len, flags) = parsed.slot(index)?;
+        (
+            parsed.slot_count(),
+            parsed.free_end(),
+            offset,
+            key_len,
+            value_len,
+            flags,
+        )
+    };
+    ensure!(slot_count > 0, "cannot delete from an empty page");
+
+    let cell_len = key_len
+        .checked_add(value_len)
+        .context("cell size overflow")?;
+    let cell_end = offset.checked_add(cell_len).context("cell end overflow")?;
+    ensure!(offset >= free_end, "cell starts before the free area");
+    ensure!(cell_end <= PAGE_SIZE, "cell exceeds the page");
+
+    let overflow = if flags & FLAG_OVERFLOW != 0 {
+        let value_start = offset + key_len;
+        Some(OverflowRef::decode(
+            &page[value_start..value_start + value_len],
+        )?)
+    } else {
+        None
+    };
+
+    // Move cells below the removed cell up into its space. Cells are packed
+    // from the end of the page, so later slots have lower offsets.
+    if offset > free_end {
+        page.copy_within(free_end..offset, free_end + cell_len);
+    }
+
+    let slot_start = HEADER_SIZE + index * SLOT_SIZE;
+    let slot_end = HEADER_SIZE + slot_count * SLOT_SIZE;
+    for later in index + 1..slot_count {
+        let later_slot = HEADER_SIZE + later * SLOT_SIZE;
+        let old_offset = LittleEndian::read_u16(&page[later_slot..later_slot + 2]) as usize;
+        let new_offset = old_offset
+            .checked_add(cell_len)
+            .context("slot offset overflow")?;
+        ensure!(new_offset <= PAGE_SIZE, "slot offset exceeds the page");
+        LittleEndian::write_u16(&mut page[later_slot..later_slot + 2], new_offset as u16);
+    }
+
+    page.copy_within(slot_start + SLOT_SIZE..slot_end, slot_start);
+    let new_count = slot_count - 1;
+    LittleEndian::write_u16(&mut page[6..8], new_count as u16);
+    LittleEndian::write_u16(
+        &mut page[24..26],
+        (HEADER_SIZE + new_count * SLOT_SIZE) as u16,
+    );
+    LittleEndian::write_u16(&mut page[26..28], (free_end + cell_len) as u16);
+    reseal(page, page_id, txn_id);
+    Ok(overflow)
+}
+
 /// Replaces a same-length leaf value directly in an owned page buffer.
 pub(crate) fn replace_value_in_place(
     page: &mut [u8; PAGE_SIZE],
@@ -968,10 +1001,17 @@ pub(crate) fn replace_child_in_place(
     Ok(())
 }
 
-/// Updates the page identity and checksum after an in-place edit.
+/// Updates the page identity after an in-place edit.
+///
+/// The checksum is intentionally left stale until commit so repeated edits to
+/// the same transaction-owned page do not re-hash the full page.
 fn reseal(page: &mut [u8; PAGE_SIZE], page_id: u64, txn_id: u64) {
     LittleEndian::write_u64(&mut page[8..16], page_id);
     LittleEndian::write_u64(&mut page[16..24], txn_id);
+}
+
+/// Recomputes and stores a page checksum after deferred in-place edits.
+pub(crate) fn seal_page(page: &mut [u8; PAGE_SIZE]) {
     let checksum = page_checksum_for_write(page);
     LittleEndian::write_u32(&mut page[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4], checksum);
 }
@@ -982,6 +1022,19 @@ mod tests {
 
     fn leaf() -> [u8; PAGE_SIZE] {
         build_leaf(2, 7, &[(b"a", b"1"), (b"b", b"2")]).unwrap()
+    }
+
+    #[test]
+    fn deletes_an_entry_in_place() {
+        let mut bytes = build_leaf(2, 7, &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3")]).unwrap();
+        let overflow = delete_entry_in_place(&mut bytes, 9, 8, 1).unwrap();
+        assert!(overflow.is_none());
+        seal_page(&mut bytes);
+        let page = Page::parse(&bytes, Some(9)).unwrap();
+        assert_eq!(page.slot_count(), 2);
+        assert_eq!(page.key(0).unwrap(), b"a");
+        assert_eq!(page.key(1).unwrap(), b"c");
+        assert_eq!(page.value(1).unwrap(), b"3");
     }
 
     #[test]

@@ -101,6 +101,12 @@ All notable changes to this project are documented here.
 - Copy-on-write leaf and branch updates copy the old page directly into the
   writable mapping and edit it there. This removes one full-page copy at every
   tree level from the common insert and update path.
+- Leaf and branch deletes shift the packed cells and slot array in place instead
+  of rebuilding the page. Large delete batches are applied bottom-up so each
+  affected page is rebuilt once rather than once per key.
+- In-place page edits defer checksum recomputation until commit, so repeated
+  changes to a transaction-owned page hash it only once. Dirty and unsealed
+  page IDs use identity-hashed sets to keep the update path allocation-light.
 
 ### Fixed
 
