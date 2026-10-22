@@ -4,6 +4,7 @@
 //! documented in `docs/storage-engine.md`.
 
 pub(crate) mod btree;
+pub(crate) mod checksum;
 pub(crate) mod commit;
 pub(crate) mod compact;
 pub(crate) mod io;

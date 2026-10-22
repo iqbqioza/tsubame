@@ -2378,7 +2378,7 @@ fn recovers_previous_commit_when_commit_record_is_corrupt() -> Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .open(dir.path().join("data.tsubame"))?;
-    file.seek(SeekFrom::Start((page_count - 1) * 4096 + 100))?;
+    file.seek(SeekFrom::Start((page_count - 1) * 4096 + 8))?;
     file.write_all(&[0xff])?;
 
     let env = options().open(dir.path())?;
