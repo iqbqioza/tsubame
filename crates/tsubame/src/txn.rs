@@ -1017,9 +1017,9 @@ impl PageStore for RwTxn<'_> {
             return Ok(*page);
         }
 
-        let mut page = [0u8; PAGE_SIZE];
-        page.copy_from_slice(self.state.read_page(page_id, &self.base)?.bytes());
-        Ok(page)
+        let bytes = self.state.read_page(page_id, &self.base)?.bytes();
+        let bytes: &[u8; PAGE_SIZE] = bytes.try_into().context("page has an unexpected size")?;
+        Ok(*bytes)
     }
 
     fn allocate_pages(&mut self, pages: u64) -> Result<u64> {
