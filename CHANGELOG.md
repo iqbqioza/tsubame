@@ -89,6 +89,9 @@ All notable changes to this project are documented here.
   of rebuilding the page entry by entry, and adjacent dirty pages are written
   in batches.
 - Small pending values are stored inline, removing a heap allocation per put.
+- Page slots shrink from 12 to 8 bytes by packing the overflow flag into the
+  high bit of the value-length word. The larger slot capacity improves point
+  lookup throughput and reduces B+tree fanout pressure.
 
 ### Fixed
 
@@ -101,6 +104,8 @@ All notable changes to this project are documented here.
 - The free list is maintained in memory. Read-only reopening does not scan the
   tree; the first write transaction reconstructs the free list from the latest
   reachable state.
+- The on-disk format is version 3. Version 2 environments are rejected and must
+  be recreated; there is no in-place format migration yet.
 
 ## [0.1.0] - 2026-10-21
 

@@ -20,6 +20,7 @@ use memmap2::Mmap;
 use crate::Result;
 use crate::comparator::KeyComparator;
 use crate::database::{Database, DatabaseKind};
+use crate::storage::checksum;
 use crate::storage::commit;
 use crate::storage::meta::{self, Meta};
 use crate::storage::overflow::{self, OverflowRef};
@@ -1201,7 +1202,7 @@ pub(crate) fn read_comparator_id(path: &Path) -> Result<Option<String>> {
         "comparator identity file has trailing data"
     );
     let stored = LittleEndian::read_u32(&bytes[total - 4..]);
-    let actual = crc32c::crc32c(&bytes[..total - 4]);
+    let actual = checksum::hash(&bytes[..total - 4]);
     ensure!(stored == actual, "comparator identity checksum mismatch");
     let id = std::str::from_utf8(&bytes[16..16 + id_len])
         .context("comparator identifier is not UTF-8")?;
@@ -1219,7 +1220,7 @@ pub(crate) fn write_comparator_id(path: &Path, comparator_id: &str) -> Result<()
     bytes.extend_from_slice(&COMPARATOR_VERSION.to_le_bytes());
     bytes.extend_from_slice(&(comparator_id.len() as u32).to_le_bytes());
     bytes.extend_from_slice(comparator_id.as_bytes());
-    let checksum = crc32c::crc32c(&bytes);
+    let checksum = checksum::hash(&bytes);
     bytes.extend_from_slice(&checksum.to_le_bytes());
 
     let mut file = OpenOptions::new()
@@ -1249,7 +1250,7 @@ fn read_clean_marker(path: &Path) -> Option<u64> {
     let stored = u32::from_le_bytes(bytes[24..28].try_into().ok()?);
     let mut copy = bytes.clone();
     copy[24..28].fill(0);
-    if stored != crc32c::crc32c(&copy) {
+    if stored != checksum::hash_zeroed(&copy, 24, 28) {
         return None;
     }
 
@@ -1263,7 +1264,7 @@ fn write_clean_marker(path: &Path, txn_id: u64) -> Result<()> {
     bytes[0..8].copy_from_slice(&CLEAN_MAGIC);
     bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
     bytes[16..24].copy_from_slice(&txn_id.to_le_bytes());
-    let checksum = crc32c::crc32c(&bytes);
+    let checksum = checksum::hash(&bytes);
     bytes[24..28].copy_from_slice(&checksum.to_le_bytes());
 
     let file = OpenOptions::new()

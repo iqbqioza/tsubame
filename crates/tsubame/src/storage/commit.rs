@@ -9,6 +9,7 @@ use anyhow::{Context, Result, ensure};
 use byteorder::{ByteOrder, LittleEndian};
 
 use super::PAGE_SIZE;
+use super::checksum as checksum_mod;
 use super::meta::{INLINE_COMMIT_CAPACITY, Meta};
 use super::overflow::{self, OverflowRef};
 use super::page::Page;
@@ -65,7 +66,7 @@ impl CommitPage {
             LittleEndian::write_u64(&mut page[offset + 8..offset + 16], page_count);
         }
 
-        let checksum = crc32c_fast::crc32c(&page);
+        let checksum = checksum_mod::hash(&page);
         LittleEndian::write_u32(&mut page[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4], checksum);
 
         Ok(page)
@@ -328,9 +329,7 @@ fn page_slice(data: &[u8], page_id: u64) -> Result<&[u8]> {
 }
 
 fn checksum(page: &[u8]) -> u32 {
-    let checksum = crc32c::crc32c(&page[..CHECKSUM_OFFSET]);
-    let checksum = crc32c::crc32c_append(checksum, &[0u8; 4]);
-    crc32c::crc32c_append(checksum, &page[CHECKSUM_OFFSET + 4..])
+    checksum_mod::hash_zeroed(page, CHECKSUM_OFFSET, CHECKSUM_OFFSET + 4)
 }
 
 #[cfg(test)]

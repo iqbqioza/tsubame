@@ -176,6 +176,8 @@ The examples use a temporary directory and clean up after themselves.
   every open and offline compaction. A stable comparator ID is persisted in
   `comparator.tsubame` and must match. Prefix iteration requires lexicographic
   order.
+- The on-disk format is version 3. Earlier format versions are rejected and are
+  not migrated in place.
 - Performance is benchmarked rather than assumed; see [`benchmarks`](benchmarks).
 
 ## Development

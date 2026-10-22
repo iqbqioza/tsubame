@@ -4,6 +4,7 @@ use anyhow::{Context, Result, ensure};
 use byteorder::{ByteOrder, LittleEndian};
 
 use super::PAGE_SIZE;
+use super::checksum as checksum_mod;
 
 /// The size of an overflow reference stored in a leaf slot.
 pub(crate) const OVERFLOW_REF_SIZE: usize = 24;
@@ -119,7 +120,7 @@ pub(crate) fn encode_extent(reference: OverflowRef, value: &[u8], txn_id: u64) -
     LittleEndian::write_u64(&mut bytes[24..32], txn_id);
     bytes[EXTENT_HEADER_SIZE..EXTENT_HEADER_SIZE + value.len()].copy_from_slice(value);
 
-    let checksum = crc32c_fast::crc32c(&bytes);
+    let checksum = checksum_mod::hash(&bytes);
     LittleEndian::write_u32(&mut bytes[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4], checksum);
 
     Ok(bytes)
@@ -205,12 +206,7 @@ fn extent_len(reference: OverflowRef) -> Result<usize> {
 /// Computes the extent checksum with the checksum field zeroed.
 fn checksum(bytes: &[u8]) -> u32 {
     debug_assert!(bytes.len() >= EXTENT_HEADER_SIZE);
-    let mut header = [0u8; EXTENT_HEADER_SIZE];
-    header.copy_from_slice(&bytes[..EXTENT_HEADER_SIZE]);
-    header[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].fill(0);
-
-    let checksum = crc32c::crc32c(&header);
-    crc32c::crc32c_append(checksum, &bytes[EXTENT_HEADER_SIZE..])
+    checksum_mod::hash_zeroed(bytes, CHECKSUM_OFFSET, CHECKSUM_OFFSET + 4)
 }
 
 #[cfg(test)]

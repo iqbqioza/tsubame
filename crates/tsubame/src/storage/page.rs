@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail, ensure};
 use byteorder::{ByteOrder, LittleEndian};
 
 use super::PAGE_SIZE;
+use super::checksum;
 use super::overflow::{OVERFLOW_REF_SIZE, OverflowRef};
 use crate::comparator::KeyComparator;
 
@@ -20,10 +21,12 @@ pub(crate) const MAX_KEY_SIZE: usize = 1024;
 pub(crate) const INLINE_BUDGET: usize = PAGE_SIZE / 4;
 
 pub(crate) const HEADER_SIZE: usize = 32;
-pub(crate) const SLOT_SIZE: usize = 12;
+pub(crate) const SLOT_SIZE: usize = 8;
 const CHECKSUM_OFFSET: usize = 0;
 const BRANCH_CHILD_SIZE: usize = 8;
 const FLAG_OVERFLOW: u8 = 1 << 0;
+const OVERFLOW_BIT: u32 = 1 << 31;
+const VALUE_LEN_MASK: u32 = OVERFLOW_BIT - 1;
 
 /// The kind of a B+tree page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +61,37 @@ pub(crate) enum LeafValue<'a> {
     Inline(&'a [u8]),
     /// The value is stored in a contiguous overflow extent.
     Overflow(OverflowRef),
+}
+
+/// Decodes the value length and flags packed into a slot.
+#[inline]
+fn decode_slot_value(word: u32) -> (usize, u8) {
+    let flags = if word & OVERFLOW_BIT != 0 {
+        FLAG_OVERFLOW
+    } else {
+        0
+    };
+    ((word & VALUE_LEN_MASK) as usize, flags)
+}
+
+/// Packs a value length and flags into a slot word.
+#[inline]
+fn encode_slot_value(value_len: usize, flags: u8) -> Result<u32> {
+    ensure!(
+        flags & !FLAG_OVERFLOW == 0,
+        "unsupported slot flags {flags:#04x}"
+    );
+    let value_len = u32::try_from(value_len).context("value is too large")?;
+    ensure!(
+        value_len <= VALUE_LEN_MASK,
+        "value is too large for the page format"
+    );
+    Ok(value_len
+        | if flags & FLAG_OVERFLOW != 0 {
+            OVERFLOW_BIT
+        } else {
+            0
+        })
 }
 
 /// A validated view over one page.
@@ -183,13 +217,8 @@ impl<'a> Page<'a> {
                 let slot = HEADER_SIZE + index * SLOT_SIZE;
                 let cell_offset = LittleEndian::read_u16(&bytes[slot..slot + 2]) as usize;
                 let key_len = LittleEndian::read_u16(&bytes[slot + 2..slot + 4]) as usize;
-                let value_len = LittleEndian::read_u32(&bytes[slot + 4..slot + 8]) as usize;
-                let flags = bytes[slot + 8];
-
-                ensure!(
-                    flags & !FLAG_OVERFLOW == 0,
-                    "unsupported slot flags {flags:#04x}"
-                );
+                let value_word = LittleEndian::read_u32(&bytes[slot + 4..slot + 8]);
+                let (value_len, flags) = decode_slot_value(value_word);
                 ensure!(
                     key_len <= MAX_KEY_SIZE,
                     "slot {index} key is {key_len} bytes, maximum is {MAX_KEY_SIZE}"
@@ -498,8 +527,8 @@ impl<'a> Page<'a> {
         let slot = HEADER_SIZE + index * SLOT_SIZE;
         let offset = LittleEndian::read_u16(&self.bytes[slot..slot + 2]) as usize;
         let key_len = LittleEndian::read_u16(&self.bytes[slot + 2..slot + 4]) as usize;
-        let value_len = LittleEndian::read_u32(&self.bytes[slot + 4..slot + 8]) as usize;
-        let flags = self.bytes[slot + 8];
+        let value_word = LittleEndian::read_u32(&self.bytes[slot + 4..slot + 8]);
+        let (value_len, flags) = decode_slot_value(value_word);
         (offset, key_len, value_len, flags)
     }
 
@@ -522,8 +551,8 @@ impl<'a> Page<'a> {
         let slot = HEADER_SIZE + index * SLOT_SIZE;
         let offset = LittleEndian::read_u16(&self.bytes[slot..slot + 2]) as usize;
         let key_len = LittleEndian::read_u16(&self.bytes[slot + 2..slot + 4]) as usize;
-        let value_len = LittleEndian::read_u32(&self.bytes[slot + 4..slot + 8]) as usize;
-        let flags = self.bytes[slot + 8];
+        let value_word = LittleEndian::read_u32(&self.bytes[slot + 4..slot + 8]);
+        let (value_len, flags) = decode_slot_value(value_word);
 
         Ok((offset, key_len, value_len, flags))
     }
@@ -677,8 +706,8 @@ impl PageBuilder {
 
         LittleEndian::write_u16(&mut self.page[slot..slot + 2], new_end as u16);
         LittleEndian::write_u16(&mut self.page[slot + 2..slot + 4], key.len() as u16);
-        LittleEndian::write_u32(&mut self.page[slot + 4..slot + 8], value.len() as u32);
-        self.page[slot + 8] = flags;
+        let value_word = encode_slot_value(value.len(), flags)?;
+        LittleEndian::write_u32(&mut self.page[slot + 4..slot + 8], value_word);
 
         self.slot_count += 1;
         self.cell_end = new_end;
@@ -710,18 +739,16 @@ impl PageBuilder {
     }
 }
 
-/// Computes the CRC32C of a page with its checksum field treated as zero.
+/// Computes the checksum of a page with its checksum field treated as zero.
 fn page_checksum(page: &[u8]) -> u32 {
-    let checksum = crc32c::crc32c(&page[..CHECKSUM_OFFSET]);
-    let checksum = crc32c::crc32c_append(checksum, &[0u8; 4]);
-    crc32c::crc32c_append(checksum, &page[CHECKSUM_OFFSET + 4..])
+    checksum::hash_zeroed(page, CHECKSUM_OFFSET, CHECKSUM_OFFSET + 4)
 }
 
 /// Computes a page checksum when the caller owns the page and can zero the
 /// checksum field before hashing. This uses the faster full-buffer CRC path.
 fn page_checksum_for_write(page: &mut [u8; PAGE_SIZE]) -> u32 {
     page[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].fill(0);
-    crc32c_fast::crc32c(page)
+    checksum::hash(page)
 }
 
 /// Appends a leaf entry directly into an owned page buffer.
@@ -769,11 +796,8 @@ pub(crate) fn append_entry_in_place(
     page[value_start..value_start + value.len()].copy_from_slice(value);
     LittleEndian::write_u16(&mut page[slot..slot + 2], cell_start as u16);
     LittleEndian::write_u16(&mut page[slot + 2..slot + 4], key.len() as u16);
-    LittleEndian::write_u32(
-        &mut page[slot + 4..slot + 8],
-        u32::try_from(value.len()).context("value is too large")?,
-    );
-    page[slot + 8] = flags;
+    let value_word = encode_slot_value(value.len(), flags)?;
+    LittleEndian::write_u32(&mut page[slot + 4..slot + 8], value_word);
     LittleEndian::write_u16(&mut page[6..8], (slot_count + 1) as u16);
     LittleEndian::write_u16(&mut page[24..26], (slot + SLOT_SIZE) as u16);
     LittleEndian::write_u16(&mut page[26..28], cell_start as u16);
@@ -810,7 +834,9 @@ pub(crate) fn replace_value_in_place(
     );
     let start = offset + key_len;
     page[start..start + value_len].copy_from_slice(value);
-    page[HEADER_SIZE + index * SLOT_SIZE + 8] = flags;
+    let slot = HEADER_SIZE + index * SLOT_SIZE;
+    let value_word = encode_slot_value(value_len, flags)?;
+    LittleEndian::write_u32(&mut page[slot + 4..slot + 8], value_word);
     reseal(page, page_id, txn_id);
     Ok(())
 }
@@ -893,11 +919,8 @@ pub(crate) fn replace_value_resized_in_place(
 
     let slot = HEADER_SIZE + index * SLOT_SIZE;
     LittleEndian::write_u16(&mut page[slot..slot + 2], new_start as u16);
-    LittleEndian::write_u32(
-        &mut page[slot + 4..slot + 8],
-        u32::try_from(value.len()).context("value is too large")?,
-    );
-    page[slot + 8] = flags;
+    let value_word = encode_slot_value(value.len(), flags)?;
+    LittleEndian::write_u32(&mut page[slot + 4..slot + 8], value_word);
 
     if value.len() != value_len {
         let delta = value.len() as isize - value_len as isize;
@@ -1003,7 +1026,7 @@ mod tests {
     #[test]
     fn rejects_a_corrupt_checksum() {
         let mut page = leaf();
-        page[100] ^= 0xff;
+        page[8] ^= 0xff;
 
         assert!(Page::parse(&page, Some(2)).is_err());
     }
@@ -1030,7 +1053,7 @@ mod tests {
         let fast = page_checksum_for_write(&mut page);
         let mut reference = page;
         reference[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].fill(0);
-        assert_eq!(fast, crc32c::crc32c(&reference));
+        assert_eq!(fast, checksum::hash(&reference));
     }
 
     #[test]
