@@ -43,6 +43,13 @@ impl PageOverlay {
         Self::Small(Vec::new())
     }
 
+    fn len(&self) -> usize {
+        match self {
+            Self::Small(entries) => entries.len(),
+            Self::Large(pages) => pages.len(),
+        }
+    }
+
     fn get(&self, page_id: u64) -> Option<&[u8; PAGE_SIZE]> {
         match self {
             Self::Small(entries) => entries
@@ -654,20 +661,40 @@ impl<'env> RwTxn<'env> {
         self.apply_pending(&mut root)?;
 
         let txn_id = self.txn_id;
-        let mut single_page = None;
-        let mut entries = Vec::new();
-        if self.extents.is_empty() {
-            let mut overlay = self.overlay.iter();
-            if let Some((page_id, _)) = overlay.next()
-                && overlay.next().is_none()
-            {
-                single_page = Some(*page_id);
-            }
-        }
-        let descriptor =
-            if let Some(page_id) = single_page {
-                Descriptor::Page(page_id)
+        let overlay_len = self.overlay.len();
+        let extent_len = self.extents.len();
+        let entry_count = overlay_len + extent_len;
+        let (commit_record, commit_page, inline, inline_count) =
+            if entry_count == 0 {
+                (0, 0, None, 0)
+            } else if overlay_len == 1 && extent_len == 0 {
+                let page_id = self
+                    .overlay
+                    .iter()
+                    .next()
+                    .map(|(page_id, _)| *page_id)
+                    .context("overlay has no page")?;
+                (0, page_id, None, 0)
+            } else if entry_count <= meta::INLINE_COMMIT_CAPACITY {
+                let mut inline = [InlineCommit::default(); meta::INLINE_COMMIT_CAPACITY];
+                let mut slot = 0;
+                for (page_id, _) in self.overlay.iter() {
+                    inline[slot] = InlineCommit {
+                        page_id: *page_id,
+                        page_count: 0,
+                    };
+                    slot += 1;
+                }
+                for (start_page, bytes) in &self.extents {
+                    inline[slot] = InlineCommit {
+                        page_id: *start_page,
+                        page_count: (bytes.len() / PAGE_SIZE) as u64,
+                    };
+                    slot += 1;
+                }
+                (0, 0, Some(inline), slot as u32)
             } else {
+                let mut entries = Vec::with_capacity(entry_count);
                 entries.extend(
                     self.overlay
                         .iter()
@@ -679,43 +706,42 @@ impl<'env> RwTxn<'env> {
                         page_count: (bytes.len() / PAGE_SIZE) as u64,
                     }
                 }));
-                commit::build(&mut self, txn_id, &entries)?
-            };
-        let (commit_record, commit_page, inline, inline_count) = match descriptor {
-            Descriptor::None => (0, 0, None, 0),
-            Descriptor::Page(page_id) => (0, page_id, None, 0),
-            Descriptor::Inline(entries) => {
-                let mut inline = [InlineCommit::default(); meta::INLINE_COMMIT_CAPACITY];
-                for (slot, entry) in entries.iter().enumerate() {
-                    inline[slot] = match *entry {
-                        CommitEntry::Page(page_id) => InlineCommit {
-                            page_id,
-                            page_count: 0,
-                        },
-                        CommitEntry::Extent {
-                            start_page,
-                            page_count,
-                        } => InlineCommit {
-                            page_id: start_page,
-                            page_count,
-                        },
-                    };
+                match commit::build(&mut self, txn_id, &entries)? {
+                    Descriptor::None => (0, 0, None, 0),
+                    Descriptor::Page(page_id) => (0, page_id, None, 0),
+                    Descriptor::Inline(entries) => {
+                        let mut inline = [InlineCommit::default(); meta::INLINE_COMMIT_CAPACITY];
+                        for (slot, entry) in entries.iter().enumerate() {
+                            inline[slot] = match *entry {
+                                CommitEntry::Page(page_id) => InlineCommit {
+                                    page_id,
+                                    page_count: 0,
+                                },
+                                CommitEntry::Extent {
+                                    start_page,
+                                    page_count,
+                                } => InlineCommit {
+                                    page_id: start_page,
+                                    page_count,
+                                },
+                            };
+                        }
+                        (0, 0, Some(inline), entries.len() as u32)
+                    }
+                    Descriptor::Chain(page_id) => {
+                        let pages = commit::chain_page_count(entries.len())?;
+                        self.deferred_free.push(FreeExtent {
+                            start_page: page_id,
+                            pages,
+                            // The new meta references this chain. It cannot be reused
+                            // until the following two commits have replaced both
+                            // recoverable meta snapshots.
+                            freed_txn: self.txn_id.saturating_add(1),
+                        });
+                        (page_id, 0, None, 0)
+                    }
                 }
-                (0, 0, Some(inline), entries.len() as u32)
-            }
-            Descriptor::Chain(page_id) => {
-                let pages = commit::chain_page_count(entries.len())?;
-                self.deferred_free.push(FreeExtent {
-                    start_page: page_id,
-                    pages,
-                    // The new meta references this chain. It cannot be reused
-                    // until the following two commits have replaced both
-                    // recoverable meta snapshots.
-                    freed_txn: self.txn_id.saturating_add(1),
-                });
-                (page_id, 0, None, 0)
-            }
-        };
+            };
 
         let new_meta = Meta {
             txn_id,
@@ -734,6 +760,16 @@ impl<'env> RwTxn<'env> {
         if let Err(error) = self.write_and_sync(&new_meta) {
             self.env.inner.poison();
             return Err(error);
+        }
+
+        // These pages were just written and synced with checksums computed by
+        // the page builder or reseal path. Mark them verified so the next
+        // writer does not re-parse and checksum them on its first read.
+        for (page_id, _) in self.overlay.iter() {
+            self.state.mark_verified(*page_id);
+        }
+        for start_page in self.extents.keys() {
+            self.state.mark_verified(*start_page);
         }
 
         self.recycle_pages();

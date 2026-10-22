@@ -52,6 +52,9 @@ All notable changes to this project are documented here.
 - Staged pending keys up to 16 bytes are stored inline instead of allocating a
   `Vec` per write, and bulk loading borrows staged keys instead of first
   converting every key to an owned buffer.
+- Small commits build inline commit descriptors directly without allocating a
+  `CommitEntry` vector or cloning it. Pages written by a successful commit are
+  marked verified to avoid rechecking their checksums on the next writer read.
 - Bulk loading builds leaf pages from borrowed entries instead of cloning
   every key and value.
 - Verified page reads bypass redundant header checks, and binary-search slot

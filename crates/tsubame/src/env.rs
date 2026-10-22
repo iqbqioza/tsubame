@@ -663,7 +663,7 @@ impl EnvState {
     }
 
     #[inline]
-    fn mark_verified(&self, page_id: u64) {
+    pub(crate) fn mark_verified(&self, page_id: u64) {
         let index = (page_id / 64) as usize;
         let bit = 1u64 << (page_id % 64);
         if let Some(word) = self.verified.get(index) {
