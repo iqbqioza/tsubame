@@ -17,6 +17,9 @@ All notable changes to this project are documented here.
   freed by a previous process become reusable without a compaction.
 - `get_rw`, `range_rw`, `rev_iter_rw`, `rev_range_rw`, `prefix_rw`, and
   `rev_prefix_rw` on write transactions, including staged puts and deletes.
+- `Database::first`, `last`, `len`, and `is_empty` inspection helpers, plus
+  `first_rw`, `last_rw`, `len_rw`, and `is_empty_rw` for staged transaction
+  views.
 - Clearing a database now releases its old tree pages for reuse.
 - `Env::compact_online` while a writable environment remains open. Active read
   transactions and database handles keep their previous mmap generation; a

@@ -10,7 +10,7 @@ use std::marker::PhantomData;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use anyhow::ensure;
+use anyhow::{Context, ensure};
 
 use crate::Result;
 use crate::env::EnvInner;
@@ -127,6 +127,137 @@ impl<KC, DC> Database<KC, DC> {
         Ok(Some(DC::bytes_decode(value).map_err(|error| {
             codec_error("value decoding failed", error)
         })?))
+    }
+
+    /// Returns the first entry in ascending key order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be resolved or a key/value
+    /// cannot be decoded.
+    pub fn first<'txn, 'env>(
+        &self,
+        txn: &'txn RoTxn<'env>,
+    ) -> Result<Option<(KC::DItem, DC::DItem)>>
+    where
+        KC: BytesDecode<'txn>,
+        DC: BytesDecode<'txn>,
+    {
+        self.iter(txn)?.next().transpose()
+    }
+
+    /// Returns the last entry in ascending key order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be resolved or a key/value
+    /// cannot be decoded.
+    pub fn last<'txn, 'env>(&self, txn: &'txn RoTxn<'env>) -> Result<Option<(KC::DItem, DC::DItem)>>
+    where
+        KC: BytesDecode<'txn>,
+        DC: BytesDecode<'txn>,
+    {
+        self.rev_iter(txn)?.next().transpose()
+    }
+
+    /// Returns the number of entries in the database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be resolved or a key/value
+    /// cannot be decoded.
+    pub fn len(&self, txn: &RoTxn<'_>) -> Result<u64>
+    where
+        KC: for<'a> BytesDecode<'a>,
+        DC: for<'a> BytesDecode<'a>,
+    {
+        let mut len = 0u64;
+        for entry in self.iter(txn)? {
+            entry?;
+            len = len.checked_add(1).context("database length overflow")?;
+        }
+        Ok(len)
+    }
+
+    /// Returns whether the database contains no entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be resolved or a key/value
+    /// cannot be decoded.
+    pub fn is_empty(&self, txn: &RoTxn<'_>) -> Result<bool>
+    where
+        KC: for<'a> BytesDecode<'a>,
+        DC: for<'a> BytesDecode<'a>,
+    {
+        Ok(self.first(txn)?.is_none())
+    }
+
+    /// Returns the first entry in the write transaction's view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be resolved or a key/value
+    /// cannot be decoded.
+    pub fn first_rw<'txn, 'env>(
+        &self,
+        txn: &'txn RwTxn<'env>,
+    ) -> Result<Option<(KC::DItem, DC::DItem)>>
+    where
+        KC: BytesDecode<'txn>,
+        DC: BytesDecode<'txn>,
+    {
+        self.iter_rw(txn)?.next().transpose()
+    }
+
+    /// Returns the last entry in the write transaction's view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be resolved or a key/value
+    /// cannot be decoded.
+    pub fn last_rw<'txn, 'env>(
+        &self,
+        txn: &'txn RwTxn<'env>,
+    ) -> Result<Option<(KC::DItem, DC::DItem)>>
+    where
+        KC: BytesDecode<'txn>,
+        DC: BytesDecode<'txn>,
+    {
+        self.rev_iter_rw(txn)?.next().transpose()
+    }
+
+    /// Returns the number of entries in the write transaction's view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be resolved or a key/value
+    /// cannot be decoded.
+    pub fn len_rw(&self, txn: &RwTxn<'_>) -> Result<u64>
+    where
+        KC: for<'a> BytesDecode<'a>,
+        DC: for<'a> BytesDecode<'a>,
+    {
+        let mut len = 0u64;
+        for entry in self.iter_rw(txn)? {
+            entry?;
+            len = len.checked_add(1).context("database length overflow")?;
+        }
+        Ok(len)
+    }
+
+    /// Returns whether the write transaction's view is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be resolved or a key/value
+    /// cannot be decoded.
+    pub fn is_empty_rw(&self, txn: &RwTxn<'_>) -> Result<bool>
+    where
+        KC: for<'a> BytesDecode<'a>,
+        DC: for<'a> BytesDecode<'a>,
+    {
+        Ok(self.first_rw(txn)?.is_none())
     }
 
     /// Returns an iterator over all entries in ascending key order.
