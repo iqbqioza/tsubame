@@ -82,6 +82,15 @@ impl<KC, DC> Database<KC, DC> {
         txn.root_for(&self.kind)
     }
 
+    fn contains_rw<'a>(&self, txn: &RwTxn<'_>, key: &'a KC::EItem) -> Result<bool>
+    where
+        KC: BytesEncode<'a>,
+    {
+        let mut key_buffer = [0u8; KEY_ENCODE_BUFFER];
+        let key = encode_key::<KC>(key, &mut key_buffer)?;
+        Ok(txn.get_raw(&self.kind, key.as_slice())?.is_some())
+    }
+
     /// Returns the value associated with `key`, if it exists.
     ///
     /// # Errors
@@ -145,6 +154,43 @@ impl<KC, DC> Database<KC, DC> {
         Ok(Some(DC::bytes_decode(value).map_err(|error| {
             codec_error("value decoding failed", error)
         })?))
+    }
+
+    /// Inserts `data` only when `key` is absent, returning the previous value.
+    ///
+    /// This is the write-transaction equivalent of heed's `get_or_put`: the
+    /// existing value is returned when the key is present, and the new value is
+    /// staged when it is not. Staged puts and deletes in the same transaction
+    /// are respected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key or value cannot be encoded, the value cannot
+    /// be decoded, or the transaction cannot stage the write. A failed put
+    /// marks the transaction as failed; it can only be aborted.
+    pub fn get_or_put<'a, 'txn>(
+        &self,
+        txn: &'txn mut RwTxn<'_>,
+        key: &'a KC::EItem,
+        data: &'a DC::EItem,
+    ) -> Result<Option<DC::DItem>>
+    where
+        KC: BytesEncode<'a>,
+        DC: BytesEncode<'a> + BytesDecode<'txn>,
+    {
+        ensure!(
+            txn.belongs_to(&self.env),
+            "transaction belongs to a different environment"
+        );
+
+        // The presence check only borrows the transaction for its own scope;
+        // keeping a decoded value here would extend that borrow through put.
+        if self.contains_rw(txn, key)? {
+            return self.get_rw(txn, key);
+        }
+
+        self.put(txn, key, data)?;
+        Ok(None)
     }
 
     /// Returns the first entry whose key is strictly greater than `key`.

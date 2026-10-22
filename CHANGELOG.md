@@ -20,6 +20,9 @@ All notable changes to this project are documented here.
 - `Database::first`, `last`, `len`, and `is_empty` inspection helpers, plus
   `first_rw`, `last_rw`, `len_rw`, and `is_empty_rw` for staged transaction
   views.
+- `Database::get_or_put` inserts only when a key is absent and returns the
+  existing decoded value without overwriting it. Staged puts and deletes are
+  respected.
 - `Database::delete_range` removes all visible entries in a range and returns
   the number deleted. A full range is handled through the same path as
   `Database::clear` after counting.

@@ -107,6 +107,43 @@ fn database_stat_reports_tree_structure() -> Result<()> {
 }
 
 #[test]
+fn get_or_put_returns_the_existing_value_without_overwriting() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+
+    assert_eq!(db.get_or_put(&mut wtxn, "a", "first")?, None);
+    assert_eq!(db.get_rw(&wtxn, "a")?, Some("first"));
+    assert_eq!(db.get_or_put(&mut wtxn, "a", "second")?, Some("first"));
+    assert_eq!(db.get_rw(&wtxn, "a")?, Some("first"));
+
+    db.delete(&mut wtxn, "a")?;
+    assert_eq!(db.get_or_put(&mut wtxn, "a", "third")?, None);
+    assert_eq!(db.get_rw(&wtxn, "a")?, Some("third"));
+
+    db.put(&mut wtxn, "b", "staged")?;
+    assert_eq!(
+        db.get_or_put(&mut wtxn, "b", "replacement")?,
+        Some("staged")
+    );
+    assert_eq!(db.get_rw(&wtxn, "b")?, Some("staged"));
+
+    db.put(&mut wtxn, "c", "deleted")?;
+    db.delete(&mut wtxn, "c")?;
+    assert_eq!(db.get_or_put(&mut wtxn, "c", "inserted")?, None);
+    assert_eq!(db.get_rw(&wtxn, "c")?, Some("inserted"));
+
+    wtxn.commit()?;
+    let rtxn = env.read_txn()?;
+    assert_eq!(db.get(&rtxn, "a")?, Some("third"));
+    assert_eq!(db.get(&rtxn, "b")?, Some("staged"));
+    assert_eq!(db.get(&rtxn, "c")?, Some("inserted"));
+
+    Ok(())
+}
+
+#[test]
 fn directional_lookups_follow_key_order() -> Result<()> {
     let dir = tempdir()?;
     let env = options().open(dir.path())?;

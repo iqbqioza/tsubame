@@ -61,6 +61,7 @@ added without changing the main API.
 - [x] Database structural statistics
 - [x] Heed-style write-transaction iterator aliases and `Env::force_sync`
 - [x] Range deletion with `Database::delete_range`
+- [x] Conditional insertion with `Database::get_or_put`
 
 ## Codec features
 
