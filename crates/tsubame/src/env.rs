@@ -183,16 +183,8 @@ impl Env {
             .writer
             .lock()
             .map_err(|_| anyhow::anyhow!("transaction lock is poisoned"))?;
-        let state_guard = self
-            .inner
-            .state
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let state = Arc::clone(&state_guard);
         let committed = self.inner.read_committed();
-        drop(state_guard);
-        self.inner.ensure_free_pool();
-        RwTxn::new(self, writer, committed, state)
+        RwTxn::new(self, writer, committed)
     }
 
     /// Opens the unnamed default database or a named database.
@@ -1259,6 +1251,9 @@ impl EnvInner {
         if readers.contains_key(&READER_RESERVED) {
             return 0;
         }
+        if readers.is_empty() && !self.multi_process {
+            return fallback;
+        }
         let oldest = readers.keys().next().copied().unwrap_or(fallback);
         drop(readers);
         if !self.multi_process {
@@ -1337,6 +1332,9 @@ impl EnvInner {
             .free_pool
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pool.is_empty() {
+            return Vec::new();
+        }
         let mut reusable = Vec::new();
         let mut retained = Vec::with_capacity(pool.len());
 
@@ -1349,21 +1347,7 @@ impl EnvInner {
         }
 
         *pool = retained;
-        reusable.sort_unstable_by_key(|extent| extent.start_page);
-        let mut merged: Vec<FreeExtent> = Vec::with_capacity(reusable.len());
-        for extent in reusable {
-            if let Some(last) = merged.last_mut()
-                && last.start_page + last.pages == extent.start_page
-            {
-                last.pages += extent.pages;
-                // The merged extent is only reusable once the later
-                // generation has also become safe.
-                last.freed_txn = last.freed_txn.max(extent.freed_txn);
-            } else {
-                merged.push(extent);
-            }
-        }
-        merged
+        reusable
     }
 
     pub(crate) fn return_free(&self, extents: impl IntoIterator<Item = FreeExtent>) {
@@ -1380,7 +1364,10 @@ impl EnvInner {
     /// read-only reopen latency proportional to the database size. The writer
     /// lock is already held when this is called, so the scan runs once.
     pub(crate) fn ensure_free_pool(&self) {
-        if !self.page_reuse || self.free_pool_ready.swap(true, Ordering::AcqRel) {
+        if !self.page_reuse || self.free_pool_ready.load(Ordering::Acquire) {
+            return;
+        }
+        if self.free_pool_ready.swap(true, Ordering::AcqRel) {
             return;
         }
         let committed = self.read_committed();

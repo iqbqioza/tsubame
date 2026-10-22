@@ -12,7 +12,7 @@ use super::io;
 const MAGIC: [u8; 8] = *b"TSUBAME\0";
 
 /// The on-disk format version implemented by this crate.
-pub(crate) const FORMAT_VERSION: u32 = 4;
+pub(crate) const FORMAT_VERSION: u32 = 5;
 
 /// The number of meta slots stored at the start of the data file.
 const META_SLOTS: usize = 2;
@@ -47,7 +47,7 @@ pub(crate) struct Meta {
     pub(crate) page_count: u64,
     /// Number of named databases.
     pub(crate) database_count: u32,
-    /// Reserved flags. Must be zero in format version 4.
+    /// Reserved flags. Must be zero in format version 5.
     pub(crate) flags: u32,
     /// First page of the commit record chain, or 0 when there are no new pages.
     pub(crate) commit_record: u64,

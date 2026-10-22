@@ -2,7 +2,7 @@
 //!
 //! A page is a slotted container. The slot array grows upward from the header
 //! and cells are packed downward from the end of the page. Every page carries
-//! a CRC32C checksum over its bytes with the checksum field zeroed.
+//! an XXH3 checksum over its used bytes with the checksum field zeroed.
 
 use std::cmp::Ordering;
 
@@ -152,7 +152,7 @@ impl<'a> Page<'a> {
 
         if verify_checksum {
             let stored = LittleEndian::read_u32(&bytes[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4]);
-            let actual = page_checksum(bytes);
+            let actual = page_checksum(bytes)?;
             ensure!(
                 stored == actual,
                 "page checksum mismatch (stored {stored:#010x}, computed {actual:#010x})"
@@ -704,16 +704,25 @@ impl PageBuilder {
     }
 }
 
-/// Computes the checksum of a page with its checksum field treated as zero.
-fn page_checksum(page: &[u8]) -> u32 {
-    checksum::hash_zeroed(page, CHECKSUM_OFFSET, CHECKSUM_OFFSET + 4)
+/// Computes the checksum over the used regions of a page.
+fn page_checksum(page: &[u8]) -> Result<u32> {
+    let free_start = LittleEndian::read_u16(&page[24..26]) as usize;
+    let free_end = LittleEndian::read_u16(&page[26..28]) as usize;
+    ensure!(
+        free_start >= HEADER_SIZE && free_start <= free_end && free_end <= PAGE_SIZE,
+        "page free area is outside the page: {free_start}..{free_end}"
+    );
+    Ok(checksum::hash_page_used(page, free_start, free_end))
 }
 
 /// Computes a page checksum when the caller owns the page and can zero the
 /// checksum field before hashing. This uses the faster full-buffer CRC path.
 fn page_checksum_for_write(page: &mut [u8; PAGE_SIZE]) -> u32 {
     page[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].fill(0);
-    checksum::hash(page)
+    let free_start = LittleEndian::read_u16(&page[24..26]) as usize;
+    let free_end = LittleEndian::read_u16(&page[26..28]) as usize;
+    debug_assert!(free_start >= HEADER_SIZE && free_start <= free_end && free_end <= PAGE_SIZE);
+    checksum::hash_page_used(page, free_start, free_end)
 }
 
 /// Appends a leaf entry directly into an owned page buffer.
@@ -1106,7 +1115,7 @@ mod tests {
         let fast = page_checksum_for_write(&mut page);
         let mut reference = page;
         reference[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].fill(0);
-        assert_eq!(fast, checksum::hash(&reference));
+        assert_eq!(fast, page_checksum(&reference).unwrap());
     }
 
     #[test]
