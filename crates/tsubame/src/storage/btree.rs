@@ -775,33 +775,53 @@ fn bulk_delete_leaf<S: PageStore, K: AsRef<[u8]>>(
     txn_id: u64,
     comparator: &KeyComparator,
 ) -> Result<Option<u64>> {
-    let mut entries = store.with_page(page_id, collect_leaf)?;
-    let mut removed = Vec::new();
-    let mut changed = false;
-    for key in keys {
-        let key = key.as_ref();
-        if let Ok(index) =
-            entries.binary_search_by(|entry| comparator.compare(entry.key.as_slice(), key))
-        {
-            removed.push(entries.remove(index));
-            changed = true;
+    let changed = store.with_page(page_id, |page| {
+        for key in keys {
+            let key = key.as_ref();
+            let index = page.lower_bound_with(key, comparator)?;
+            if index < page.slot_count()
+                && comparator.compare(page.key(index)?, key) == Ordering::Equal
+            {
+                return Ok(true);
+            }
         }
-    }
+        Ok(false)
+    })?;
     if !changed {
         return Ok(None);
     }
 
-    for entry in &removed {
-        free_value(store, &entry.value)?;
-    }
-    if entries.is_empty() {
-        store.free_pages(page_id, 1)?;
-        return Ok(Some(0));
-    }
+    let mut removed = Vec::new();
+    let mut empty = false;
+    let new_page = store.rewrite_page(page_id, |new_page_id, bytes| {
+        for key in keys.iter().rev() {
+            let key = key.as_ref();
+            let page = Page::parse_trusted(bytes, None)?;
+            if page.slot_count() == 0 {
+                break;
+            }
+            let index = page.lower_bound_with(key, comparator)?;
+            if index < page.slot_count()
+                && comparator.compare(page.key(index)?, key) == Ordering::Equal
+                && let Some(reference) =
+                    page::delete_entry_in_place(bytes, new_page_id, txn_id, index)?
+            {
+                removed.push(reference);
+            }
+        }
+        empty = Page::parse_trusted(bytes, None)?.slot_count() == 0;
+        Ok(())
+    })?;
 
-    let new_page = allocate_leaf(store, &entries, txn_id)?;
-    store.free_pages(page_id, 1)?;
-    Ok(Some(new_page))
+    for reference in removed {
+        store.free_pages(reference.start_page, reference.page_count)?;
+    }
+    if empty {
+        store.free_pages(new_page, 1)?;
+        Ok(Some(0))
+    } else {
+        Ok(Some(new_page))
+    }
 }
 
 fn bulk_delete_branch<S: PageStore, K: AsRef<[u8]>>(

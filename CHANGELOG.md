@@ -98,7 +98,8 @@ All notable changes to this project are documented here.
   high bit of the value-length word. The larger slot capacity improves point
   lookup throughput and reduces B+tree fanout pressure.
 - Meta and commit-record checksums cover only the bytes that carry metadata,
-  avoiding a full-page hash on every commit.
+  avoiding a full-page hash on every commit. Page checksums use XXH3 over the
+  used page regions, skipping uncommitted free space.
 - Committed pages, overflow extents, and the new meta page are written directly
   into writable shared mappings, removing per-page `pwrite` syscalls and overlay
   copies from the commit path. POSIX systems flush the mappings with one
@@ -120,6 +121,9 @@ All notable changes to this project are documented here.
 - Ordered iteration keeps the current leaf page in the cursor instead of looking
   it up again for every entry. Range, prefix, and reverse scans avoid one page
   lookup per key.
+- Writer startup defers state and free-list setup until the first allocation,
+  and transaction-owned page sets are boxed/lazily initialized where possible.
+  Startup write bursts therefore avoid work not required by the transaction.
 
 ### Fixed
 
@@ -132,7 +136,7 @@ All notable changes to this project are documented here.
 - The free list is maintained in memory. Read-only reopening does not scan the
   tree; the first write transaction reconstructs the free list from the latest
   reachable state.
-- The on-disk format is version 4. Earlier format versions are rejected and must
+- The on-disk format is version 5. Earlier format versions are rejected and must
   be recreated; there is no in-place format migration yet.
 
 ## [0.1.0] - 2026-10-21

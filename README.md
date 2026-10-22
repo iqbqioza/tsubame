@@ -180,7 +180,7 @@ The examples use a temporary directory and clean up after themselves.
   pages can be written through a writable mapping. The file is sparse on Unix,
   but tools that copy the file may copy its logical size rather than its used
   pages.
-- The on-disk format is version 4. Earlier format versions are rejected and are
+- The on-disk format is version 5. Earlier format versions are rejected and are
   not migrated in place.
 - Performance is benchmarked rather than assumed; see [`benchmarks`](benchmarks).
 
@@ -214,8 +214,8 @@ See [CHANGELOG.md](CHANGELOG.md) for release notes.
 ## Benchmarks
 
 The standalone [`benchmarks`](benchmarks) crate compares Tsubame with heed on
-batch inserts, point reads, range scans, durable commit latency, bulk deletes,
-and reopen time:
+batch inserts, point reads, range scans, large values, durable commit latency,
+startup writes, bulk deletes, and reopen time:
 
 ```sh
 cd benchmarks

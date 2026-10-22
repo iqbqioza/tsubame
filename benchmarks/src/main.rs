@@ -20,6 +20,7 @@ struct Config {
     reads: u64,
     commits: u64,
     warmup_reads: u64,
+    repeats: u32,
 }
 
 fn config() -> &'static Config {
@@ -29,6 +30,9 @@ fn config() -> &'static Config {
         reads: env_u64("TSUBAME_BENCH_READS", 1_000_000),
         commits: env_u64("TSUBAME_BENCH_COMMITS", 50),
         warmup_reads: env_u64("TSUBAME_BENCH_WARMUP", 10_000),
+        repeats: u32::try_from(env_u64("TSUBAME_BENCH_REPEATS", 5))
+            .unwrap_or(3)
+            .max(1),
     })
 }
 
@@ -44,6 +48,7 @@ type HeedDb = heed::Database<HeedU64<HeedEndian>, HeedStr>;
 type TsubameLargeDb = tsubame::Database<TsubameU64<TsubameEndian>, TsubameBytes>;
 type HeedLargeDb = heed::Database<HeedU64<HeedEndian>, HeedBytes>;
 
+#[derive(Clone, Copy)]
 struct Report {
     insert: Duration,
     read: Duration,
@@ -65,16 +70,16 @@ fn main() -> Result<()> {
                 options.map_size(MAP_SIZE);
                 let duration = bench_tsubame_commit(dir.path(), &mut options)?;
                 println!(
-                    "tsubame commit: {:.2} us/op",
-                    duration.as_secs_f64() * 1_000_000.0 / config().commits as f64
+                    "tsubame commit median: {:.2} us/op",
+                    duration.as_secs_f64() * 1_000_000.0
                 );
                 return Ok(());
             }
             "heed-commit" => {
                 let duration = bench_heed_commit(dir.path())?;
                 println!(
-                    "heed commit: {:.2} us/op",
-                    duration.as_secs_f64() * 1_000_000.0 / config().commits as f64
+                    "heed commit median: {:.2} us/op",
+                    duration.as_secs_f64() * 1_000_000.0
                 );
                 return Ok(());
             }
@@ -84,11 +89,17 @@ fn main() -> Result<()> {
 
     let config = config();
     println!(
-        "dataset: {} entries, {} point reads, {} commits, map {MAP_SIZE} bytes",
-        config.entries, config.reads, config.commits
+        "dataset: {} entries, {} point reads, {} commits, {} repeats, map {MAP_SIZE} bytes",
+        config.entries, config.reads, config.commits, config.repeats
     );
-    let tsubame = run_tsubame()?;
-    let heed = run_heed()?;
+    let mut tsubame_runs = Vec::with_capacity(config.repeats as usize);
+    let mut heed_runs = Vec::with_capacity(config.repeats as usize);
+    for _ in 0..config.repeats {
+        tsubame_runs.push(run_tsubame()?);
+        heed_runs.push(run_heed()?);
+    }
+    let tsubame = median_report(&tsubame_runs);
+    let heed = median_report(&heed_runs);
 
     println!();
     println!("scenario                                  Tsubame          heed     Tsubame/heed");
@@ -122,19 +133,19 @@ fn main() -> Result<()> {
         "ns/op",
     );
     print_row(
-        "durable commit",
+        "durable commit (median)",
         tsubame.commit,
         heed.commit,
-        config.commits,
+        1,
         "us/op",
     );
     print_row("bulk delete (1 txn)", tsubame.delete, heed.delete, 1, "ms");
     print_row("reopen", tsubame.reopen, heed.reopen, 1, "ms");
     print_row(
-        "first write after reopen",
+        "startup writes (1000)",
         tsubame.first_write,
         heed.first_write,
-        1,
+        1000,
         "us/op",
     );
 
@@ -156,6 +167,24 @@ fn per_op(duration: Duration, ops: u64, unit: &str) -> f64 {
         "us/op" => duration.as_secs_f64() * 1_000_000.0 / ops as f64,
         "ms" => duration.as_secs_f64() * 1_000.0 / ops as f64,
         _ => duration.as_secs_f64() * 1_000.0,
+    }
+}
+
+fn median_report(reports: &[Report]) -> Report {
+    fn median(mut values: Vec<Duration>) -> Duration {
+        values.sort_unstable();
+        values[values.len() / 2]
+    }
+    Report {
+        insert: median(reports.iter().map(|report| report.insert).collect()),
+        read: median(reports.iter().map(|report| report.read).collect()),
+        range: median(reports.iter().map(|report| report.range).collect()),
+        commit: median(reports.iter().map(|report| report.commit).collect()),
+        delete: median(reports.iter().map(|report| report.delete).collect()),
+        first_write: median(reports.iter().map(|report| report.first_write).collect()),
+        large_insert: median(reports.iter().map(|report| report.large_insert).collect()),
+        large_read: median(reports.iter().map(|report| report.large_read).collect()),
+        reopen: median(reports.iter().map(|report| report.reopen).collect()),
     }
 }
 
@@ -210,16 +239,13 @@ fn run_tsubame() -> Result<Report> {
     let db: TsubameDb = env.open_database(&rtxn, None)?;
     assert_eq!(db.get(&rtxn, &0)?, Some(values[0].as_str()));
     drop(rtxn);
-    let start = Instant::now();
-    let first_write_txn = env.write_txn()?;
-    let first_write = start.elapsed();
-    first_write_txn.abort()?;
     drop(db);
     drop(env);
 
     let (large_insert, large_read) = bench_tsubame_large()?;
     let commit = bench_tsubame_commit(dir.path(), &mut options)?;
     let delete = bench_tsubame_delete(dir.path(), &mut options)?;
+    let first_write = bench_tsubame_startup(dir.path(), &mut options)?;
 
     Ok(Report {
         insert,
@@ -241,14 +267,16 @@ fn bench_tsubame_commit(path: &std::path::Path, options: &mut TsubameOptions) ->
     let db: TsubameDb = env.create_database(&mut wtxn, None)?;
     wtxn.commit()?;
 
-    let start = Instant::now();
+    let mut samples = Vec::with_capacity(config.commits as usize);
     for i in 0..config.commits {
+        let start = Instant::now();
         let mut wtxn = env.write_txn()?;
         db.put(&mut wtxn, &i, "value")?;
         wtxn.commit()?;
+        samples.push(start.elapsed());
     }
-
-    Ok(start.elapsed())
+    samples.sort_unstable();
+    Ok(samples[samples.len() / 2])
 }
 
 fn bench_tsubame_delete(path: &std::path::Path, options: &mut TsubameOptions) -> Result<Duration> {
@@ -329,15 +357,12 @@ fn run_heed() -> Result<Report> {
         .context("unnamed database is missing")?;
     assert_eq!(db.get(&rtxn, &0)?, Some(values[0].as_str()));
     drop(rtxn);
-    let start = Instant::now();
-    let first_write_txn = env.write_txn()?;
-    let first_write = start.elapsed();
-    first_write_txn.abort();
     drop(env);
 
     let (large_insert, large_read) = bench_heed_large()?;
     let commit = bench_heed_commit(dir.path())?;
     let delete = bench_heed_delete(dir.path())?;
+    let first_write = bench_heed_startup(dir.path())?;
 
     Ok(Report {
         insert,
@@ -365,14 +390,16 @@ fn bench_heed_commit(path: &std::path::Path) -> Result<Duration> {
     let db: HeedDb = env.create_database(&mut wtxn, None)?;
     wtxn.commit()?;
 
-    let start = Instant::now();
+    let mut samples = Vec::with_capacity(config.commits as usize);
     for i in 0..config.commits {
+        let start = Instant::now();
         let mut wtxn = env.write_txn()?;
         db.put(&mut wtxn, &i, "value")?;
         wtxn.commit()?;
+        samples.push(start.elapsed());
     }
-
-    Ok(start.elapsed())
+    samples.sort_unstable();
+    Ok(samples[samples.len() / 2])
 }
 
 fn bench_heed_delete(path: &std::path::Path) -> Result<Duration> {
@@ -396,6 +423,42 @@ fn bench_heed_delete(path: &std::path::Path) -> Result<Duration> {
         db.delete(&mut wtxn, &i)?;
     }
     wtxn.commit()?;
+    Ok(start.elapsed())
+}
+
+fn bench_tsubame_startup(path: &std::path::Path, options: &mut TsubameOptions) -> Result<Duration> {
+    let env = options.open(path)?;
+    let rtxn = env.read_txn()?;
+    let db: TsubameDb = env.open_database(&rtxn, None)?;
+    drop(rtxn);
+    let start = Instant::now();
+    for i in 0..1000 {
+        let mut wtxn = env.write_txn()?;
+        db.put(&mut wtxn, &i, "startup-write")?;
+        wtxn.commit()?;
+    }
+    Ok(start.elapsed())
+}
+
+fn bench_heed_startup(path: &std::path::Path) -> Result<Duration> {
+    // SAFETY: this benchmark owns the directory.
+    let env = unsafe {
+        HeedOptions::new()
+            .map_size(MAP_SIZE)
+            .max_dbs(1)
+            .open(path)?
+    };
+    let rtxn = env.read_txn()?;
+    let db: HeedDb = env
+        .open_database(&rtxn, None)?
+        .context("unnamed database is missing")?;
+    drop(rtxn);
+    let start = Instant::now();
+    for i in 0..1000 {
+        let mut wtxn = env.write_txn()?;
+        db.put(&mut wtxn, &i, "startup-write")?;
+        wtxn.commit()?;
+    }
     Ok(start.elapsed())
 }
 

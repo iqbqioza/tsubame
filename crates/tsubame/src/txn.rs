@@ -5,6 +5,7 @@
 //! exclusive access to the environment.
 
 use std::borrow::Borrow;
+use std::cell::OnceCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, MutexGuard, OnceLock};
@@ -129,18 +130,21 @@ impl<'a> Iterator for PageOverlayIter<'a> {
 const INLINE_PENDING_VALUE: usize = 32;
 
 #[derive(Clone)]
+struct MappedValue {
+    reference: OverflowRef,
+    state: Arc<EnvState>,
+    offset: usize,
+    len: usize,
+}
+
+#[derive(Clone)]
 enum PendingValue {
     Inline {
         bytes: [u8; INLINE_PENDING_VALUE],
         len: u8,
     },
     Owned(Vec<u8>),
-    Mapped {
-        reference: OverflowRef,
-        state: Arc<EnvState>,
-        offset: usize,
-        len: usize,
-    },
+    Mapped(Box<MappedValue>),
 }
 
 impl PendingValue {
@@ -161,23 +165,21 @@ impl PendingValue {
         match self {
             Self::Inline { bytes, len } => &bytes[..*len as usize],
             Self::Owned(value) => value,
-            Self::Mapped {
-                state, offset, len, ..
-            } => &state.mmap[*offset..*offset + *len],
+            Self::Mapped(mapped) => &mapped.state.mmap[mapped.offset..mapped.offset + mapped.len],
         }
     }
 }
 
 impl PendingValue {
     fn is_mapped(&self) -> bool {
-        matches!(self, Self::Mapped { .. })
+        matches!(self, Self::Mapped(_))
     }
 }
 
 impl BulkValue for PendingValue {
     fn value_ref(&self) -> ValueRef<'_> {
         match self {
-            Self::Mapped { reference, .. } => ValueRef::Overflow(*reference),
+            Self::Mapped(mapped) => ValueRef::Overflow(mapped.reference),
             _ => ValueRef::Inline(self.as_slice()),
         }
     }
@@ -326,19 +328,19 @@ impl Pending {
             }
             Self::Unordered(mut pending) => {
                 let previous = match value.as_ref() {
-                    Some(mapped @ PendingValue::Mapped { .. }) => {
+                    Some(mapped @ PendingValue::Mapped(_)) => {
                         pending.mapped.insert(key.clone(), mapped.clone())
                     }
                     _ if !pending.mapped.is_empty() => pending.mapped.remove(&key),
                     _ => None,
                 };
-                if let Some(PendingValue::Mapped { reference, .. }) = &previous
+                if let Some(PendingValue::Mapped(mapped)) = &previous
                     && let Some(index) = pending.entries.iter().rposition(|(existing, value, _)| {
                         existing == &key
                             && matches!(
                                 value,
-                                Some(PendingValue::Mapped { reference: old, .. })
-                                    if old.start_page == reference.start_page
+                                Some(PendingValue::Mapped(old))
+                                    if old.reference.start_page == mapped.reference.start_page
                             )
                     })
                 {
@@ -581,7 +583,7 @@ impl PageSource for RoTxn<'_> {
 /// transactions only after [`RwTxn::commit`] succeeds.
 pub struct RwTxn<'env> {
     env: &'env Env,
-    state: Arc<EnvState>,
+    state: OnceCell<Arc<EnvState>>,
     base: Meta,
     base_slot: u8,
     txn_id: u64,
@@ -597,6 +599,7 @@ pub struct RwTxn<'env> {
     // transaction. They are safe for the committed snapshots and active
     // readers, but are not part of this transaction yet.
     cross_free: Vec<FreeExtent>,
+    cross_free_loaded: bool,
     // Pages from `cross_free` that this transaction has allocated. They are
     // returned to the environment if the transaction is aborted.
     cross_allocated: Vec<FreeExtent>,
@@ -622,24 +625,15 @@ impl<'env> RwTxn<'env> {
         env: &'env Env,
         writer: MutexGuard<'env, ()>,
         committed: Committed,
-        state: Arc<EnvState>,
     ) -> Result<Self> {
         let txn_id = committed
             .meta
             .txn_id
             .checked_add(1)
             .context("transaction ID overflow")?;
-        let cross_free = if env.inner.page_reuse {
-            let oldest_reader = env.inner.oldest_reader_snapshot(committed.meta.txn_id);
-            let free_limit = committed.meta.txn_id.saturating_sub(1).min(oldest_reader);
-            env.inner.take_reusable_free(free_limit)
-        } else {
-            Vec::new()
-        };
-
         Ok(Self {
             env,
-            state,
+            state: OnceCell::new(),
             base: committed.meta,
             base_slot: committed.slot,
             txn_id,
@@ -651,7 +645,8 @@ impl<'env> RwTxn<'env> {
             next_page: committed.meta.page_count,
             free_single: BTreeSet::new(),
             free_runs: BTreeMap::new(),
-            cross_free,
+            cross_free: Vec::new(),
+            cross_free_loaded: false,
             cross_allocated: Vec::new(),
             base_freed: Vec::new(),
             owned_pages: PageSet::default(),
@@ -667,12 +662,17 @@ impl<'env> RwTxn<'env> {
         })
     }
 
+    #[inline]
+    fn state(&self) -> &Arc<EnvState> {
+        self.state.get_or_init(|| self.env.inner.read_state())
+    }
+
     pub(crate) fn belongs_to(&self, env: &Arc<EnvInner>) -> bool {
         Arc::ptr_eq(&self.env.inner, env)
     }
 
     pub(crate) fn put_raw(&mut self, kind: DatabaseKind, key: &[u8], value: &[u8]) -> Result<()> {
-        let value = if value.len() > INLINE_BUDGET && self.state.has_write_mmap() {
+        let value = if value.len() > INLINE_BUDGET && self.state().has_write_mmap() {
             let pages = overflow::pages_for(value.len())?;
             let start_page = self.allocate_pages(pages)?;
             let reference = OverflowRef {
@@ -680,7 +680,7 @@ impl<'env> RwTxn<'env> {
                 start_page,
                 page_count: pages,
             };
-            self.state
+            self.state()
                 .write_overflow_direct(reference, value, self.txn_id)?;
             self.direct_extent_pages.insert(start_page, pages);
             let offset = usize::try_from(start_page - 2)
@@ -688,12 +688,12 @@ impl<'env> RwTxn<'env> {
                 .checked_mul(PAGE_SIZE)
                 .and_then(|offset| offset.checked_add(overflow::EXTENT_HEADER_SIZE))
                 .context("overflow payload offset overflow")?;
-            PendingValue::Mapped {
+            PendingValue::Mapped(Box::new(MappedValue {
                 reference,
-                state: Arc::clone(&self.state),
+                state: Arc::clone(self.state()),
                 offset,
                 len: value.len(),
-            }
+            }))
         } else {
             PendingValue::new(value)
         };
@@ -723,13 +723,13 @@ impl<'env> RwTxn<'env> {
     }
 
     fn release_pending_value(&mut self, value: Option<PendingValue>) -> Result<()> {
-        if let Some(PendingValue::Mapped { reference, .. }) = value
+        if let Some(PendingValue::Mapped(mapped)) = value
             && self
                 .direct_extent_pages
-                .remove(&reference.start_page)
+                .remove(&mapped.reference.start_page)
                 .is_some()
         {
-            self.free_pages(reference.start_page, reference.page_count)?;
+            self.free_pages(mapped.reference.start_page, mapped.reference.page_count)?;
         }
         Ok(())
     }
@@ -1043,16 +1043,16 @@ impl<'env> RwTxn<'env> {
         // the page builder or reseal path. Mark them verified so the next
         // writer does not re-parse and checksum them on its first read.
         for (page_id, _) in self.overlay.iter() {
-            self.state.mark_verified(*page_id);
+            self.state().mark_verified(*page_id);
         }
         for page_id in &self.dirty_pages {
-            self.state.mark_verified(*page_id);
+            self.state().mark_verified(*page_id);
         }
         for start_page in self.extents.keys() {
-            self.state.mark_verified(*start_page);
+            self.state().mark_verified(*start_page);
         }
         for start_page in self.direct_extent_pages.keys() {
-            self.state.mark_verified(*start_page);
+            self.state().mark_verified(*start_page);
         }
 
         self.recycle_pages();
@@ -1217,8 +1217,8 @@ impl<'env> RwTxn<'env> {
         for page_id in pages {
             if let Some(page) = self.overlay.get_mut(page_id) {
                 page::seal_page(page);
-            } else if self.state.has_write_mmap() {
-                self.state.seal_page_direct(page_id)?;
+            } else if self.state().has_write_mmap() {
+                self.state().seal_page_direct(page_id)?;
             } else {
                 bail!("page {page_id} has no writable storage for sealing");
             }
@@ -1228,7 +1228,7 @@ impl<'env> RwTxn<'env> {
 
     fn write_and_sync(&mut self, new_meta: &Meta) -> Result<()> {
         self.seal_pages()?;
-        let data = &self.state.data;
+        let data = &self.state().data;
 
         let mut pages = self.overlay.iter().peekable();
         while let Some((&start_page, first)) = pages.next() {
@@ -1285,9 +1285,10 @@ impl<'env> RwTxn<'env> {
         // remain unreachable from the old meta page and are rejected by the
         // commit-intent validation if the new meta page survives alone.
         #[cfg(windows)]
-        self.state.flush_write_pages(&self.dirty_pages)?;
+        self.state().flush_write_pages(&self.dirty_pages)?;
         #[cfg(windows)]
-        self.state.flush_write_extents(&self.direct_extent_pages)?;
+        self.state()
+            .flush_write_extents(&self.direct_extent_pages)?;
 
         let slot = 1 - self.base_slot;
         {
@@ -1298,11 +1299,11 @@ impl<'env> RwTxn<'env> {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             new_meta.encode_into(&mut page);
-            if !self.state.write_meta_direct(slot as usize, &page)? {
+            if !self.state().write_meta_direct(slot as usize, &page)? {
                 meta::write_slot_page(data, slot as usize, &page)?;
             }
             #[cfg(windows)]
-            self.state.flush_meta_page(slot as usize)?;
+            self.state().flush_meta_page(slot as usize)?;
         }
         data.sync_data().context("failed to sync the commit")?;
 
@@ -1339,9 +1340,9 @@ impl PageSource for RwTxn<'_> {
         if let Some(page) = self.overlay.get(page_id) {
             Page::parse_trusted(page, Some(page_id))
         } else if self.dirty_pages.contains(&page_id) {
-            self.state.read_written_page(page_id)
+            self.state().read_written_page(page_id)
         } else {
-            self.state.read_page(page_id, &self.base)
+            self.state().read_page(page_id, &self.base)
         }
     }
 
@@ -1349,14 +1350,30 @@ impl PageSource for RwTxn<'_> {
         if let Some(bytes) = self.extents.get(&reference.start_page) {
             overflow::validate_extent(bytes, reference)
         } else if self.direct_extent_pages.contains_key(&reference.start_page) {
-            self.state.read_overflow_written(reference)
+            self.state().read_overflow_written(reference)
         } else {
-            self.state.read_overflow(reference, &self.base)
+            self.state().read_overflow(reference, &self.base)
         }
     }
 
     fn comparator(&self) -> &crate::comparator::KeyComparator {
         &self.env.inner.comparator
+    }
+}
+
+impl RwTxn<'_> {
+    fn ensure_cross_free(&mut self) {
+        if self.cross_free_loaded {
+            return;
+        }
+        self.cross_free_loaded = true;
+        if !self.env.inner.page_reuse {
+            return;
+        }
+        self.env.inner.ensure_free_pool();
+        let oldest_reader = self.env.inner.oldest_reader_snapshot(self.base.txn_id);
+        let free_limit = self.base.txn_id.saturating_sub(1).min(oldest_reader);
+        self.cross_free = self.env.inner.take_reusable_free(free_limit);
     }
 }
 
@@ -1374,9 +1391,9 @@ impl PageStore for RwTxn<'_> {
             new_page_id >= 2 && new_page_id < self.next_page,
             "page {new_page_id} is outside the transaction allocation range"
         );
-        if self.state.has_write_mmap() {
+        if self.state().has_write_mmap() {
             let defer_checksum = new_page_id == old_page_id;
-            self.state
+            self.state()
                 .update_page_direct(old_page_id, new_page_id, |page| {
                     edit(page)?;
                     if !defer_checksum {
@@ -1385,7 +1402,7 @@ impl PageStore for RwTxn<'_> {
                     Ok(())
                 })?;
             self.dirty_pages.insert(new_page_id);
-            self.state.mark_verified(new_page_id);
+            self.state().mark_verified(new_page_id);
             if defer_checksum {
                 self.unsealed_pages.insert(new_page_id);
             }
@@ -1404,9 +1421,9 @@ impl PageStore for RwTxn<'_> {
         }
 
         let page = if self.dirty_pages.contains(&page_id) {
-            self.state.read_written_page(page_id)?
+            self.state().read_written_page(page_id)?
         } else {
-            self.state.read_page(page_id, &self.base)?
+            self.state().read_page(page_id, &self.base)?
         };
         let bytes: &[u8; PAGE_SIZE] = page
             .bytes()
@@ -1417,6 +1434,7 @@ impl PageStore for RwTxn<'_> {
 
     fn allocate_pages(&mut self, pages: u64) -> Result<u64> {
         ensure!(pages > 0, "allocation must contain at least one page");
+        self.ensure_cross_free();
 
         // Prefer exact-size reusable runs. If none exists, split the smallest
         // larger run. This reclaims small leaves and branches from runs left by
@@ -1503,7 +1521,7 @@ impl PageStore for RwTxn<'_> {
             .checked_add(pages)
             .context("page ID overflow")?;
         let max_pages =
-            u64::try_from(self.state.map_size / PAGE_SIZE).context("map size is too large")?;
+            u64::try_from(self.state().map_size / PAGE_SIZE).context("map size is too large")?;
         ensure!(
             self.next_page <= max_pages,
             "environment map is full at {} pages; reopen it with a larger map_size",
@@ -1523,10 +1541,10 @@ impl PageStore for RwTxn<'_> {
             page_id >= 2 && page_id < self.next_page,
             "page {page_id} is outside the transaction allocation range"
         );
-        if self.state.write_page_direct(page_id, &page)? {
+        if self.state().write_page_direct(page_id, &page)? {
             self.dirty_pages.insert(page_id);
             self.unsealed_pages.remove(&page_id);
-            self.state.mark_verified(page_id);
+            self.state().mark_verified(page_id);
         } else {
             self.overlay.insert(page_id, page);
             self.unsealed_pages.remove(&page_id);
@@ -1558,7 +1576,10 @@ impl PageStore for RwTxn<'_> {
     }
 
     fn write_overflow(&mut self, reference: OverflowRef, value: &[u8], txn_id: u64) -> Result<()> {
-        if self.state.write_overflow_direct(reference, value, txn_id)? {
+        if self
+            .state()
+            .write_overflow_direct(reference, value, txn_id)?
+        {
             self.direct_extent_pages
                 .insert(reference.start_page, reference.page_count);
         } else {
