@@ -7,6 +7,7 @@
 use anyhow::Result;
 
 use super::PAGE_SIZE;
+use super::overflow::{self, OverflowRef};
 use super::page::Page;
 
 /// A mutable page store.
@@ -51,6 +52,12 @@ pub(crate) trait PageStore {
 
     /// Writes a complete overflow extent.
     fn write_extent(&mut self, start_page: u64, bytes: &[u8]) -> Result<()>;
+
+    /// Encodes and writes an overflow value.
+    fn write_overflow(&mut self, reference: OverflowRef, value: &[u8], txn_id: u64) -> Result<()> {
+        let bytes = overflow::encode_extent(reference, value, txn_id)?;
+        self.write_extent(reference.start_page, &bytes)
+    }
 
     /// Marks a contiguous run of pages as free.
     fn free_pages(&mut self, start_page: u64, pages: u64) -> Result<()>;

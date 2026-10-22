@@ -865,36 +865,73 @@ impl EnvState {
         Ok(())
     }
 
-    /// Copies an overflow extent into the writable mapping.
+    /// Encodes an overflow extent directly into the writable mapping.
     ///
     /// Returns `false` when this environment has no writable mapping.
-    pub(crate) fn write_extent_direct(&self, start_page: u64, bytes: &[u8]) -> Result<bool> {
+    pub(crate) fn write_overflow_direct(
+        &self,
+        reference: OverflowRef,
+        value: &[u8],
+        txn_id: u64,
+    ) -> Result<bool> {
         let Some(write_mmap) = &self.write_mmap else {
             return Ok(false);
         };
         ensure!(
-            start_page >= 2,
-            "overflow extent starts at reserved page {start_page}"
+            txn_id > 0,
+            "overflow extent transaction ID must be non-zero"
         );
         ensure!(
-            bytes.len().is_multiple_of(PAGE_SIZE),
-            "overflow extent is not page-aligned"
+            reference.total_len as usize == value.len(),
+            "overflow reference length {} does not match the value length {}",
+            reference.total_len,
+            value.len()
         );
-        let index = usize::try_from(start_page - 2).context("page ID is too large")?;
+        let required_pages = overflow::pages_for(value.len())?;
+        ensure!(
+            required_pages == reference.page_count,
+            "overflow reference has {} pages, expected {required_pages}",
+            reference.page_count
+        );
+        reference.validate_shape()?;
+        ensure!(
+            reference.start_page >= 2,
+            "overflow extent starts at reserved page {}",
+            reference.start_page
+        );
+
+        let extent_len = usize::try_from(reference.page_count)
+            .context("overflow page count is too large")?
+            .checked_mul(PAGE_SIZE)
+            .context("overflow extent size overflow")?;
+        let index = usize::try_from(reference.start_page - 2)
+            .context("overflow start page is too large")?;
         let start = index
             .checked_mul(PAGE_SIZE)
-            .context("extent offset overflow")?;
+            .context("overflow offset overflow")?;
         let end = start
-            .checked_add(bytes.len())
-            .context("extent offset overflow")?;
+            .checked_add(extent_len)
+            .context("overflow offset overflow")?;
         let mut mapping = write_mmap
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         ensure!(
             end <= mapping.len(),
-            "overflow extent at page {start_page} is outside the writable mapping"
+            "overflow extent at page {} is outside the writable mapping",
+            reference.start_page
         );
-        mapping[start..end].copy_from_slice(bytes);
+
+        let bytes = &mut mapping[start..end];
+        bytes[..overflow::EXTENT_HEADER_SIZE].fill(0);
+        LittleEndian::write_u32(&mut bytes[4..8], reference.total_len);
+        LittleEndian::write_u64(&mut bytes[8..16], reference.start_page);
+        LittleEndian::write_u64(&mut bytes[16..24], reference.page_count);
+        LittleEndian::write_u64(&mut bytes[24..32], txn_id);
+        let value_end = overflow::EXTENT_HEADER_SIZE + value.len();
+        bytes[overflow::EXTENT_HEADER_SIZE..value_end].copy_from_slice(value);
+        bytes[value_end..].fill(0);
+        let checksum = checksum::hash(bytes);
+        LittleEndian::write_u32(&mut bytes[0..4], checksum);
         Ok(true)
     }
 
@@ -953,34 +990,65 @@ impl EnvState {
     }
 
     #[cfg(windows)]
-    pub(crate) fn flush_write_extents(
-        &self,
-        starts: &BTreeSet<u64>,
-        extents: &BTreeMap<u64, Vec<u8>>,
-    ) -> Result<()> {
+    #[cfg(windows)]
+    pub(crate) fn flush_write_extents(&self, extents: &BTreeMap<u64, u64>) -> Result<()> {
         let Some(write_mmap) = &self.write_mmap else {
             return Ok(());
         };
         let mapping = write_mmap
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for start_page in starts {
-            let bytes = extents
-                .get(start_page)
-                .with_context(|| format!("missing extent {start_page}"))?;
-            let offset = usize::try_from(start_page - 2)
+        for (start_page, pages) in extents {
+            let offset = usize::try_from(*start_page - 2)
                 .context("page ID is too large")?
                 .checked_mul(PAGE_SIZE)
                 .context("extent offset overflow")?;
+            let len = usize::try_from(*pages)
+                .context("extent page count is too large")?
+                .checked_mul(PAGE_SIZE)
+                .context("extent length overflow")?;
             ensure!(
-                offset + bytes.len() <= mapping.len(),
+                offset + len <= mapping.len(),
                 "overflow extent at page {start_page} is outside the writable mapping"
             );
             mapping
-                .flush_range(offset, bytes.len())
+                .flush_range(offset, len)
                 .with_context(|| format!("failed to flush overflow extent at page {start_page}"))?;
         }
         Ok(())
+    }
+
+    /// Returns a verified overflow payload written by the current transaction
+    /// without consulting the committed snapshot bound.
+    pub(crate) fn read_overflow_written(&self, reference: OverflowRef) -> Result<&[u8]> {
+        ensure!(
+            reference.start_page >= 2,
+            "overflow extent points at reserved page {}",
+            reference.start_page
+        );
+        let index = usize::try_from(reference.start_page - 2)
+            .context("overflow start page is too large")?;
+        let start = index
+            .checked_mul(PAGE_SIZE)
+            .context("overflow offset overflow")?;
+        let len = usize::try_from(reference.page_count)
+            .context("overflow page count is too large")?
+            .checked_mul(PAGE_SIZE)
+            .context("overflow length overflow")?;
+        let end = start.checked_add(len).context("overflow offset overflow")?;
+        ensure!(
+            end <= self.mmap.len(),
+            "overflow extent is outside the mapped region"
+        );
+        let total_len = reference.total_len as usize;
+        let payload_end = overflow::EXTENT_HEADER_SIZE
+            .checked_add(total_len)
+            .context("overflow payload length overflow")?;
+        ensure!(
+            payload_end <= len,
+            "overflow payload exceeds its mapped extent"
+        );
+        Ok(&self.mmap[start + overflow::EXTENT_HEADER_SIZE..start + payload_end])
     }
 
     #[inline]
@@ -1061,7 +1129,15 @@ impl EnvState {
 
         let bytes = &self.mmap[start..end];
         if self.is_verified(reference.start_page) {
-            overflow::validate_extent_unchecked(bytes, reference)
+            let total_len = reference.total_len as usize;
+            let payload_end = overflow::EXTENT_HEADER_SIZE
+                .checked_add(total_len)
+                .context("overflow payload length overflow")?;
+            ensure!(
+                payload_end <= bytes.len(),
+                "overflow payload exceeds its mapped extent"
+            );
+            Ok(&bytes[overflow::EXTENT_HEADER_SIZE..payload_end])
         } else {
             let payload = overflow::validate_extent(bytes, reference)?;
             self.mark_verified(reference.start_page);

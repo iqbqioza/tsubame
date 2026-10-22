@@ -57,7 +57,7 @@ impl OverflowRef {
         bytes
     }
 
-    fn validate_shape(self) -> Result<()> {
+    pub(crate) fn validate_shape(self) -> Result<()> {
         ensure!(
             self.start_page >= 2,
             "overflow extent points at a reserved page"

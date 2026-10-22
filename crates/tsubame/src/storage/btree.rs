@@ -1063,8 +1063,7 @@ fn make_overflow<S: PageStore>(store: &mut S, value: &[u8], txn_id: u64) -> Resu
         start_page,
         page_count: pages,
     };
-    let bytes = overflow::encode_extent(reference, value, txn_id)?;
-    store.write_extent(start_page, &bytes)?;
+    store.write_overflow(reference, value, txn_id)?;
     Ok(reference)
 }
 

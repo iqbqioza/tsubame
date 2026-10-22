@@ -535,7 +535,7 @@ pub struct RwTxn<'env> {
     overlay: PageOverlay,
     dirty_pages: PageSet,
     unsealed_pages: PageSet,
-    direct_extents: BTreeSet<u64>,
+    direct_extent_pages: BTreeMap<u64, u64>,
     extents: BTreeMap<u64, Vec<u8>>,
     next_page: u64,
     free_single: BTreeSet<u64>,
@@ -593,7 +593,7 @@ impl<'env> RwTxn<'env> {
             overlay: PageOverlay::new(),
             dirty_pages: PageSet::default(),
             unsealed_pages: PageSet::default(),
-            direct_extents: BTreeSet::new(),
+            direct_extent_pages: BTreeMap::new(),
             extents: BTreeMap::new(),
             next_page: committed.meta.page_count,
             free_single: BTreeSet::new(),
@@ -794,7 +794,7 @@ impl<'env> RwTxn<'env> {
         let txn_id = self.txn_id;
         let overlay_len = self.overlay.len();
         let dirty_len = self.dirty_pages.len();
-        let extent_len = self.extents.len();
+        let extent_len = self.extents.len() + self.direct_extent_pages.len();
         let entry_count = overlay_len + dirty_len + extent_len;
         let page_count = overlay_len + dirty_len;
         let (commit_record, commit_page, inline, inline_count) =
@@ -835,6 +835,13 @@ impl<'env> RwTxn<'env> {
                     };
                     slot += 1;
                 }
+                for (start_page, page_count) in &self.direct_extent_pages {
+                    inline[slot] = InlineCommit {
+                        page_id: *start_page,
+                        page_count: *page_count,
+                    };
+                    slot += 1;
+                }
                 (0, 0, Some(inline), slot as u32)
             } else {
                 let mut entries = Vec::with_capacity(entry_count);
@@ -854,6 +861,14 @@ impl<'env> RwTxn<'env> {
                         page_count: (bytes.len() / PAGE_SIZE) as u64,
                     }
                 }));
+                entries.extend(
+                    self.direct_extent_pages
+                        .iter()
+                        .map(|(start_page, page_count)| CommitEntry::Extent {
+                            start_page: *start_page,
+                            page_count: *page_count,
+                        }),
+                );
                 match commit::build(&mut self, txn_id, &entries)? {
                     Descriptor::None => (0, 0, None, 0),
                     Descriptor::Page(page_id) => (0, page_id, None, 0),
@@ -920,6 +935,9 @@ impl<'env> RwTxn<'env> {
             self.state.mark_verified(*page_id);
         }
         for start_page in self.extents.keys() {
+            self.state.mark_verified(*start_page);
+        }
+        for start_page in self.direct_extent_pages.keys() {
             self.state.mark_verified(*start_page);
         }
 
@@ -1141,9 +1159,6 @@ impl<'env> RwTxn<'env> {
                 bytes.len().is_multiple_of(PAGE_SIZE),
                 "overflow extent is not page-aligned"
             );
-            if self.direct_extents.contains(start_page) {
-                continue;
-            }
             let offset = start_page
                 .checked_mul(PAGE_SIZE as u64)
                 .context("extent offset overflow")?;
@@ -1158,8 +1173,7 @@ impl<'env> RwTxn<'env> {
         #[cfg(windows)]
         self.state.flush_write_pages(&self.dirty_pages)?;
         #[cfg(windows)]
-        self.state
-            .flush_write_extents(&self.direct_extents, &self.extents)?;
+        self.state.flush_write_extents(&self.direct_extent_pages)?;
 
         let slot = 1 - self.base_slot;
         {
@@ -1220,6 +1234,8 @@ impl PageSource for RwTxn<'_> {
     fn overflow(&self, reference: OverflowRef) -> Result<&[u8]> {
         if let Some(bytes) = self.extents.get(&reference.start_page) {
             overflow::validate_extent(bytes, reference)
+        } else if self.direct_extent_pages.contains_key(&reference.start_page) {
+            self.state.read_overflow_written(reference)
         } else {
             self.state.read_overflow(reference, &self.base)
         }
@@ -1423,10 +1439,18 @@ impl PageStore for RwTxn<'_> {
             "overflow extent extends beyond the transaction allocation range"
         );
 
-        if self.state.write_extent_direct(start_page, bytes)? {
-            self.direct_extents.insert(start_page);
-        }
         self.extents.insert(start_page, bytes.to_vec());
+        Ok(())
+    }
+
+    fn write_overflow(&mut self, reference: OverflowRef, value: &[u8], txn_id: u64) -> Result<()> {
+        if self.state.write_overflow_direct(reference, value, txn_id)? {
+            self.direct_extent_pages
+                .insert(reference.start_page, reference.page_count);
+        } else {
+            let bytes = overflow::encode_extent(reference, value, txn_id)?;
+            self.write_extent(reference.start_page, &bytes)?;
+        }
         Ok(())
     }
 
@@ -1482,12 +1506,12 @@ impl RwTxn<'_> {
             self.dirty_pages.remove(&page_id);
             self.unsealed_pages.remove(&page_id);
         }
+        self.extents.remove(&start_page);
+        self.direct_extent_pages.remove(&start_page);
         if pages == 1 {
             self.overlay.remove(start_page);
             self.free_single.insert(start_page);
         } else {
-            self.extents.remove(&start_page);
-            self.direct_extents.remove(&start_page);
             self.free_runs.insert(start_page, pages);
         }
 
