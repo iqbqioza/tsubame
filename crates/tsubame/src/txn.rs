@@ -4,6 +4,8 @@
 //! provide a consistent snapshot and can coexist; a read-write transaction has
 //! exclusive access to the environment.
 
+use std::borrow::Borrow;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, MutexGuard};
 
@@ -145,10 +147,75 @@ impl AsRef<[u8]> for PendingValue {
     }
 }
 
+const INLINE_PENDING_KEY: usize = 16;
+
+/// A staged key that stays inline for short keys such as fixed-width integers.
+enum PendingKey {
+    Inline {
+        bytes: [u8; INLINE_PENDING_KEY],
+        len: u8,
+    },
+    Owned(Vec<u8>),
+}
+
+impl PendingKey {
+    fn new(bytes: &[u8]) -> Self {
+        if bytes.len() <= INLINE_PENDING_KEY {
+            let mut inline = [0u8; INLINE_PENDING_KEY];
+            inline[..bytes.len()].copy_from_slice(bytes);
+            Self::Inline {
+                bytes: inline,
+                len: bytes.len() as u8,
+            }
+        } else {
+            Self::Owned(bytes.to_vec())
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Inline { bytes, len } => &bytes[..*len as usize],
+            Self::Owned(bytes) => bytes,
+        }
+    }
+}
+
+impl AsRef<[u8]> for PendingKey {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl Borrow<[u8]> for PendingKey {
+    fn borrow(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl PartialEq for PendingKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for PendingKey {}
+
+impl PartialOrd for PendingKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PendingKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.as_slice().cmp(other.as_slice())
+    }
+}
+
 enum Pending {
     Empty,
-    One(Vec<u8>, Option<PendingValue>),
-    Map(BTreeMap<Vec<u8>, Option<PendingValue>>),
+    One(PendingKey, Option<PendingValue>),
+    Map(BTreeMap<PendingKey, Option<PendingValue>>),
 }
 
 impl Pending {
@@ -156,7 +223,7 @@ impl Pending {
         Self::Empty
     }
 
-    fn insert(&mut self, key: Vec<u8>, value: Option<PendingValue>) {
+    fn insert(&mut self, key: PendingKey, value: Option<PendingValue>) {
         match std::mem::replace(self, Self::Empty) {
             Self::Empty => *self = Self::One(key, value),
             Self::One(existing_key, existing_value) => {
@@ -413,8 +480,9 @@ impl<'env> RwTxn<'env> {
         Arc::ptr_eq(&self.env.inner, env)
     }
 
-    pub(crate) fn put_raw(&mut self, kind: DatabaseKind, key: Vec<u8>, value: &[u8]) {
+    pub(crate) fn put_raw(&mut self, kind: DatabaseKind, key: &[u8], value: &[u8]) {
         let value = PendingValue::new(value);
+        let key = PendingKey::new(key);
         match kind {
             DatabaseKind::Unnamed => self.unnamed_pending.insert(key, Some(value)),
             DatabaseKind::Named(name) => self
@@ -425,7 +493,8 @@ impl<'env> RwTxn<'env> {
         }
     }
 
-    pub(crate) fn delete_raw(&mut self, kind: DatabaseKind, key: Vec<u8>) {
+    pub(crate) fn delete_raw(&mut self, kind: DatabaseKind, key: &[u8]) {
+        let key = PendingKey::new(key);
         match kind {
             DatabaseKind::Unnamed => self.unnamed_pending.insert(key, None),
             DatabaseKind::Named(name) => self
@@ -734,12 +803,14 @@ impl<'env> RwTxn<'env> {
             Pending::One(key, value) => self.apply_one(root, key, value, comparator),
             Pending::Map(pending) => {
                 if *root == 0 && pending.len() >= BULK_LOAD_THRESHOLD {
-                    let mut entries: Vec<(Vec<u8>, PendingValue)> = pending
+                    let mut entries: Vec<(PendingKey, PendingValue)> = pending
                         .into_iter()
                         .filter_map(|(key, value)| value.map(|value| (key, value)))
                         .collect();
                     if !comparator.is_lexicographic() {
-                        entries.sort_by(|left, right| comparator.compare(&left.0, &right.0));
+                        entries.sort_by(|left, right| {
+                            comparator.compare(left.0.as_ref(), right.0.as_ref())
+                        });
                     }
                     if !entries.is_empty() {
                         *root = btree::bulk_load_with(self, &entries, self.txn_id, &comparator)?;
@@ -758,7 +829,7 @@ impl<'env> RwTxn<'env> {
     fn apply_one(
         &mut self,
         root: &mut u64,
-        key: Vec<u8>,
+        key: PendingKey,
         value: Option<PendingValue>,
         comparator: KeyComparator,
     ) -> Result<()> {
@@ -766,12 +837,12 @@ impl<'env> RwTxn<'env> {
             Some(value) => btree::insert_with(
                 self,
                 *root,
-                &key,
+                key.as_slice(),
                 value.as_slice(),
                 self.txn_id,
                 &comparator,
             )?,
-            None => btree::delete_with(self, *root, &key, self.txn_id, &comparator)?,
+            None => btree::delete_with(self, *root, key.as_slice(), self.txn_id, &comparator)?,
         };
         Ok(())
     }

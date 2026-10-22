@@ -651,9 +651,9 @@ pub(crate) fn bulk_load<S: PageStore>(
     bulk_load_with(store, entries, txn_id, &KeyComparator::lexicographic())
 }
 
-pub(crate) fn bulk_load_with<S: PageStore, V: AsRef<[u8]>>(
+pub(crate) fn bulk_load_with<S: PageStore, K: AsRef<[u8]>, V: AsRef<[u8]>>(
     store: &mut S,
-    entries: &[(Vec<u8>, V)],
+    entries: &[(K, V)],
     txn_id: u64,
     comparator: &KeyComparator,
 ) -> Result<u64> {
@@ -661,10 +661,12 @@ pub(crate) fn bulk_load_with<S: PageStore, V: AsRef<[u8]>>(
         return Ok(0);
     }
     for pair in entries.windows(2) {
+        let left = pair[0].0.as_ref();
+        let right = pair[1].0.as_ref();
         let ordered = if comparator.is_lexicographic() {
-            pair[0].0 < pair[1].0
+            left < right
         } else {
-            comparator.compare(&pair[0].0, &pair[1].0) == Ordering::Less
+            comparator.compare(left, right) == Ordering::Less
         };
         ensure!(ordered, "bulk-load keys must be strictly ascending");
     }
@@ -675,6 +677,7 @@ pub(crate) fn bulk_load_with<S: PageStore, V: AsRef<[u8]>>(
     let mut page_values: Vec<LeafValue<'_>> = Vec::new();
 
     for (index, (key, value)) in entries.iter().enumerate() {
+        let key = key.as_ref();
         ensure!(
             key.len() <= MAX_KEY_SIZE,
             "key is {} bytes, maximum is {MAX_KEY_SIZE}",
@@ -792,9 +795,9 @@ fn flush_leaf<S: PageStore>(
     Ok(())
 }
 
-fn flush_bulk_leaf<S: PageStore, V: AsRef<[u8]>>(
+fn flush_bulk_leaf<S: PageStore, K: AsRef<[u8]>, V: AsRef<[u8]>>(
     store: &mut S,
-    entries: &[(Vec<u8>, V)],
+    entries: &[(K, V)],
     values: &[LeafValue<'_>],
     leaves: &mut Vec<(Vec<u8>, u64)>,
     txn_id: u64,
@@ -810,7 +813,7 @@ fn flush_bulk_leaf<S: PageStore, V: AsRef<[u8]>>(
     let separator = if leaves.is_empty() {
         Vec::new()
     } else {
-        entries[0].0.clone()
+        entries[0].0.as_ref().to_vec()
     };
     let page_id = store.allocate_pages(1)?;
     let page = page::build_leaf_entries_from_iter(
@@ -819,7 +822,7 @@ fn flush_bulk_leaf<S: PageStore, V: AsRef<[u8]>>(
         entries
             .iter()
             .zip(values)
-            .map(|((key, _), value)| (key.as_slice(), *value)),
+            .map(|((key, _), value)| (key.as_ref(), *value)),
     )?;
     store.write_page(page_id, page)?;
     leaves.push((separator, page_id));

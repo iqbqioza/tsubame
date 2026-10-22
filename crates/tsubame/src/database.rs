@@ -458,16 +458,16 @@ impl<KC, DC> Database<KC, DC> {
         );
 
         let result = (|| {
-            let key =
-                KC::bytes_encode(key).map_err(|error| codec_error("key encoding failed", error))?;
+            let mut key_buffer = [0u8; KEY_ENCODE_BUFFER];
+            let key = encode_key::<KC>(key, &mut key_buffer)?;
             let value = DC::bytes_encode(data)
                 .map_err(|error| codec_error("value encoding failed", error))?;
             ensure!(
-                key.len() <= MAX_KEY_SIZE,
+                key.as_slice().len() <= MAX_KEY_SIZE,
                 "key is {} bytes, maximum is {MAX_KEY_SIZE}",
-                key.len()
+                key.as_slice().len()
             );
-            txn.put_raw(self.kind.clone(), key.into_owned(), value.as_ref());
+            txn.put_raw(self.kind.clone(), key.as_slice(), value.as_ref());
             Ok(())
         })();
 
@@ -496,14 +496,14 @@ impl<KC, DC> Database<KC, DC> {
         );
 
         let result = (|| {
-            let key =
-                KC::bytes_encode(key).map_err(|error| codec_error("key encoding failed", error))?;
+            let mut key_buffer = [0u8; KEY_ENCODE_BUFFER];
+            let key = encode_key::<KC>(key, &mut key_buffer)?;
             ensure!(
-                key.len() <= MAX_KEY_SIZE,
+                key.as_slice().len() <= MAX_KEY_SIZE,
                 "key is {} bytes, maximum is {MAX_KEY_SIZE}",
-                key.len()
+                key.as_slice().len()
             );
-            txn.delete_raw(self.kind.clone(), key.into_owned());
+            txn.delete_raw(self.kind.clone(), key.as_slice());
             Ok(())
         })();
 
