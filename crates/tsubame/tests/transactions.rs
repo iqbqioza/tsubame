@@ -1255,6 +1255,39 @@ fn online_compaction_preserves_custom_comparator() -> Result<()> {
 }
 
 #[test]
+fn multi_process_online_compaction_requires_readers_closed() -> Result<()> {
+    let dir = tempdir()?;
+    let mut writer_options = options();
+    writer_options.multi_process(true);
+    let writer = writer_options.open(dir.path())?;
+    let mut wtxn = writer.write_txn()?;
+    let db = writer.create_database::<Str, Str>(&mut wtxn, None)?;
+    db.put(&mut wtxn, "key", "value")?;
+    wtxn.commit()?;
+
+    let mut read_options = options();
+    read_options.read_only(true);
+    let reader = read_options.open(dir.path())?;
+    assert!(writer.compact_online().is_err());
+    drop(reader);
+
+    writer.compact_online()?;
+    let rtxn = writer.read_txn()?;
+    assert_eq!(db.get(&rtxn, "key")?, Some("value"));
+
+    drop(rtxn);
+    drop(db);
+    drop(writer);
+
+    let env = options().open(dir.path())?;
+    let rtxn = env.read_txn()?;
+    let db = env.open_database::<Str, Str>(&rtxn, None)?;
+    assert_eq!(db.get(&rtxn, "key")?, Some("value"));
+
+    Ok(())
+}
+
+#[test]
 fn online_compaction_remaps_an_open_environment() -> Result<()> {
     let dir = tempdir()?;
     let env = options().open(dir.path())?;

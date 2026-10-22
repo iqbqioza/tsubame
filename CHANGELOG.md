@@ -33,6 +33,9 @@ All notable changes to this project are documented here.
 - `multi_process(true)` lets a writable environment coexist with read-only
   processes while retaining cross-process page reuse. Reader snapshots are
   advertised in `readers.tsubame`; offline compaction clears stale slots.
+- Online compaction is now available to a `multi_process` writer after all
+  read-only environments have been closed. The environment-open gate prevents
+  new environments from appearing during the file swap.
 
 ### Performance
 

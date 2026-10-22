@@ -40,9 +40,13 @@ const CLEAN_FILE: &str = "clean.tsubame";
 const COMPARATOR_FILE: &str = "comparator.tsubame";
 const READER_FILE: &str = "readers.tsubame";
 const READER_LOCK_FILE: &str = "readers.tsubame.lock";
+const OPEN_GATE_FILE: &str = "open.tsubame.lock";
+const READER_COUNT_INDEX: usize = 0;
+const ENV_COUNT_INDEX: usize = 1;
+const READER_SLOT_BASE: usize = 2;
 const READER_SLOTS: usize = 4096;
 const READER_RESERVED: u64 = u64::MAX;
-const READER_REGISTRY_LEN: u64 = ((READER_SLOTS + 1) * 8) as u64;
+const READER_REGISTRY_LEN: u64 = ((READER_SLOTS + READER_SLOT_BASE) * 8) as u64;
 const COMPARATOR_MAGIC: [u8; 8] = *b"TSUBCMP\0";
 const COMPARATOR_VERSION: u32 = 1;
 const MAX_COMPARATOR_ID_LEN: usize = 1024;
@@ -281,30 +285,40 @@ impl Env {
     /// the compacted file. A write transaction must not be active.
     ///
     /// Unlike [`Env::compact`], this does not require closing and reopening the
-    /// environment. Read-only and multi-process environments are rejected
-    /// because their other processes would retain the old file generation.
+    /// environment. Read-only environments are rejected because they would
+    /// retain the old file generation. A multi-process writer may compact only
+    /// after all read-only environments have been closed.
     ///
     /// # Errors
     ///
-    /// Returns an error for read-only or multi-process environments, when a
-    /// write transaction is active, or when the replacement file cannot be
-    /// built or mapped.
+    /// Returns an error for read-only environments, when another read-only
+    /// environment is open, when a write transaction is active, or when the
+    /// replacement file cannot be built or mapped.
     pub fn compact_online(&self) -> Result<()> {
         ensure!(
             !self.inner.read_only,
             "read-only environments cannot be compacted online"
         );
-        ensure!(
-            !self.inner.multi_process,
-            "multi-process environments must be compacted offline"
-        );
+        let path = self.inner.path.clone();
+        let _open_gate = if self.inner.multi_process {
+            Some(lock_open_gate(&path)?)
+        } else {
+            None
+        };
         let _writer = self
             .inner
             .writer
             .try_lock()
             .map_err(|_| anyhow::anyhow!("a write transaction is active"))?;
-
-        let path = self.inner.path.clone();
+        if self.inner.multi_process {
+            ensure!(
+                self.inner
+                    .reader_slots
+                    .load(ENV_COUNT_INDEX, Ordering::Acquire)
+                    == 1,
+                "close all read-only environments before compacting online"
+            );
+        }
         let state = self.inner.read_state();
         let map_size = state.map_size;
         let comparator = self.inner.comparator;
@@ -873,12 +887,18 @@ impl EnvInner {
     }
 
     pub(crate) fn oldest_external_reader(&self) -> Result<Option<u64>> {
-        if self.reader_slots.load(0, Ordering::Acquire) == 0 {
+        if self
+            .reader_slots
+            .load(READER_COUNT_INDEX, Ordering::Acquire)
+            == 0
+        {
             return Ok(None);
         }
         let mut oldest = None;
         for index in 0..READER_SLOTS {
-            let txn_id = self.reader_slots.load(index + 1, Ordering::Acquire);
+            let txn_id = self
+                .reader_slots
+                .load(READER_SLOT_BASE + index, Ordering::Acquire);
             if txn_id == READER_RESERVED {
                 return Ok(Some(0));
             }
@@ -902,7 +922,7 @@ impl EnvInner {
     pub(crate) fn publish_external_reader(&self, slot: u64, txn_id: u64) -> Result<()> {
         let index = usize::try_from(slot).context("reader slot is too large")?;
         self.reader_slots
-            .store(index + 1, txn_id, Ordering::Release);
+            .store(READER_SLOT_BASE + index, txn_id, Ordering::Release);
         Ok(())
     }
 
@@ -1028,6 +1048,8 @@ impl EnvInner {
 
 impl Drop for EnvInner {
     fn drop(&mut self) {
+        self.reader_slots
+            .fetch_sub(ENV_COUNT_INDEX, 1, Ordering::AcqRel);
         if self.poisoned.load(Ordering::Acquire)
             || !self.clean_marker_on_drop.load(Ordering::Acquire)
         {
@@ -1298,6 +1320,8 @@ impl EnvOpenOptions {
             })?;
         }
 
+        let _open_gate = lock_open_gate(path)?;
+
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1366,7 +1390,6 @@ impl EnvOpenOptions {
         )
         .context("failed to map the reader registry")?;
         drop(reader_lock);
-
         let data_path = path.join(DATA_FILE);
         let data = if self.read_only {
             OpenOptions::new()
@@ -1504,6 +1527,8 @@ impl EnvOpenOptions {
             write_comparator_id(path, &comparator_id)?;
         }
 
+        reader_slots.fetch_add(ENV_COUNT_INDEX, 1, Ordering::AcqRel);
+
         let state = EnvState::new(data, mmap, map_size);
         let inner = EnvInner {
             path: path.to_path_buf(),
@@ -1534,6 +1559,25 @@ impl EnvOpenOptions {
             inner: Arc::new(inner),
         })
     }
+}
+
+/// Acquires the environment-open gate.
+///
+/// Every `Env::open` holds this lock while it registers the new environment.
+/// Online compaction takes it exclusively so no environment can appear while
+/// the compacted file is being installed.
+fn lock_open_gate(path: &Path) -> Result<File> {
+    let gate_path = path.join(OPEN_GATE_FILE);
+    let gate = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&gate_path)
+        .with_context(|| format!("failed to open `{}`", gate_path.display()))?;
+    fs4::FileExt::lock(&gate)
+        .with_context(|| format!("failed to lock `{}`", gate_path.display()))?;
+    Ok(gate)
 }
 
 /// Opens or creates the shared reader registry used for cross-process reuse.
