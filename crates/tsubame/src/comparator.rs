@@ -63,6 +63,22 @@ impl KeyComparator {
 #[inline]
 pub(crate) fn compare_lexicographic(a: &[u8], b: &[u8]) -> Ordering {
     match (a.len(), b.len()) {
+        (16, 16) => {
+            let mut left = [0u8; 16];
+            let mut right = [0u8; 16];
+            left.copy_from_slice(a);
+            right.copy_from_slice(b);
+            u128::from_be_bytes(left).cmp(&u128::from_be_bytes(right))
+        }
+        (10, 10) => {
+            let mut left_prefix = [0u8; 8];
+            let mut right_prefix = [0u8; 8];
+            left_prefix.copy_from_slice(&a[..8]);
+            right_prefix.copy_from_slice(&b[..8]);
+            u64::from_be_bytes(left_prefix)
+                .cmp(&u64::from_be_bytes(right_prefix))
+                .then_with(|| a[8..].cmp(&b[8..]))
+        }
         (8, 8) => {
             let mut left = [0u8; 8];
             let mut right = [0u8; 8];
@@ -103,6 +119,27 @@ mod tests {
         let comparator = KeyComparator::lexicographic();
         assert!(comparator.is_lexicographic());
         assert_eq!(comparator.compare(b"a", b"b"), Ordering::Less);
+    }
+
+    #[test]
+    fn fixed_width_keys_use_numeric_order() {
+        let comparator = KeyComparator::lexicographic();
+        assert_eq!(
+            comparator.compare(b"key-000001", b"key-000002"),
+            Ordering::Less
+        );
+        assert_eq!(
+            comparator.compare(b"key-199999", b"key-200000"),
+            Ordering::Less
+        );
+        assert_eq!(
+            comparator.compare(b"key-000001", b"key-000001"),
+            Ordering::Equal
+        );
+        assert_eq!(
+            comparator.compare(b"0123456789abcdef", b"0123456789abcdeg"),
+            Ordering::Less
+        );
     }
 
     #[test]
