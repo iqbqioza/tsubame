@@ -48,11 +48,14 @@ added without changing the main API.
 - [x] Write transaction reads and iteration with pending writes
 - [x] Serde-based codecs behind features
 - [x] Cross-transaction page reuse within and across processes
+- [x] Coalescing and splitting of reusable free extents
 - [x] Lazy free-list reconstruction after reopening
 - [x] Read-only environments with shared locks
 - [x] Concurrent writer and read-only processes (`multi_process`)
+- [x] Atomic cross-process reader registration
 - [x] Custom key comparators
 - [x] Online compaction while an environment remains open
+- [x] Multi-process online compaction with reader generation remapping
 - [x] Offline compaction
 
 ## Codec features
@@ -142,9 +145,9 @@ The examples use a temporary directory and clean up after themselves.
   snapshot can still need. The registry supports up to 4096 simultaneous
   cross-process readers. Stale slots left by a crashed reader conservatively
   block reuse while another environment remains open; a multi-process writer
-  clears them once it is the only environment, and offline compaction always
-  clears them. Read-only environments therefore need write access to their
-  directory for the registry sidecar.
+  clears them once it can acquire the lifecycle lock exclusively, and offline
+  compaction always clears them. Read-only environments therefore need write
+  access to their directory for the registry sidecar.
 - Freed pages are reused across transactions once the two recoverable meta
   snapshots no longer reference them and no active reader, in any process, can
   still observe them. Readers reserve a registry slot before loading a
@@ -167,7 +170,8 @@ The examples use a temporary directory and clean up after themselves.
   must not be active. A `multi_process` writer may compact while read-only
   environments are open; their existing transactions keep the old generation,
   and their next read transaction remaps the compacted file. Read-only
-  environments cannot initiate compaction.
+  environments cannot initiate compaction. A writer restart also advances the
+  generation so readers recover from an interrupted compaction.
 - Custom key comparators are environment-wide and must be supplied again on
   every open and offline compaction. A stable comparator ID is persisted in
   `comparator.tsubame` and must match. Prefix iteration requires lexicographic
