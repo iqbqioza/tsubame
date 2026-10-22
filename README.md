@@ -155,11 +155,11 @@ The examples use a temporary directory and clean up after themselves.
   window. This keeps long-running update workloads from growing the file
   indefinitely. Commit-record pages are recycled with one additional
   generation of delay.
-- The free list is in memory. The first write transaction after reopening
-  rebuilds it by scanning pages reachable from the latest commit, so pages
-  freed by a previous process become reusable without waiting for compaction.
-  Read-only reopening does not scan the tree. Offline compaction is still
-  available:
+- The free list is in memory. Cleanly closed writable environments persist it in
+  `free.tsubame`; the next writer validates the cache against the committed
+  transaction and page count, then falls back to scanning reachable pages after
+  an unclean shutdown or corrupt cache. Read-only reopening does not scan the
+  tree. Offline compaction is still available:
   ```rust
   Env::compact("/path/to/env")?;
   ```

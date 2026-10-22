@@ -44,6 +44,10 @@ All notable changes to this project are documented here.
 - Reopening a multi-process writer advances the reader generation, so existing
   read-only environments remap after a compaction interrupted before its
   generation was published.
+- Cleanly closed writable environments persist their free list in a checksummed
+  `free.tsubame` sidecar. The first writer after reopening loads it when the
+  transaction and page count match, avoiding a full reachable-page scan. Stale
+  or corrupt caches are ignored and the free list is reconstructed.
 
 ### Performance
 

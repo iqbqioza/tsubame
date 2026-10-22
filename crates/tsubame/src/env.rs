@@ -57,6 +57,11 @@ const MAX_COMPARATOR_ID_LEN: usize = 1024;
 const MIN_MAP_SIZE: usize = 3 * PAGE_SIZE;
 const CLEAN_MAGIC: [u8; 8] = *b"TSUBCLN\0";
 const CLEAN_LEN: usize = 32;
+const FREE_FILE: &str = "free.tsubame";
+const FREE_MAGIC: [u8; 8] = *b"TSUBFREE";
+const FREE_VERSION: u32 = 1;
+const FREE_HEADER_LEN: usize = 64;
+const FREE_ENTRY_LEN: usize = 24;
 
 /// An open environment.
 ///
@@ -279,7 +284,10 @@ impl Env {
         comparator: KeyComparator,
         comparator_id: &str,
     ) -> Result<()> {
-        crate::storage::compact::compact_with(path.as_ref(), comparator, comparator_id)
+        let path = path.as_ref();
+        crate::storage::compact::compact_with(path, comparator, comparator_id)?;
+        let _ = fs::remove_file(path.join(FREE_FILE));
+        Ok(())
     }
 
     /// Compacts this environment while it remains open.
@@ -1300,6 +1308,12 @@ impl EnvInner {
             return;
         }
         let committed = self.read_committed();
+        if let Some(free) =
+            read_free_cache(&self.path, committed.meta.txn_id, committed.meta.page_count)
+        {
+            self.return_free(free);
+            return;
+        }
         let state = self.read_state();
         // A malformed reachable tree already fails reads. Do not turn that
         // into an open error; leave the pool empty if reconstruction cannot
@@ -1463,6 +1477,19 @@ impl Drop for EnvInner {
         }
 
         let committed = self.read_committed();
+        if self.free_pool_ready.load(Ordering::Acquire) {
+            let extents = self
+                .free_pool
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let _ = write_free_cache(
+                &self.path,
+                committed.meta.txn_id,
+                committed.meta.page_count,
+                &extents,
+            );
+        }
         let _ = write_clean_marker(&self.path, committed.meta.txn_id);
     }
 }
@@ -1533,6 +1560,121 @@ pub(crate) fn write_comparator_id(path: &Path, comparator_id: &str) -> Result<()
         .with_context(|| format!("failed to sync `{}`", file_path.display()))?;
     io::sync_dir(path).with_context(|| format!("failed to sync `{}`", path.display()))?;
     Ok(())
+}
+
+/// Normalizes free extents for persistence and reuse.
+fn normalize_free_extents(mut extents: Vec<FreeExtent>) -> Vec<FreeExtent> {
+    extents.retain(|extent| extent.pages > 0 && extent.start_page >= 2);
+    extents.sort_unstable_by_key(|extent| extent.start_page);
+    let mut normalized: Vec<FreeExtent> = Vec::with_capacity(extents.len());
+    for extent in extents {
+        if let Some(last) = normalized.last_mut()
+            && last
+                .start_page
+                .checked_add(last.pages)
+                .is_some_and(|end| end >= extent.start_page)
+        {
+            let last_end = last.start_page.saturating_add(last.pages);
+            let extent_end = extent.start_page.saturating_add(extent.pages);
+            last.pages = last_end.max(extent_end).saturating_sub(last.start_page);
+            last.freed_txn = last.freed_txn.max(extent.freed_txn);
+        } else {
+            normalized.push(extent);
+        }
+    }
+    normalized
+}
+
+/// Writes the free-list cache after a clean shutdown.
+fn write_free_cache(
+    path: &Path,
+    txn_id: u64,
+    page_count: u64,
+    extents: &[FreeExtent],
+) -> Result<()> {
+    let extents = normalize_free_extents(extents.to_vec());
+    let entries_len = extents
+        .len()
+        .checked_mul(FREE_ENTRY_LEN)
+        .context("free-list cache is too large")?;
+    let total_len = FREE_HEADER_LEN
+        .checked_add(entries_len)
+        .context("free-list cache is too large")?;
+    let mut bytes = vec![0u8; total_len];
+    bytes[0..8].copy_from_slice(&FREE_MAGIC);
+    LittleEndian::write_u32(&mut bytes[8..12], FREE_VERSION);
+    LittleEndian::write_u32(&mut bytes[12..16], FREE_HEADER_LEN as u32);
+    LittleEndian::write_u64(&mut bytes[16..24], txn_id);
+    LittleEndian::write_u64(&mut bytes[24..32], page_count);
+    LittleEndian::write_u64(&mut bytes[32..40], extents.len() as u64);
+    LittleEndian::write_u32(&mut bytes[44..48], meta::FORMAT_VERSION);
+    for (index, extent) in extents.iter().enumerate() {
+        let offset = FREE_HEADER_LEN + index * FREE_ENTRY_LEN;
+        LittleEndian::write_u64(&mut bytes[offset..offset + 8], extent.start_page);
+        LittleEndian::write_u64(&mut bytes[offset + 8..offset + 16], extent.pages);
+        LittleEndian::write_u64(&mut bytes[offset + 16..offset + 24], extent.freed_txn);
+    }
+    let checksum = checksum::hash_zeroed(&bytes, 40, 44);
+    LittleEndian::write_u32(&mut bytes[40..44], checksum);
+
+    let file_path = path.join(FREE_FILE);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&file_path)
+        .with_context(|| format!("failed to create `{}`", file_path.display()))?;
+    file.write_all(&bytes)
+        .with_context(|| format!("failed to write `{}`", file_path.display()))?;
+    file.sync_data()
+        .with_context(|| format!("failed to sync `{}`", file_path.display()))?;
+    io::sync_dir(path).with_context(|| format!("failed to sync `{}`", path.display()))?;
+    Ok(())
+}
+
+/// Reads a free-list cache only when it exactly matches the committed snapshot.
+fn read_free_cache(path: &Path, txn_id: u64, page_count: u64) -> Option<Vec<FreeExtent>> {
+    let bytes = fs::read(path.join(FREE_FILE)).ok()?;
+    if bytes.len() < FREE_HEADER_LEN || &bytes[0..8] != FREE_MAGIC.as_slice() {
+        return None;
+    }
+    if LittleEndian::read_u32(&bytes[8..12]) != FREE_VERSION
+        || LittleEndian::read_u32(&bytes[12..16]) != FREE_HEADER_LEN as u32
+        || LittleEndian::read_u32(&bytes[44..48]) != meta::FORMAT_VERSION
+    {
+        return None;
+    }
+    let stored = LittleEndian::read_u32(&bytes[40..44]);
+    let actual = checksum::hash_zeroed(&bytes, 40, 44);
+    if stored != actual
+        || LittleEndian::read_u64(&bytes[16..24]) != txn_id
+        || LittleEndian::read_u64(&bytes[24..32]) != page_count
+    {
+        return None;
+    }
+    let count = usize::try_from(LittleEndian::read_u64(&bytes[32..40])).ok()?;
+    let expected = FREE_HEADER_LEN.checked_add(count.checked_mul(FREE_ENTRY_LEN)?)?;
+    if bytes.len() != expected {
+        return None;
+    }
+
+    let mut extents = Vec::with_capacity(count);
+    for index in 0..count {
+        let offset = FREE_HEADER_LEN + index * FREE_ENTRY_LEN;
+        let start_page = LittleEndian::read_u64(&bytes[offset..offset + 8]);
+        let pages = LittleEndian::read_u64(&bytes[offset + 8..offset + 16]);
+        let freed_txn = LittleEndian::read_u64(&bytes[offset + 16..offset + 24]);
+        let end = start_page.checked_add(pages)?;
+        if start_page < 2 || pages == 0 || end > page_count || freed_txn == 0 {
+            return None;
+        }
+        extents.push(FreeExtent {
+            start_page,
+            pages,
+            freed_txn,
+        });
+    }
+    Some(normalize_free_extents(extents))
 }
 
 /// Reads the clean-shutdown marker, if it is present and valid.
@@ -1856,6 +1998,7 @@ impl EnvOpenOptions {
             let initial_len = (2 * PAGE_SIZE) as u64;
             data.set_len(initial_len)
                 .with_context(|| format!("failed to size `{}`", data_path.display()))?;
+            let _ = fs::remove_file(path.join(FREE_FILE));
             let meta = meta::initialize(&data).context("failed to initialize the environment")?;
             data.sync_all()
                 .with_context(|| format!("failed to sync `{}`", data_path.display()))?;
@@ -2266,6 +2409,95 @@ mod tests {
         file.write_all(&[0xff]).unwrap();
 
         assert!(options().open(dir.path()).is_err());
+    }
+
+    #[test]
+    fn free_cache_round_trips_and_rejects_stale_metadata() {
+        let dir = tempdir().unwrap();
+        let extents = [
+            FreeExtent {
+                start_page: 5,
+                pages: 2,
+                freed_txn: 3,
+            },
+            FreeExtent {
+                start_page: 7,
+                pages: 1,
+                freed_txn: 4,
+            },
+        ];
+        write_free_cache(dir.path(), 9, 64, &extents).unwrap();
+
+        let loaded = read_free_cache(dir.path(), 9, 64).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].start_page, 5);
+        assert_eq!(loaded[0].pages, 3);
+        assert_eq!(loaded[0].freed_txn, 4);
+        assert!(read_free_cache(dir.path(), 10, 64).is_none());
+        assert!(read_free_cache(dir.path(), 9, 65).is_none());
+
+        let path = dir.path().join(FREE_FILE);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[FREE_HEADER_LEN + 1] ^= 0xff;
+        fs::write(&path, bytes).unwrap();
+        assert!(read_free_cache(dir.path(), 9, 64).is_none());
+    }
+
+    #[test]
+    fn clean_reopen_uses_and_recovers_from_a_bad_free_cache() {
+        let dir = tempdir().unwrap();
+        let cache_path = dir.path().join(FREE_FILE);
+        {
+            let env = options().open(dir.path()).unwrap();
+            let mut wtxn = env.write_txn().unwrap();
+            let db = env
+                .create_database::<crate::types::Str, crate::types::Str>(&mut wtxn, None)
+                .unwrap();
+            for i in 0..2_000u32 {
+                db.put(&mut wtxn, &format!("key-{i:04}"), "value").unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+        assert!(cache_path.is_file());
+
+        {
+            let env = options().open(dir.path()).unwrap();
+            let mut wtxn = env.write_txn().unwrap();
+            let db = env
+                .create_database::<crate::types::Str, crate::types::Str>(&mut wtxn, None)
+                .unwrap();
+            for i in (0..2_000u32).step_by(2) {
+                db.delete(&mut wtxn, &format!("key-{i:04}")).unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+
+        fs::write(&cache_path, b"not a free cache").unwrap();
+        {
+            let env = options().open(dir.path()).unwrap();
+            let mut wtxn = env.write_txn().unwrap();
+            let db = env
+                .create_database::<crate::types::Str, crate::types::Str>(&mut wtxn, None)
+                .unwrap();
+            for i in (0..2_000u32).step_by(2) {
+                assert_eq!(db.get_rw(&wtxn, &format!("key-{i:04}")).unwrap(), None);
+                assert_eq!(
+                    db.get_rw(&wtxn, &format!("key-{:04}", i + 1)).unwrap(),
+                    Some("value")
+                );
+            }
+            db.put(&mut wtxn, "after-cache-loss", "ok").unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let env = options().open(dir.path()).unwrap();
+        let rtxn = env.read_txn().unwrap();
+        let db = env
+            .open_database::<crate::types::Str, crate::types::Str>(&rtxn, None)
+            .unwrap();
+        assert_eq!(db.get(&rtxn, "after-cache-loss").unwrap(), Some("ok"));
+        assert_eq!(db.get(&rtxn, "key-0000").unwrap(), None);
+        assert_eq!(db.get(&rtxn, "key-0001").unwrap(), Some("value"));
     }
 
     #[test]
