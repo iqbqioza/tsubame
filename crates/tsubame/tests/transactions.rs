@@ -991,6 +991,57 @@ fn offline_compaction_clears_stale_reader_slots() -> Result<()> {
 }
 
 #[test]
+fn bulk_delete_many_keys_and_overflow_values() -> Result<()> {
+    let dir = tempdir()?;
+    let large = "x".repeat(10_000);
+    {
+        let env = options().open(dir.path())?;
+        let mut wtxn = env.write_txn()?;
+        let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+        for i in 0..4096u32 {
+            db.put(&mut wtxn, &format!("key-{i:04}"), &format!("value-{i:04}"))?;
+        }
+        db.put(&mut wtxn, "large", &large)?;
+        wtxn.commit()?;
+
+        let mut wtxn = env.write_txn()?;
+        for i in (0..4096u32).step_by(2) {
+            db.delete(&mut wtxn, &format!("key-{i:04}"))?;
+        }
+        db.delete(&mut wtxn, "large")?;
+        wtxn.commit()?;
+    }
+
+    {
+        let env = options().open(dir.path())?;
+        let rtxn = env.read_txn()?;
+        let db = env.open_database::<Str, Str>(&rtxn, None)?;
+        for i in 0..4096u32 {
+            let key = format!("key-{i:04}");
+            let expected = (i % 2 == 1).then(|| format!("value-{i:04}"));
+            assert_eq!(db.get(&rtxn, &key)?, expected.as_deref(), "key {key}");
+        }
+        assert_eq!(db.get(&rtxn, "large")?, None);
+        drop(rtxn);
+
+        let mut wtxn = env.write_txn()?;
+        let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+        for i in (0..4096u32).step_by(2) {
+            db.delete(&mut wtxn, &format!("key-{:04}", i + 1))?;
+        }
+        wtxn.commit()?;
+        drop(db);
+    }
+
+    let env = options().open(dir.path())?;
+    let rtxn = env.read_txn()?;
+    let db = env.open_database::<Str, Str>(&rtxn, None)?;
+    assert_eq!(db.iter(&rtxn)?.count(), 0);
+
+    Ok(())
+}
+
+#[test]
 fn compaction_preserves_overflow_values() -> Result<()> {
     let dir = tempdir()?;
     let value = vec![0x5a; 10_000];
@@ -2186,6 +2237,39 @@ fn custom_comparator_orders_reads_and_compaction() -> Result<()> {
         .map(|item| item.map(|(key, _)| key.to_owned()))
         .collect::<std::result::Result<_, _>>()?;
     assert_eq!(named_keys, ["c", "b", "a"]);
+
+    Ok(())
+}
+
+#[test]
+fn custom_comparator_bulk_delete() -> Result<()> {
+    let dir = tempdir()?;
+    let mut options = options();
+    options
+        .comparator(KeyComparator::custom(reverse_bytes))
+        .comparator_id("reverse-v1");
+    let env = options.open(dir.path())?;
+
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+    for i in 0..2_000u32 {
+        db.put(&mut wtxn, &format!("key-{i:04}"), &format!("value-{i}"))?;
+    }
+    wtxn.commit()?;
+
+    let mut wtxn = env.write_txn()?;
+    for i in 0..1_500u32 {
+        db.delete(&mut wtxn, &format!("key-{i:04}"))?;
+    }
+    db.delete(&mut wtxn, "missing")?;
+    wtxn.commit()?;
+
+    let rtxn = env.read_txn()?;
+    for i in 0..2_000u32 {
+        let key = format!("key-{i:04}");
+        let expected = (i >= 1_500).then(|| format!("value-{i}"));
+        assert_eq!(db.get(&rtxn, &key)?, expected.as_deref(), "key {key}");
+    }
 
     Ok(())
 }

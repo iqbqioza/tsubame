@@ -20,6 +20,8 @@ use memmap2::{Mmap, MmapMut};
 use crate::Result;
 use crate::comparator::KeyComparator;
 use crate::database::{Database, DatabaseKind};
+#[cfg(windows)]
+use crate::storage::PageSet;
 use crate::storage::checksum;
 use crate::storage::commit;
 use crate::storage::meta::{self, Meta};
@@ -817,13 +819,42 @@ impl EnvState {
             old_end <= mapping.len() && new_end <= mapping.len(),
             "page update is outside the writable mapping"
         );
-        mapping.copy_within(old_start..old_end, new_start);
+        if old_start != new_start {
+            mapping.copy_within(old_start..old_end, new_start);
+        }
         let new_slice = &mut mapping[new_start..new_end];
         let bytes: &mut [u8; PAGE_SIZE] = new_slice
             .try_into()
             .map_err(|_| anyhow::anyhow!("page has an unexpected size"))?;
         edit(bytes)?;
         Ok(true)
+    }
+
+    /// Recomputes a deferred page checksum directly in the writable mapping.
+    pub(crate) fn seal_page_direct(&self, page_id: u64) -> Result<()> {
+        let Some(write_mmap) = &self.write_mmap else {
+            bail!("environment has no writable mapping");
+        };
+        ensure!(page_id >= 2, "data page ID {page_id} is reserved");
+        let index = usize::try_from(page_id - 2).context("page ID is too large")?;
+        let start = index
+            .checked_mul(PAGE_SIZE)
+            .context("page offset overflow")?;
+        let end = start
+            .checked_add(PAGE_SIZE)
+            .context("page offset overflow")?;
+        let mut mapping = write_mmap
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ensure!(
+            end <= mapping.len(),
+            "page {page_id} is outside the writable mapping"
+        );
+        let page: &mut [u8; PAGE_SIZE] = (&mut mapping[start..end])
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("page has an unexpected size"))?;
+        crate::storage::page::seal_page(page);
+        Ok(())
     }
 
     /// Copies an overflow extent into the writable mapping.
@@ -860,7 +891,9 @@ impl EnvState {
     }
 
     #[cfg(windows)]
-    pub(crate) fn flush_write_pages(&self, pages: &BTreeSet<u64>) -> Result<()> {
+    pub(crate) fn flush_write_pages(&self, pages: &PageSet) -> Result<()> {
+        let mut pages: Vec<u64> = pages.iter().copied().collect();
+        pages.sort_unstable();
         let Some(write_mmap) = &self.write_mmap else {
             return Ok(());
         };

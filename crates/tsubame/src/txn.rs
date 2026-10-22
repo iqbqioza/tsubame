@@ -19,9 +19,10 @@ use crate::storage::btree::PageSource;
 use crate::storage::commit::{self, CommitEntry, Descriptor};
 use crate::storage::meta::{self, InlineCommit, Meta};
 use crate::storage::overflow::{self, OverflowRef};
+use crate::storage::page;
 use crate::storage::page::Page;
 use crate::storage::store::PageStore;
-use crate::storage::{PAGE_SIZE, io};
+use crate::storage::{PAGE_SIZE, PageSet, io};
 
 /// Transactions writing at least this many entries into an empty database
 /// build the tree bottom-up instead of inserting one path at a time.
@@ -57,6 +58,16 @@ impl PageOverlay {
                 .find(|(id, _)| *id == page_id)
                 .map(|(_, page)| page),
             Self::Large(pages) => pages.get(&page_id),
+        }
+    }
+
+    fn get_mut(&mut self, page_id: u64) -> Option<&mut [u8; PAGE_SIZE]> {
+        match self {
+            Self::Small(entries) => entries
+                .iter_mut()
+                .find(|(id, _)| *id == page_id)
+                .map(|(_, page)| page),
+            Self::Large(pages) => pages.get_mut(&page_id),
         }
     }
 
@@ -522,7 +533,8 @@ pub struct RwTxn<'env> {
     base_slot: u8,
     txn_id: u64,
     overlay: PageOverlay,
-    dirty_pages: BTreeSet<u64>,
+    dirty_pages: PageSet,
+    unsealed_pages: PageSet,
     direct_extents: BTreeSet<u64>,
     extents: BTreeMap<u64, Vec<u8>>,
     next_page: u64,
@@ -540,7 +552,7 @@ pub struct RwTxn<'env> {
     base_freed: Vec<FreeExtent>,
     // Pages allocated by this transaction. Page IDs alone do not distinguish
     // an old base page from a reused free page below the old high-water mark.
-    owned_pages: BTreeSet<u64>,
+    owned_pages: PageSet,
     deferred_free: Vec<FreeExtent>,
     unnamed_pending: Pending,
     named_pending: BTreeMap<Arc<str>, Pending>,
@@ -579,7 +591,8 @@ impl<'env> RwTxn<'env> {
             base_slot: committed.slot,
             txn_id,
             overlay: PageOverlay::new(),
-            dirty_pages: BTreeSet::new(),
+            dirty_pages: PageSet::default(),
+            unsealed_pages: PageSet::default(),
             direct_extents: BTreeSet::new(),
             extents: BTreeMap::new(),
             next_page: committed.meta.page_count,
@@ -588,7 +601,7 @@ impl<'env> RwTxn<'env> {
             cross_free,
             cross_allocated: Vec::new(),
             base_freed: Vec::new(),
-            owned_pages: BTreeSet::new(),
+            owned_pages: PageSet::default(),
             deferred_free: Vec::new(),
             unnamed_pending: Pending::new(),
             named_pending: BTreeMap::new(),
@@ -978,6 +991,14 @@ impl<'env> RwTxn<'env> {
             Pending::Unordered(mut pending) => {
                 sort_unordered_entries(&mut pending.entries, comparator);
                 let mut entries = deduplicate_unordered(pending.entries);
+                if *root != 0
+                    && entries.len() >= BULK_LOAD_THRESHOLD
+                    && entries.iter().all(|(_, value)| value.is_none())
+                {
+                    let keys: Vec<PendingKey> = entries.into_iter().map(|(key, _)| key).collect();
+                    *root = btree::bulk_delete_with(self, *root, &keys, self.txn_id, &comparator)?;
+                    return Ok(());
+                }
                 if *root == 0 && entries.len() >= BULK_LOAD_THRESHOLD {
                     let entries: Vec<(PendingKey, PendingValue)> = entries
                         .drain(..)
@@ -994,6 +1015,14 @@ impl<'env> RwTxn<'env> {
                 Ok(())
             }
             Pending::Map(pending) => {
+                if *root != 0
+                    && pending.len() >= BULK_LOAD_THRESHOLD
+                    && pending.values().all(Option::is_none)
+                {
+                    let keys: Vec<PendingKey> = pending.into_keys().collect();
+                    *root = btree::bulk_delete_with(self, *root, &keys, self.txn_id, &comparator)?;
+                    return Ok(());
+                }
                 if *root == 0 && pending.len() >= BULK_LOAD_THRESHOLD {
                     let mut entries: Vec<(PendingKey, PendingValue)> = pending
                         .into_iter()
@@ -1051,7 +1080,22 @@ impl<'env> RwTxn<'env> {
         Ok(())
     }
 
-    fn write_and_sync(&self, new_meta: &Meta) -> Result<()> {
+    fn seal_pages(&mut self) -> Result<()> {
+        let pages = std::mem::take(&mut self.unsealed_pages);
+        for page_id in pages {
+            if let Some(page) = self.overlay.get_mut(page_id) {
+                page::seal_page(page);
+            } else if self.state.has_write_mmap() {
+                self.state.seal_page_direct(page_id)?;
+            } else {
+                bail!("page {page_id} has no writable storage for sealing");
+            }
+        }
+        Ok(())
+    }
+
+    fn write_and_sync(&mut self, new_meta: &Meta) -> Result<()> {
+        self.seal_pages()?;
         let data = &self.state.data;
 
         let mut pages = self.overlay.iter().peekable();
@@ -1201,13 +1245,25 @@ impl PageStore for RwTxn<'_> {
             "page {new_page_id} is outside the transaction allocation range"
         );
         if self.state.has_write_mmap() {
+            let defer_checksum = new_page_id == old_page_id;
             self.state
-                .update_page_direct(old_page_id, new_page_id, edit)?;
+                .update_page_direct(old_page_id, new_page_id, |page| {
+                    edit(page)?;
+                    if !defer_checksum {
+                        page::seal_page(page);
+                    }
+                    Ok(())
+                })?;
             self.dirty_pages.insert(new_page_id);
+            self.state.mark_verified(new_page_id);
+            if defer_checksum {
+                self.unsealed_pages.insert(new_page_id);
+            }
         } else {
             let mut page = self.read_page(old_page_id)?;
             edit(&mut page)?;
             self.write_page(new_page_id, page)?;
+            self.unsealed_pages.insert(new_page_id);
         }
         Ok(())
     }
@@ -1328,6 +1384,10 @@ impl PageStore for RwTxn<'_> {
         Ok(start)
     }
 
+    fn owns_page(&self, page_id: u64) -> bool {
+        self.owned_pages.contains(&page_id)
+    }
+
     fn write_page(&mut self, page_id: u64, page: [u8; PAGE_SIZE]) -> Result<()> {
         ensure!(
             page_id >= 2 && page_id < self.next_page,
@@ -1335,8 +1395,11 @@ impl PageStore for RwTxn<'_> {
         );
         if self.state.write_page_direct(page_id, &page)? {
             self.dirty_pages.insert(page_id);
+            self.unsealed_pages.remove(&page_id);
+            self.state.mark_verified(page_id);
         } else {
             self.overlay.insert(page_id, page);
+            self.unsealed_pages.remove(&page_id);
         }
         Ok(())
     }
@@ -1417,6 +1480,7 @@ impl RwTxn<'_> {
 
         for page_id in start_page..end {
             self.dirty_pages.remove(&page_id);
+            self.unsealed_pages.remove(&page_id);
         }
         if pages == 1 {
             self.overlay.remove(start_page);
