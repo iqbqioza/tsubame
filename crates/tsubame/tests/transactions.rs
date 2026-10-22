@@ -49,6 +49,35 @@ fn commits_are_visible_after_reopen() -> Result<()> {
 }
 
 #[test]
+fn copy_to_path_creates_a_consistent_backup() -> Result<()> {
+    let dir = tempdir()?;
+    let backup = dir.path().join("backup");
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+    for i in 0..1_000u32 {
+        db.put(&mut wtxn, &format!("key-{i:04}"), &format!("value-{i:04}"))?;
+    }
+    wtxn.commit()?;
+
+    let active = env.write_txn()?;
+    assert!(env.copy_to_path(&backup).is_err());
+    drop(active);
+    env.copy_to_path(&backup)?;
+    assert!(env.copy_to_path(&backup).is_err());
+
+    let mut read_only = options();
+    read_only.read_only(true);
+    let restored = read_only.open(&backup)?;
+    let rtxn = restored.read_txn()?;
+    let db = restored.open_database::<Str, Str>(&rtxn, None)?;
+    assert_eq!(db.get(&rtxn, "key-0000")?, Some("value-0000"));
+    assert_eq!(db.get(&rtxn, "key-0999")?, Some("value-0999"));
+
+    Ok(())
+}
+
+#[test]
 fn database_inspection_helpers_match_the_visible_snapshot() -> Result<()> {
     let dir = tempdir()?;
     let env = options().open(dir.path())?;

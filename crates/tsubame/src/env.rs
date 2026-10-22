@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -246,6 +246,89 @@ impl Env {
         };
 
         Ok(Database::new(Arc::clone(&self.inner), kind))
+    }
+
+    /// Copies this environment to an empty destination directory.
+    ///
+    /// The copy contains a consistent committed snapshot. All writes must be
+    /// idle while the copy runs; an active write transaction causes an error.
+    /// The free-list cache and reader-registry sidecars are intentionally not
+    /// copied, so the destination reconstructs them on first use.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a write transaction is active, the destination is
+    /// not empty, or a file cannot be copied or synced.
+    pub fn copy_to_path(&self, destination: impl AsRef<Path>) -> Result<()> {
+        let destination = destination.as_ref();
+        if destination == self.inner.path {
+            bail!("backup destination must differ from the environment path");
+        }
+        let _writer = self
+            .inner
+            .writer
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("a write transaction is active"))?;
+
+        if destination.exists() {
+            ensure!(
+                fs::read_dir(destination)
+                    .with_context(|| format!("failed to read `{}`", destination.display()))?
+                    .next()
+                    .is_none(),
+                "backup destination `{}` is not empty",
+                destination.display()
+            );
+        } else {
+            fs::create_dir(destination)
+                .with_context(|| format!("failed to create `{}`", destination.display()))?;
+        }
+
+        let committed = self.inner.read_committed();
+        let data_len = pages_to_bytes(committed.meta.page_count)?;
+        let source_path = self.inner.path.join(DATA_FILE);
+        let target_path = destination.join(DATA_FILE);
+        let mut source = File::open(&source_path)
+            .with_context(|| format!("failed to open `{}`", source_path.display()))?;
+        let mut target = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target_path)
+            .with_context(|| format!("failed to create `{}`", target_path.display()))?;
+        target
+            .set_len(data_len as u64)
+            .with_context(|| format!("failed to size `{}`", target_path.display()))?;
+        let mut limited = Read::by_ref(&mut source).take(data_len as u64);
+        let copied = std::io::copy(&mut limited, &mut target)
+            .with_context(|| format!("failed to copy `{}`", source_path.display()))?;
+        ensure!(
+            copied == data_len as u64,
+            "environment `{}` ended before the committed page count",
+            source_path.display()
+        );
+        target
+            .sync_all()
+            .with_context(|| format!("failed to sync `{}`", target_path.display()))?;
+
+        let comparator_path = self.inner.path.join(COMPARATOR_FILE);
+        let destination_comparator = destination.join(COMPARATOR_FILE);
+        if comparator_path.is_file() {
+            fs::copy(&comparator_path, &destination_comparator).with_context(|| {
+                format!(
+                    "failed to copy `{}` to `{}`",
+                    comparator_path.display(),
+                    destination_comparator.display()
+                )
+            })?;
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&destination_comparator)?
+                .sync_all()?;
+        }
+        io::sync_dir(destination)
+            .with_context(|| format!("failed to sync `{}`", destination.display()))?;
+        Ok(())
     }
 
     /// Compacts the environment at `path` into a fresh data file.

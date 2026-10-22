@@ -57,6 +57,7 @@ added without changing the main API.
 - [x] Online compaction while an environment remains open
 - [x] Multi-process online compaction with reader generation remapping
 - [x] Offline compaction
+- [x] Consistent environment backup with `Env::copy_to_path`
 
 ## Codec features
 
