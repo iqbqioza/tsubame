@@ -97,6 +97,32 @@ impl Env {
         &self.inner.comparator_id
     }
 
+    /// Flushes all committed data and the environment directory to stable
+    /// storage.
+    ///
+    /// Commits already sync their own writes. This method is useful after
+    /// external file operations or to force a filesystem flush explicitly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a write transaction is active or a file cannot be
+    /// synced.
+    pub fn force_sync(&self) -> Result<()> {
+        let _writer = self
+            .inner
+            .writer
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("a write transaction is active"))?;
+        let state = self.inner.read_state();
+        state
+            .data
+            .sync_all()
+            .context("failed to sync the environment data file")?;
+        io::sync_dir(&self.inner.path)
+            .with_context(|| format!("failed to sync `{}`", self.inner.path.display()))?;
+        Ok(())
+    }
+
     /// Returns a consistent snapshot of the environment metadata.
     pub fn info(&self) -> EnvInfo {
         let state_guard = self

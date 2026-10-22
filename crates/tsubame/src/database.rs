@@ -417,6 +417,84 @@ impl<KC, DC> Database<KC, DC> {
         RwIter::new(txn, root, pending)
     }
 
+    /// Alias for [`Database::iter_rw`], matching heed's write-transaction API.
+    pub fn iter_mut<'txn, 'env>(
+        &self,
+        txn: &'txn mut RwTxn<'env>,
+    ) -> Result<RwIter<'txn, 'env, KC, DC>>
+    where
+        KC: BytesDecode<'txn>,
+        DC: BytesDecode<'txn>,
+    {
+        self.iter_rw(txn)
+    }
+
+    /// Alias for [`Database::range_rw`], matching heed's write-transaction API.
+    pub fn range_mut<'a, 'txn, 'env>(
+        &self,
+        txn: &'txn mut RwTxn<'env>,
+        start: Bound<&'a KC::EItem>,
+        end: Bound<&'a KC::EItem>,
+    ) -> Result<RwRange<'txn, 'env, KC, DC>>
+    where
+        KC: BytesEncode<'a> + BytesDecode<'txn>,
+        DC: BytesDecode<'txn>,
+    {
+        self.range_rw(txn, start, end)
+    }
+
+    /// Alias for [`Database::rev_iter_rw`].
+    pub fn rev_iter_mut<'txn, 'env>(
+        &self,
+        txn: &'txn mut RwTxn<'env>,
+    ) -> Result<RwRevIter<'txn, 'env, KC, DC>>
+    where
+        KC: BytesDecode<'txn>,
+        DC: BytesDecode<'txn>,
+    {
+        self.rev_iter_rw(txn)
+    }
+
+    /// Alias for [`Database::rev_range_rw`].
+    pub fn rev_range_mut<'a, 'txn, 'env>(
+        &self,
+        txn: &'txn mut RwTxn<'env>,
+        start: Bound<&'a KC::EItem>,
+        end: Bound<&'a KC::EItem>,
+    ) -> Result<RwRevRange<'txn, 'env, KC, DC>>
+    where
+        KC: BytesEncode<'a> + BytesDecode<'txn>,
+        DC: BytesDecode<'txn>,
+    {
+        self.rev_range_rw(txn, start, end)
+    }
+
+    /// Alias for [`Database::prefix_rw`].
+    pub fn prefix_iter_mut<'a, 'txn, 'env>(
+        &self,
+        txn: &'txn mut RwTxn<'env>,
+        prefix: &'a KC::EItem,
+    ) -> Result<RwPrefix<'txn, 'env, KC, DC>>
+    where
+        KC: BytesEncode<'a> + BytesDecode<'txn>,
+        DC: BytesDecode<'txn>,
+    {
+        self.prefix_rw(txn, prefix)
+    }
+
+    /// Alias for [`Database::rev_prefix_rw`].
+    pub fn rev_prefix_iter_mut<'a, 'txn, 'env>(
+        &self,
+        txn: &'txn mut RwTxn<'env>,
+        prefix: &'a KC::EItem,
+    ) -> Result<RwRevPrefix<'txn, 'env, KC, DC>>
+    where
+        KC: BytesEncode<'a> + BytesDecode<'txn>,
+        DC: BytesDecode<'txn>,
+    {
+        self.rev_prefix_rw(txn, prefix)
+    }
+
     /// Returns a forward range iterator over the write transaction's view.
     ///
     /// # Errors

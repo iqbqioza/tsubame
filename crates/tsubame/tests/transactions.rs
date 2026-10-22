@@ -132,6 +132,81 @@ fn directional_lookups_follow_key_order() -> Result<()> {
 }
 
 #[test]
+fn heed_style_mut_aliases_reflect_staged_changes() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+    for key in ["a", "b", "c"] {
+        db.put(&mut wtxn, key, key)?;
+    }
+    wtxn.commit()?;
+
+    let mut wtxn = env.write_txn()?;
+    db.put(&mut wtxn, "d", "d")?;
+    db.put(&mut wtxn, "e", "e")?;
+
+    let all = db.iter_mut(&mut wtxn)?.collect::<Result<Vec<_>>>()?;
+    assert_eq!(
+        all,
+        vec![("a", "a"), ("b", "b"), ("c", "c"), ("d", "d"), ("e", "e")]
+    );
+
+    let range = db
+        .range_mut(&mut wtxn, Bound::Included("b"), Bound::Excluded("e"))?
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(range, vec![("b", "b"), ("c", "c"), ("d", "d")]);
+
+    let rev = db.rev_iter_mut(&mut wtxn)?.collect::<Result<Vec<_>>>()?;
+    assert_eq!(
+        rev,
+        vec![("e", "e"), ("d", "d"), ("c", "c"), ("b", "b"), ("a", "a")]
+    );
+
+    let rev_range = db
+        .rev_range_mut(&mut wtxn, Bound::Included("b"), Bound::Included("d"))?
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(rev_range, vec![("d", "d"), ("c", "c"), ("b", "b")]);
+
+    let prefix = db
+        .prefix_iter_mut(&mut wtxn, "c")?
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(prefix, vec![("c", "c")]);
+
+    let rev_prefix = db
+        .rev_prefix_iter_mut(&mut wtxn, "c")?
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(rev_prefix, vec![("c", "c")]);
+
+    Ok(())
+}
+
+#[test]
+fn force_sync_waits_for_writers() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+    db.put(&mut wtxn, "key", "value")?;
+    wtxn.commit()?;
+
+    env.force_sync()?;
+    let wtxn = env.write_txn()?;
+    assert!(env.force_sync().is_err());
+    drop(wtxn);
+    env.force_sync()?;
+    drop(db);
+    drop(env);
+
+    let mut read_options = options();
+    read_options.read_only(true);
+    let read_only = read_options.open(dir.path())?;
+    read_only.force_sync()?;
+
+    Ok(())
+}
+
+#[test]
 fn database_inspection_helpers_match_the_visible_snapshot() -> Result<()> {
     let dir = tempdir()?;
     let env = options().open(dir.path())?;
