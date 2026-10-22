@@ -283,185 +283,6 @@ impl<'a> Page<'a> {
         }
     }
 
-    /// Appends a leaf entry and returns the new page bytes.
-    pub(crate) fn append_entry(
-        &self,
-        page_id: u64,
-        txn_id: u64,
-        key: &[u8],
-        value: &[u8],
-        flags: u8,
-    ) -> Result<[u8; PAGE_SIZE]> {
-        ensure!(
-            self.page_type == PageType::Leaf,
-            "cannot append an entry to a branch page"
-        );
-        ensure!(
-            key.len() <= MAX_KEY_SIZE,
-            "key is {} bytes, maximum is {MAX_KEY_SIZE}",
-            key.len()
-        );
-        ensure!(
-            flags & !FLAG_OVERFLOW == 0,
-            "unsupported slot flags {flags:#04x}"
-        );
-
-        let slot = HEADER_SIZE + self.slot_count * SLOT_SIZE;
-        let cell_len = key
-            .len()
-            .checked_add(value.len())
-            .context("cell size overflow")?;
-        let cell_start = self
-            .free_end()
-            .checked_sub(cell_len)
-            .context("page does not have room for the cell")?;
-        ensure!(
-            cell_start >= slot + SLOT_SIZE,
-            "page does not have room for another slot"
-        );
-
-        let mut page = self.copy_page()?;
-        page[cell_start..cell_start + key.len()].copy_from_slice(key);
-        let value_start = cell_start + key.len();
-        page[value_start..value_start + value.len()].copy_from_slice(value);
-
-        LittleEndian::write_u16(&mut page[slot..slot + 2], cell_start as u16);
-        LittleEndian::write_u16(&mut page[slot + 2..slot + 4], key.len() as u16);
-        LittleEndian::write_u32(&mut page[slot + 4..slot + 8], value.len() as u32);
-        page[slot + 8] = flags;
-
-        LittleEndian::write_u16(&mut page[6..8], (self.slot_count + 1) as u16);
-        LittleEndian::write_u16(&mut page[24..26], (slot + SLOT_SIZE) as u16);
-        LittleEndian::write_u16(&mut page[26..28], cell_start as u16);
-
-        reseal(&mut page, page_id, txn_id);
-        Ok(page)
-    }
-
-    /// Replaces a leaf value whose encoded length is unchanged.
-    pub(crate) fn replace_value(
-        &self,
-        page_id: u64,
-        txn_id: u64,
-        index: usize,
-        value: &[u8],
-        flags: u8,
-    ) -> Result<[u8; PAGE_SIZE]> {
-        ensure!(
-            self.page_type == PageType::Leaf,
-            "cannot replace a value in a branch page"
-        );
-        let (offset, key_len, value_len, _) = self.slot(index)?;
-        ensure!(
-            value_len == value.len(),
-            "replacement value has {} bytes, expected {value_len}",
-            value.len()
-        );
-        ensure!(
-            flags & !FLAG_OVERFLOW == 0,
-            "unsupported slot flags {flags:#04x}"
-        );
-
-        let mut page = self.copy_page()?;
-        let start = offset + key_len;
-        page[start..start + value_len].copy_from_slice(value);
-        page[HEADER_SIZE + index * SLOT_SIZE + 8] = flags;
-
-        reseal(&mut page, page_id, txn_id);
-        Ok(page)
-    }
-
-    /// Replaces a leaf value with a different encoded length.
-    ///
-    /// Cells are packed contiguously below the slot array. Changing one cell
-    /// shifts the cells for later slots as a single block, so the key and value
-    /// bytes of the other entries do not have to be rebuilt one by one.
-    pub(crate) fn replace_value_resized(
-        &self,
-        page_id: u64,
-        txn_id: u64,
-        index: usize,
-        value: &[u8],
-        flags: u8,
-    ) -> Result<[u8; PAGE_SIZE]> {
-        ensure!(
-            self.page_type == PageType::Leaf,
-            "cannot replace a value in a branch page"
-        );
-        ensure!(
-            flags & !FLAG_OVERFLOW == 0,
-            "unsupported slot flags {flags:#04x}"
-        );
-
-        let (offset, key_len, value_len, _) = self.slot(index)?;
-        let old_cell_len = key_len
-            .checked_add(value_len)
-            .context("cell size overflow")?;
-        let new_cell_len = key_len
-            .checked_add(value.len())
-            .context("cell size overflow")?;
-        let old_cell_end = offset
-            .checked_add(old_cell_len)
-            .context("cell end overflow")?;
-        let new_start = old_cell_end
-            .checked_sub(new_cell_len)
-            .context("cell start underflow")?;
-
-        let free_end = self.free_end();
-        let new_free_end = if value.len() >= value_len {
-            free_end.checked_sub(value.len() - value_len)
-        } else {
-            free_end.checked_add(value_len - value.len())
-        }
-        .context("leaf free area overflow")?;
-        let slot_end = HEADER_SIZE
-            .checked_add(self.slot_count * SLOT_SIZE)
-            .context("slot array overflow")?;
-        ensure!(
-            new_free_end >= slot_end,
-            "resized leaf cell overlaps the slot array"
-        );
-        ensure!(
-            new_start >= new_free_end && new_start + new_cell_len <= PAGE_SIZE,
-            "resized leaf cell is outside the page"
-        );
-
-        let mut page = self.copy_page()?;
-        if new_free_end != free_end {
-            page.copy_within(free_end..offset, new_free_end);
-        }
-
-        page[new_start..new_start + key_len].copy_from_slice(&self.bytes[offset..offset + key_len]);
-        let value_start = new_start + key_len;
-        page[value_start..value_start + value.len()].copy_from_slice(value);
-
-        let slot = HEADER_SIZE + index * SLOT_SIZE;
-        LittleEndian::write_u16(&mut page[slot..slot + 2], new_start as u16);
-        LittleEndian::write_u32(
-            &mut page[slot + 4..slot + 8],
-            u32::try_from(value.len()).context("value is too large")?,
-        );
-        page[slot + 8] = flags;
-
-        if value.len() != value_len {
-            let delta = value.len() as isize - value_len as isize;
-            for later in index + 1..self.slot_count {
-                let later_slot = HEADER_SIZE + later * SLOT_SIZE;
-                let old_offset = LittleEndian::read_u16(&page[later_slot..later_slot + 2]) as isize;
-                let new_offset = old_offset - delta;
-                ensure!(
-                    new_offset >= slot_end as isize && new_offset <= PAGE_SIZE as isize,
-                    "resized leaf slot is outside the page"
-                );
-                LittleEndian::write_u16(&mut page[later_slot..later_slot + 2], new_offset as u16);
-            }
-        }
-
-        LittleEndian::write_u16(&mut page[26..28], new_free_end as u16);
-        reseal(&mut page, page_id, txn_id);
-        Ok(page)
-    }
-
     /// Replaces a branch child page ID.
     pub(crate) fn replace_child(
         &self,
@@ -899,6 +720,227 @@ fn page_checksum(page: &[u8]) -> u32 {
 fn page_checksum_for_write(page: &mut [u8; PAGE_SIZE]) -> u32 {
     page[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].fill(0);
     crc32c_fast::crc32c(page)
+}
+
+/// Appends a leaf entry directly into an owned page buffer.
+pub(crate) fn append_entry_in_place(
+    page: &mut [u8; PAGE_SIZE],
+    page_id: u64,
+    txn_id: u64,
+    key: &[u8],
+    value: &[u8],
+    flags: u8,
+) -> Result<()> {
+    let (slot_count, free_end) = {
+        let parsed = Page::parse_trusted(page, None)?;
+        ensure!(
+            parsed.page_type() == PageType::Leaf,
+            "cannot append an entry to a branch page"
+        );
+        (parsed.slot_count(), parsed.free_end())
+    };
+    ensure!(
+        key.len() <= MAX_KEY_SIZE,
+        "key is {} bytes, maximum is {MAX_KEY_SIZE}",
+        key.len()
+    );
+    ensure!(
+        flags & !FLAG_OVERFLOW == 0,
+        "unsupported slot flags {flags:#04x}"
+    );
+
+    let slot = HEADER_SIZE + slot_count * SLOT_SIZE;
+    let cell_len = key
+        .len()
+        .checked_add(value.len())
+        .context("cell size overflow")?;
+    let cell_start = free_end
+        .checked_sub(cell_len)
+        .context("page does not have room for the cell")?;
+    ensure!(
+        cell_start >= slot + SLOT_SIZE,
+        "page does not have room for another slot"
+    );
+
+    page[cell_start..cell_start + key.len()].copy_from_slice(key);
+    let value_start = cell_start + key.len();
+    page[value_start..value_start + value.len()].copy_from_slice(value);
+    LittleEndian::write_u16(&mut page[slot..slot + 2], cell_start as u16);
+    LittleEndian::write_u16(&mut page[slot + 2..slot + 4], key.len() as u16);
+    LittleEndian::write_u32(
+        &mut page[slot + 4..slot + 8],
+        u32::try_from(value.len()).context("value is too large")?,
+    );
+    page[slot + 8] = flags;
+    LittleEndian::write_u16(&mut page[6..8], (slot_count + 1) as u16);
+    LittleEndian::write_u16(&mut page[24..26], (slot + SLOT_SIZE) as u16);
+    LittleEndian::write_u16(&mut page[26..28], cell_start as u16);
+    reseal(page, page_id, txn_id);
+    Ok(())
+}
+
+/// Replaces a same-length leaf value directly in an owned page buffer.
+pub(crate) fn replace_value_in_place(
+    page: &mut [u8; PAGE_SIZE],
+    page_id: u64,
+    txn_id: u64,
+    index: usize,
+    value: &[u8],
+    flags: u8,
+) -> Result<()> {
+    let (offset, key_len, value_len) = {
+        let parsed = Page::parse_trusted(page, None)?;
+        ensure!(
+            parsed.page_type() == PageType::Leaf,
+            "cannot replace a value in a branch page"
+        );
+        let (offset, key_len, value_len, _) = parsed.slot(index)?;
+        (offset, key_len, value_len)
+    };
+    ensure!(
+        value_len == value.len(),
+        "replacement value has {} bytes, expected {value_len}",
+        value.len()
+    );
+    ensure!(
+        flags & !FLAG_OVERFLOW == 0,
+        "unsupported slot flags {flags:#04x}"
+    );
+    let start = offset + key_len;
+    page[start..start + value_len].copy_from_slice(value);
+    page[HEADER_SIZE + index * SLOT_SIZE + 8] = flags;
+    reseal(page, page_id, txn_id);
+    Ok(())
+}
+
+/// Replaces a changed-length leaf value directly in an owned page buffer.
+pub(crate) fn replace_value_resized_in_place(
+    page: &mut [u8; PAGE_SIZE],
+    page_id: u64,
+    txn_id: u64,
+    index: usize,
+    value: &[u8],
+    flags: u8,
+) -> Result<()> {
+    let (slot_count, free_end, offset, key_len, value_len) = {
+        let parsed = Page::parse_trusted(page, None)?;
+        ensure!(
+            parsed.page_type() == PageType::Leaf,
+            "cannot replace a value in a branch page"
+        );
+        let (offset, key_len, value_len, _) = parsed.slot(index)?;
+        (
+            parsed.slot_count(),
+            parsed.free_end(),
+            offset,
+            key_len,
+            value_len,
+        )
+    };
+    ensure!(
+        flags & !FLAG_OVERFLOW == 0,
+        "unsupported slot flags {flags:#04x}"
+    );
+
+    let old_cell_len = key_len
+        .checked_add(value_len)
+        .context("cell size overflow")?;
+    let new_cell_len = key_len
+        .checked_add(value.len())
+        .context("cell size overflow")?;
+    let old_cell_end = offset
+        .checked_add(old_cell_len)
+        .context("cell end overflow")?;
+    let new_start = old_cell_end
+        .checked_sub(new_cell_len)
+        .context("cell start underflow")?;
+    let new_free_end = if value.len() >= value_len {
+        free_end.checked_sub(value.len() - value_len)
+    } else {
+        free_end.checked_add(value_len - value.len())
+    }
+    .context("leaf free area overflow")?;
+    let slot_end = HEADER_SIZE
+        .checked_add(slot_count * SLOT_SIZE)
+        .context("slot array overflow")?;
+    ensure!(
+        new_free_end >= slot_end,
+        "resized leaf cell overlaps the slot array"
+    );
+    ensure!(
+        new_start >= new_free_end && new_start + new_cell_len <= PAGE_SIZE,
+        "resized leaf cell is outside the page"
+    );
+
+    if value.len() < value_len {
+        // Shrinking shifts earlier cells into the old target cell. Move the
+        // target key out of the way first; the shifted block ends at new_start.
+        page.copy_within(offset..offset + key_len, new_start);
+        if new_free_end != free_end {
+            page.copy_within(free_end..offset, new_free_end);
+        }
+    } else {
+        // Growing shifts earlier cells left, ending before the target key.
+        if new_free_end != free_end {
+            page.copy_within(free_end..offset, new_free_end);
+        }
+        page.copy_within(offset..offset + key_len, new_start);
+    }
+    let value_start = new_start + key_len;
+    page[value_start..value_start + value.len()].copy_from_slice(value);
+
+    let slot = HEADER_SIZE + index * SLOT_SIZE;
+    LittleEndian::write_u16(&mut page[slot..slot + 2], new_start as u16);
+    LittleEndian::write_u32(
+        &mut page[slot + 4..slot + 8],
+        u32::try_from(value.len()).context("value is too large")?,
+    );
+    page[slot + 8] = flags;
+
+    if value.len() != value_len {
+        let delta = value.len() as isize - value_len as isize;
+        for later in index + 1..slot_count {
+            let later_slot = HEADER_SIZE + later * SLOT_SIZE;
+            let old_offset = LittleEndian::read_u16(&page[later_slot..later_slot + 2]) as isize;
+            let new_offset = old_offset - delta;
+            ensure!(
+                new_offset >= slot_end as isize && new_offset <= PAGE_SIZE as isize,
+                "resized leaf slot is outside the page"
+            );
+            LittleEndian::write_u16(&mut page[later_slot..later_slot + 2], new_offset as u16);
+        }
+    }
+
+    LittleEndian::write_u16(&mut page[26..28], new_free_end as u16);
+    reseal(page, page_id, txn_id);
+    Ok(())
+}
+
+/// Replaces a branch child directly in an owned page buffer.
+pub(crate) fn replace_child_in_place(
+    page: &mut [u8; PAGE_SIZE],
+    page_id: u64,
+    txn_id: u64,
+    index: usize,
+    child: u64,
+) -> Result<()> {
+    let (offset, key_len, value_len) = {
+        let parsed = Page::parse_trusted(page, None)?;
+        ensure!(
+            parsed.page_type() == PageType::Branch,
+            "cannot replace a child in a leaf page"
+        );
+        let (offset, key_len, value_len, _) = parsed.slot(index)?;
+        (offset, key_len, value_len)
+    };
+    ensure!(
+        value_len == BRANCH_CHILD_SIZE,
+        "branch child slot has {value_len} bytes"
+    );
+    let start = offset + key_len;
+    LittleEndian::write_u64(&mut page[start..start + 8], child);
+    reseal(page, page_id, txn_id);
+    Ok(())
 }
 
 /// Updates the page identity and checksum after an in-place edit.
