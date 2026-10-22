@@ -111,10 +111,11 @@ All notable changes to this project are documented here.
 - In-place page edits defer checksum recomputation until commit, so repeated
   changes to a transaction-owned page hash it only once. Dirty and unsealed
   page IDs use identity-hashed sets to keep the update path allocation-light.
-- Large overflow values are encoded directly into the writable mapping instead
-  of a temporary full-value buffer, and verified overflow extents return their
-  payload without re-reading extent headers. Large-value point reads and writes
-  avoid an extra full-value copy and repeated header validation.
+- Large overflow values are written into their final writable-mapped extent at
+  `put` time and referenced directly by the tree writer, avoiding the pending
+  full-value copy as well as a temporary encoding buffer. Verified overflow
+  extents return their payload without re-reading extent headers, so large-value
+  point reads avoid repeated header validation.
 - Ordered iteration keeps the current leaf page in the cursor instead of looking
   it up again for every entry. Range, prefix, and reverse scans avoid one page
   lookup per key.

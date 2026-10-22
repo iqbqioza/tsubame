@@ -467,7 +467,7 @@ impl<KC, DC> Database<KC, DC> {
                 "key is {} bytes, maximum is {MAX_KEY_SIZE}",
                 key.as_slice().len()
             );
-            txn.put_raw(self.kind.clone(), key.as_slice(), value.as_ref());
+            txn.put_raw(self.kind.clone(), key.as_slice(), value.as_ref())?;
             Ok(())
         })();
 
@@ -503,7 +503,7 @@ impl<KC, DC> Database<KC, DC> {
                 "key is {} bytes, maximum is {MAX_KEY_SIZE}",
                 key.as_slice().len()
             );
-            txn.delete_raw(self.kind.clone(), key.as_slice());
+            txn.delete_raw(self.kind.clone(), key.as_slice())?;
             Ok(())
         })();
 
