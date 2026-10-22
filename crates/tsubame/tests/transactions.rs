@@ -1281,34 +1281,46 @@ fn multi_process_writer_clears_stale_registry_state() -> Result<()> {
 }
 
 #[test]
-fn multi_process_online_compaction_requires_readers_closed() -> Result<()> {
+fn multi_process_online_compaction_refreshes_read_only_environment() -> Result<()> {
     let dir = tempdir()?;
     let mut writer_options = options();
     writer_options.multi_process(true);
     let writer = writer_options.open(dir.path())?;
     let mut wtxn = writer.write_txn()?;
     let db = writer.create_database::<Str, Str>(&mut wtxn, None)?;
-    db.put(&mut wtxn, "key", "value")?;
+    db.put(&mut wtxn, "key", "before")?;
     wtxn.commit()?;
 
     let mut read_options = options();
     read_options.read_only(true);
     let reader = read_options.open(dir.path())?;
-    assert!(writer.compact_online().is_err());
-    drop(reader);
+    let old_rtxn = reader.read_txn()?;
+    let old_db = reader.open_database::<Str, Str>(&old_rtxn, None)?;
+    assert_eq!(old_db.get(&old_rtxn, "key")?, Some("before"));
 
     writer.compact_online()?;
-    let rtxn = writer.read_txn()?;
-    assert_eq!(db.get(&rtxn, "key")?, Some("value"));
+    assert_eq!(old_db.get(&old_rtxn, "key")?, Some("before"));
 
-    drop(rtxn);
+    let mut wtxn = writer.write_txn()?;
+    db.put(&mut wtxn, "key", "after")?;
+    wtxn.commit()?;
+
+    let new_rtxn = reader.read_txn()?;
+    let new_db = reader.open_database::<Str, Str>(&new_rtxn, None)?;
+    assert_eq!(new_db.get(&new_rtxn, "key")?, Some("after"));
+
+    drop(new_rtxn);
+    drop(new_db);
+    drop(old_rtxn);
+    drop(old_db);
     drop(db);
+    drop(reader);
     drop(writer);
 
     let env = options().open(dir.path())?;
     let rtxn = env.read_txn()?;
     let db = env.open_database::<Str, Str>(&rtxn, None)?;
-    assert_eq!(db.get(&rtxn, "key")?, Some("value"));
+    assert_eq!(db.get(&rtxn, "key")?, Some("after"));
 
     Ok(())
 }

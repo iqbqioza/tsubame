@@ -164,9 +164,10 @@ The examples use a temporary directory and clean up after themselves.
 - `Env::compact_online` keeps an open writable environment mapped to the
   compacted file. Read transactions and `Database` handles may remain active;
   existing readers keep their previous file generation. A write transaction
-  must not be active. Read-only environments must use offline compaction; a
-  `multi_process` writer may compact online after all read-only environments
-  have been closed.
+  must not be active. A `multi_process` writer may compact while read-only
+  environments are open; their existing transactions keep the old generation,
+  and their next read transaction remaps the compacted file. Read-only
+  environments cannot initiate compaction.
 - Custom key comparators are environment-wide and must be supplied again on
   every open and offline compaction. A stable comparator ID is persisted in
   `comparator.tsubame` and must match. Prefix iteration requires lexicographic

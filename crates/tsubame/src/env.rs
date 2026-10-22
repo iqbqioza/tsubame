@@ -43,7 +43,8 @@ const READER_LOCK_FILE: &str = "readers.tsubame.lock";
 const OPEN_GATE_FILE: &str = "open.tsubame.lock";
 const READER_COUNT_INDEX: usize = 0;
 const ENV_COUNT_INDEX: usize = 1;
-const READER_SLOT_BASE: usize = 2;
+const GENERATION_INDEX: usize = 2;
+const READER_SLOT_BASE: usize = 3;
 const READER_SLOTS: usize = 4096;
 const READER_RESERVED: u64 = u64::MAX;
 const READER_REGISTRY_LEN: u64 = ((READER_SLOTS + READER_SLOT_BASE) * 8) as u64;
@@ -291,9 +292,8 @@ impl Env {
     ///
     /// # Errors
     ///
-    /// Returns an error for read-only environments, when another read-only
-    /// environment is open, when a write transaction is active, or when the
-    /// replacement file cannot be built or mapped.
+    /// Returns an error for read-only environments, when a write transaction
+    /// is active, or when the replacement file cannot be built or mapped.
     pub fn compact_online(&self) -> Result<()> {
         ensure!(
             !self.inner.read_only,
@@ -312,13 +312,6 @@ impl Env {
             .map_err(|_| anyhow::anyhow!("a write transaction is active"))?;
         if self.inner.multi_process {
             self.inner.reset_registry_if_solo()?;
-            ensure!(
-                self.inner
-                    .reader_slots
-                    .load(ENV_COUNT_INDEX, Ordering::Acquire)
-                    == 1,
-                "close all read-only environments before compacting online"
-            );
         }
         let state = self.inner.read_state();
         let map_size = state.map_size;
@@ -389,7 +382,12 @@ impl Env {
                 )
             })?;
 
-            let new_state = Arc::new(EnvState::new(new_file, new_mmap, map_size));
+            let generation = self
+                .inner
+                .reader_slots
+                .load(GENERATION_INDEX, Ordering::Acquire)
+                .wrapping_add(1);
+            let new_state = Arc::new(EnvState::new(new_file, new_mmap, map_size, generation));
             let replacement = Committed {
                 meta: chosen.meta,
                 slot: chosen.slot,
@@ -408,6 +406,9 @@ impl Env {
                 *state_guard = new_state;
                 *committed = replacement;
             }
+            self.inner
+                .reader_slots
+                .store(GENERATION_INDEX, generation, Ordering::Release);
             self.inner
                 .free_pool
                 .lock()
@@ -653,17 +654,19 @@ pub(crate) struct EnvState {
     pub(crate) data: File,
     pub(crate) mmap: Mmap,
     pub(crate) map_size: usize,
+    pub(crate) generation: u64,
     verified: Vec<AtomicU64>,
 }
 
 impl EnvState {
-    pub(crate) fn new(data: File, mmap: Mmap, map_size: usize) -> Self {
+    pub(crate) fn new(data: File, mmap: Mmap, map_size: usize, generation: u64) -> Self {
         let verified_words = (map_size / PAGE_SIZE).div_ceil(64);
         let verified = (0..verified_words).map(|_| AtomicU64::new(0)).collect();
         Self {
             data,
             mmap,
             map_size,
+            generation,
             verified,
         }
     }
@@ -917,8 +920,12 @@ impl EnvInner {
 
     pub(crate) fn reserve_external_reader(&self) -> Result<u64> {
         for index in 0..READER_SLOTS {
-            if self.reader_slots.try_claim(index + 1, READER_RESERVED) {
-                self.reader_slots.fetch_add(0, 1, Ordering::AcqRel);
+            if self
+                .reader_slots
+                .try_claim(READER_SLOT_BASE + index, READER_RESERVED)
+            {
+                self.reader_slots
+                    .fetch_add(READER_COUNT_INDEX, 1, Ordering::AcqRel);
                 return Ok(index as u64);
             }
         }
@@ -936,8 +943,10 @@ impl EnvInner {
         let Ok(index) = usize::try_from(slot) else {
             return;
         };
-        self.reader_slots.store(index + 1, 0, Ordering::Release);
-        self.reader_slots.fetch_sub(0, 1, Ordering::AcqRel);
+        self.reader_slots
+            .store(READER_SLOT_BASE + index, 0, Ordering::Release);
+        self.reader_slots
+            .fetch_sub(READER_COUNT_INDEX, 1, Ordering::AcqRel);
     }
 
     pub(crate) fn take_reusable_free(&self, limit_txn: u64) -> Vec<FreeExtent> {
@@ -1000,11 +1009,99 @@ impl EnvInner {
         self.return_free(free);
     }
 
+    fn reload_read_only(&self, generation: u64) -> Result<()> {
+        let data_path = self.path.join(DATA_FILE);
+        let data = OpenOptions::new()
+            .read(true)
+            .open(&data_path)
+            .with_context(|| format!("failed to open `{}`", data_path.display()))?;
+        let file_len = usize::try_from(
+            data.metadata()
+                .with_context(|| format!("failed to inspect `{}`", data_path.display()))?
+                .len(),
+        )
+        .context("data file is too large")?;
+        let old_state = self.read_state();
+        let map_size = old_state.map_size.max(file_len);
+        let loaded = meta::load_all(&data, &data_path)?;
+        let newest = &loaded[0];
+        let minimum = pages_to_bytes(newest.meta.page_count)?;
+        ensure!(
+            map_size >= minimum,
+            "read-only map size is smaller than the committed page count"
+        );
+        let data_offset = (2 * PAGE_SIZE) as u64;
+        let mapped_len = map_size
+            .checked_sub(2 * PAGE_SIZE)
+            .context("map size is too small")?;
+        let mmap = if mapped_len == 0 {
+            mmap::map_empty().context("failed to map an empty data region")?
+        } else {
+            mmap::map_data(&data, data_offset, mapped_len)
+                .with_context(|| format!("failed to map `{}`", data_path.display()))?
+        };
+        let clean_txn = read_clean_marker(&self.path);
+        let covers_newest = file_len >= minimum;
+        let mut chosen = None;
+        let mut errors = Vec::new();
+        for candidate in loaded {
+            let required = pages_to_bytes(candidate.meta.page_count)?;
+            let required_data = required.saturating_sub(2 * PAGE_SIZE);
+            if mmap.len() < required_data {
+                errors.push(format!(
+                    "slot {}: committed pages exceed the read-only mapping",
+                    candidate.slot
+                ));
+                continue;
+            }
+            if clean_txn == Some(candidate.meta.txn_id) && covers_newest {
+                chosen = Some(candidate);
+                break;
+            }
+            match commit::validate(&mmap, &candidate.meta) {
+                Ok(()) => {
+                    chosen = Some(candidate);
+                    break;
+                }
+                Err(error) => errors.push(format!("slot {}: {error:#}", candidate.slot)),
+            }
+        }
+        let chosen = chosen.with_context(|| {
+            format!(
+                "no recoverable commit in `{}`: {}",
+                self.path.display(),
+                errors.join("; ")
+            )
+        })?;
+        let replacement = Committed {
+            meta: chosen.meta,
+            slot: chosen.slot,
+        };
+        let new_state = Arc::new(EnvState::new(data, mmap, map_size, generation));
+        {
+            let mut state = self
+                .state
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut committed = self
+                .committed
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *state = new_state;
+            *committed = replacement;
+        }
+        Ok(())
+    }
+
     #[inline]
     /// Refreshes the committed snapshot from disk for a read-only environment.
     pub(crate) fn refresh_read_only(&self) -> Result<()> {
-        let data_path = self.path.join(DATA_FILE);
+        let generation = self.reader_slots.load(GENERATION_INDEX, Ordering::Acquire);
         let state = self.read_state();
+        if state.generation != generation {
+            return self.reload_read_only(generation);
+        }
+        let data_path = self.path.join(DATA_FILE);
         let loaded = meta::load_all(&state.data, &data_path)?;
         let clean_txn = read_clean_marker(&self.path);
         let mut chosen = None;
@@ -1538,7 +1635,8 @@ impl EnvOpenOptions {
         }
         reader_slots.fetch_add(ENV_COUNT_INDEX, 1, Ordering::AcqRel);
 
-        let state = EnvState::new(data, mmap, map_size);
+        let generation = reader_slots.load(GENERATION_INDEX, Ordering::Acquire);
+        let state = EnvState::new(data, mmap, map_size, generation);
         let inner = EnvInner {
             path: path.to_path_buf(),
             max_dbs: self.max_dbs,

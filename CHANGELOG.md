@@ -33,9 +33,11 @@ All notable changes to this project are documented here.
 - `multi_process(true)` lets a writable environment coexist with read-only
   processes while retaining cross-process page reuse. Reader snapshots are
   advertised in `readers.tsubame`; offline compaction clears stale slots.
-- Online compaction is now available to a `multi_process` writer after all
-  read-only environments have been closed. The environment-open gate prevents
-  new environments from appearing during the file swap.
+- Online compaction is now available to a `multi_process` writer while
+  read-only environments are open. Existing read transactions keep the old
+  file generation and new read transactions remap the compacted file. The
+  environment-open gate prevents new environments from mapping the old
+  generation during the swap.
 - A multi-process writer clears stale reader registry state when it can acquire
   the lifecycle lock exclusively, so crashed read-only processes do not block
   page reuse or online compaction indefinitely.
