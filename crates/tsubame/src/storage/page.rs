@@ -24,7 +24,7 @@ pub(crate) const HEADER_SIZE: usize = 32;
 pub(crate) const SLOT_SIZE: usize = 8;
 const CHECKSUM_OFFSET: usize = 0;
 const BRANCH_CHILD_SIZE: usize = 8;
-pub(crate) const FLAG_OVERFLOW: u8 = 1 << 0;
+const FLAG_OVERFLOW: u8 = 1 << 0;
 const OVERFLOW_BIT: u32 = 1 << 31;
 const VALUE_LEN_MASK: u32 = OVERFLOW_BIT - 1;
 

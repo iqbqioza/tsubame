@@ -1173,15 +1173,6 @@ impl<'env> RwTxn<'env> {
                     }
                     return Ok(());
                 }
-                if *root != 0 && entries.len() >= BULK_LOAD_THRESHOLD {
-                    let operations: Vec<(&PendingKey, Option<ValueRef<'_>>)> = entries
-                        .iter()
-                        .map(|(key, value)| (key, value.as_ref().map(PendingValue::value_ref)))
-                        .collect();
-                    *root =
-                        btree::bulk_apply_with(self, *root, &operations, self.txn_id, &comparator)?;
-                    return Ok(());
-                }
                 for (key, value) in entries {
                     self.apply_one(root, key, value, comparator)?;
                 }
