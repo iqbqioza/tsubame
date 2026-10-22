@@ -45,9 +45,10 @@ All notable changes to this project are documented here.
   read-only environments remap after a compaction interrupted before its
   generation was published.
 - Cleanly closed writable environments persist their free list in a checksummed
-  `free.tsubame` sidecar. The first writer after reopening loads it when the
-  transaction and page count match, avoiding a full reachable-page scan. Stale
-  or corrupt caches are ignored and the free list is reconstructed.
+  `free.tsubame` sidecar. A writer loads it during open when the transaction
+  and page count match, avoiding both a full reachable-page scan and cache I/O
+  on the first write. Stale or corrupt caches are ignored and the free list is
+  reconstructed on first use.
 
 ### Performance
 
