@@ -49,6 +49,53 @@ fn commits_are_visible_after_reopen() -> Result<()> {
 }
 
 #[test]
+fn database_inspection_helpers_match_the_visible_snapshot() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+    db.put(&mut wtxn, "b", "2")?;
+    db.put(&mut wtxn, "a", "1")?;
+    db.put(&mut wtxn, "c", "3")?;
+    wtxn.commit()?;
+
+    let rtxn = env.read_txn()?;
+    assert_eq!(db.first(&rtxn)?, Some(("a", "1")));
+    assert_eq!(db.last(&rtxn)?, Some(("c", "3")));
+    assert_eq!(db.len(&rtxn)?, 3);
+    assert!(!db.is_empty(&rtxn)?);
+    drop(rtxn);
+
+    let mut wtxn = env.write_txn()?;
+    db.put(&mut wtxn, "d", "4")?;
+    db.delete(&mut wtxn, "b")?;
+    assert_eq!(db.first_rw(&wtxn)?, Some(("a", "1")));
+    assert_eq!(db.last_rw(&wtxn)?, Some(("d", "4")));
+    assert_eq!(db.len_rw(&wtxn)?, 3);
+    assert!(!db.is_empty_rw(&wtxn)?);
+    wtxn.commit()?;
+
+    let rtxn = env.read_txn()?;
+    assert_eq!(db.first(&rtxn)?, Some(("a", "1")));
+    assert_eq!(db.last(&rtxn)?, Some(("d", "4")));
+    assert_eq!(db.len(&rtxn)?, 3);
+    drop(rtxn);
+
+    let mut wtxn = env.write_txn()?;
+    db.clear(&mut wtxn)?;
+    assert!(db.is_empty_rw(&wtxn)?);
+    assert_eq!(db.len_rw(&wtxn)?, 0);
+    wtxn.commit()?;
+
+    let rtxn = env.read_txn()?;
+    assert!(db.is_empty(&rtxn)?);
+    assert_eq!(db.first(&rtxn)?, None);
+    assert_eq!(db.last(&rtxn)?, None);
+
+    Ok(())
+}
+
+#[test]
 fn abort_discards_writes() -> Result<()> {
     let dir = tempdir()?;
     let env = options().open(dir.path())?;
