@@ -522,6 +522,8 @@ pub struct RwTxn<'env> {
     base_slot: u8,
     txn_id: u64,
     overlay: PageOverlay,
+    dirty_pages: BTreeSet<u64>,
+    direct_extents: BTreeSet<u64>,
     extents: BTreeMap<u64, Vec<u8>>,
     next_page: u64,
     free_single: BTreeSet<u64>,
@@ -577,6 +579,8 @@ impl<'env> RwTxn<'env> {
             base_slot: committed.slot,
             txn_id,
             overlay: PageOverlay::new(),
+            dirty_pages: BTreeSet::new(),
+            direct_extents: BTreeSet::new(),
             extents: BTreeMap::new(),
             next_page: committed.meta.page_count,
             free_single: BTreeSet::new(),
@@ -776,23 +780,35 @@ impl<'env> RwTxn<'env> {
 
         let txn_id = self.txn_id;
         let overlay_len = self.overlay.len();
+        let dirty_len = self.dirty_pages.len();
         let extent_len = self.extents.len();
-        let entry_count = overlay_len + extent_len;
+        let entry_count = overlay_len + dirty_len + extent_len;
+        let page_count = overlay_len + dirty_len;
         let (commit_record, commit_page, inline, inline_count) =
             if entry_count == 0 {
                 (0, 0, None, 0)
-            } else if overlay_len == 1 && extent_len == 0 {
-                let page_id = self
-                    .overlay
-                    .iter()
-                    .next()
-                    .map(|(page_id, _)| *page_id)
-                    .context("overlay has no page")?;
+            } else if page_count == 1 && extent_len == 0 {
+                let page_id = if let Some(&page_id) = self.dirty_pages.iter().next() {
+                    page_id
+                } else {
+                    self.overlay
+                        .iter()
+                        .next()
+                        .map(|(page_id, _)| *page_id)
+                        .context("commit has no page")?
+                };
                 (0, page_id, None, 0)
             } else if entry_count <= meta::INLINE_COMMIT_CAPACITY {
                 let mut inline = [InlineCommit::default(); meta::INLINE_COMMIT_CAPACITY];
                 let mut slot = 0;
                 for (page_id, _) in self.overlay.iter() {
+                    inline[slot] = InlineCommit {
+                        page_id: *page_id,
+                        page_count: 0,
+                    };
+                    slot += 1;
+                }
+                for page_id in &self.dirty_pages {
                     inline[slot] = InlineCommit {
                         page_id: *page_id,
                         page_count: 0,
@@ -813,6 +829,11 @@ impl<'env> RwTxn<'env> {
                     self.overlay
                         .iter()
                         .map(|(page_id, _)| CommitEntry::Page(*page_id)),
+                );
+                entries.extend(
+                    self.dirty_pages
+                        .iter()
+                        .map(|page_id| CommitEntry::Page(*page_id)),
                 );
                 entries.extend(self.extents.iter().map(|(start_page, bytes)| {
                     CommitEntry::Extent {
@@ -880,6 +901,9 @@ impl<'env> RwTxn<'env> {
         // the page builder or reseal path. Mark them verified so the next
         // writer does not re-parse and checksum them on its first read.
         for (page_id, _) in self.overlay.iter() {
+            self.state.mark_verified(*page_id);
+        }
+        for page_id in &self.dirty_pages {
             self.state.mark_verified(*page_id);
         }
         for start_page in self.extents.keys() {
@@ -1073,12 +1097,25 @@ impl<'env> RwTxn<'env> {
                 bytes.len().is_multiple_of(PAGE_SIZE),
                 "overflow extent is not page-aligned"
             );
+            if self.direct_extents.contains(start_page) {
+                continue;
+            }
             let offset = start_page
                 .checked_mul(PAGE_SIZE as u64)
                 .context("extent offset overflow")?;
             io::write_all_at(data, bytes, offset)
                 .with_context(|| format!("failed to write overflow extent at page {start_page}"))?;
         }
+        // POSIX `fdatasync` below writes back dirty shared mappings and the
+        // meta page together. On Windows, mapped views need an explicit flush
+        // before the meta page is published. Either way, unflushed page writes
+        // remain unreachable from the old meta page and are rejected by the
+        // commit-intent validation if the new meta page survives alone.
+        #[cfg(windows)]
+        self.state.flush_write_pages(&self.dirty_pages)?;
+        #[cfg(windows)]
+        self.state
+            .flush_write_extents(&self.direct_extents, &self.extents)?;
 
         let slot = 1 - self.base_slot;
         {
@@ -1125,6 +1162,8 @@ impl PageSource for RwTxn<'_> {
     fn page(&self, page_id: u64) -> Result<Page<'_>> {
         if let Some(page) = self.overlay.get(page_id) {
             Page::parse_trusted(page, Some(page_id))
+        } else if self.dirty_pages.contains(&page_id) {
+            self.state.read_written_page(page_id)
         } else {
             self.state.read_page(page_id, &self.base)
         }
@@ -1149,8 +1188,15 @@ impl PageStore for RwTxn<'_> {
             return Ok(*page);
         }
 
-        let bytes = self.state.read_page(page_id, &self.base)?.bytes();
-        let bytes: &[u8; PAGE_SIZE] = bytes.try_into().context("page has an unexpected size")?;
+        let page = if self.dirty_pages.contains(&page_id) {
+            self.state.read_written_page(page_id)?
+        } else {
+            self.state.read_page(page_id, &self.base)?
+        };
+        let bytes: &[u8; PAGE_SIZE] = page
+            .bytes()
+            .try_into()
+            .context("page has an unexpected size")?;
         Ok(*bytes)
     }
 
@@ -1258,7 +1304,11 @@ impl PageStore for RwTxn<'_> {
             page_id >= 2 && page_id < self.next_page,
             "page {page_id} is outside the transaction allocation range"
         );
-        self.overlay.insert(page_id, page);
+        if self.state.write_page_direct(page_id, &page)? {
+            self.dirty_pages.insert(page_id);
+        } else {
+            self.overlay.insert(page_id, page);
+        }
         Ok(())
     }
 
@@ -1281,6 +1331,9 @@ impl PageStore for RwTxn<'_> {
             "overflow extent extends beyond the transaction allocation range"
         );
 
+        if self.state.write_extent_direct(start_page, bytes)? {
+            self.direct_extents.insert(start_page);
+        }
         self.extents.insert(start_page, bytes.to_vec());
         Ok(())
     }
@@ -1333,11 +1386,15 @@ impl RwTxn<'_> {
             "free range {start_page}..{end} exceeds the transaction high-water mark"
         );
 
+        for page_id in start_page..end {
+            self.dirty_pages.remove(&page_id);
+        }
         if pages == 1 {
             self.overlay.remove(start_page);
             self.free_single.insert(start_page);
         } else {
             self.extents.remove(&start_page);
+            self.direct_extents.remove(&start_page);
             self.free_runs.insert(start_page, pages);
         }
 

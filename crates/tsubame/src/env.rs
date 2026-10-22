@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use anyhow::{Context, bail, ensure};
 use byteorder::{ByteOrder, LittleEndian};
 use fs4::TryLockError;
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapMut};
 
 use crate::Result;
 use crate::comparator::KeyComparator;
@@ -348,12 +348,9 @@ impl Env {
                 .write(true)
                 .open(&temp_data)
                 .with_context(|| format!("failed to open `{}`", temp_data.display()))?;
-            #[cfg(windows)]
-            {
-                if new_file.metadata()?.len() < map_size as u64 {
-                    new_file.set_len(map_size as u64)?;
-                    new_file.sync_data()?;
-                }
+            if new_file.metadata()?.len() < map_size as u64 {
+                new_file.set_len(map_size as u64)?;
+                new_file.sync_all()?;
             }
             let mapped_len = map_size
                 .checked_sub(2 * PAGE_SIZE)
@@ -363,6 +360,16 @@ impl Env {
             } else {
                 mmap::map_data(&new_file, (2 * PAGE_SIZE) as u64, mapped_len)
                     .with_context(|| format!("failed to map `{}`", temp_data.display()))?
+            };
+            let new_write_mmap = if mapped_len == 0 {
+                None
+            } else {
+                Some(
+                    mmap::map_data_mut(&new_file, (2 * PAGE_SIZE) as u64, mapped_len)
+                        .with_context(|| {
+                            format!("failed to map `{}` for writing", temp_data.display())
+                        })?,
+                )
             };
 
             let candidates = meta::load_all(&new_file, &temp_data)?;
@@ -388,7 +395,13 @@ impl Env {
                 .reader_slots
                 .load(GENERATION_INDEX, Ordering::Acquire)
                 .wrapping_add(1);
-            let new_state = Arc::new(EnvState::new(new_file, new_mmap, map_size, generation));
+            let new_state = Arc::new(EnvState::new(
+                new_file,
+                new_mmap,
+                map_size,
+                generation,
+                new_write_mmap,
+            ));
             let replacement = Committed {
                 meta: chosen.meta,
                 slot: chosen.slot,
@@ -656,11 +669,18 @@ pub(crate) struct EnvState {
     pub(crate) mmap: Mmap,
     pub(crate) map_size: usize,
     pub(crate) generation: u64,
+    write_mmap: Option<Mutex<MmapMut>>,
     verified: Vec<AtomicU64>,
 }
 
 impl EnvState {
-    pub(crate) fn new(data: File, mmap: Mmap, map_size: usize, generation: u64) -> Self {
+    pub(crate) fn new(
+        data: File,
+        mmap: Mmap,
+        map_size: usize,
+        generation: u64,
+        write_mmap: Option<MmapMut>,
+    ) -> Self {
         let verified_words = (map_size / PAGE_SIZE).div_ceil(64);
         let verified = (0..verified_words).map(|_| AtomicU64::new(0)).collect();
         Self {
@@ -668,8 +688,103 @@ impl EnvState {
             mmap,
             map_size,
             generation,
+            write_mmap: write_mmap.map(Mutex::new),
             verified,
         }
+    }
+
+    /// Copies a page into the writable mapping.
+    ///
+    /// Returns `false` when this environment has no writable mapping, in which
+    /// case the caller must fall back to the transaction overlay.
+    pub(crate) fn write_page_direct(&self, page_id: u64, page: &[u8; PAGE_SIZE]) -> Result<bool> {
+        let Some(write_mmap) = &self.write_mmap else {
+            return Ok(false);
+        };
+        ensure!(page_id >= 2, "data page ID {page_id} is reserved");
+        let index = usize::try_from(page_id - 2).context("page ID is too large")?;
+        let start = index
+            .checked_mul(PAGE_SIZE)
+            .context("page offset overflow")?;
+        let end = start
+            .checked_add(PAGE_SIZE)
+            .context("page offset overflow")?;
+        let mut mapping = write_mmap
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ensure!(
+            end <= mapping.len(),
+            "page {page_id} is outside the writable mapping"
+        );
+        mapping[start..end].copy_from_slice(page);
+        Ok(true)
+    }
+
+    /// Copies an overflow extent into the writable mapping.
+    ///
+    /// Returns `false` when this environment has no writable mapping.
+    pub(crate) fn write_extent_direct(&self, start_page: u64, bytes: &[u8]) -> Result<bool> {
+        let Some(write_mmap) = &self.write_mmap else {
+            return Ok(false);
+        };
+        ensure!(
+            start_page >= 2,
+            "overflow extent starts at reserved page {start_page}"
+        );
+        ensure!(
+            bytes.len().is_multiple_of(PAGE_SIZE),
+            "overflow extent is not page-aligned"
+        );
+        let index = usize::try_from(start_page - 2).context("page ID is too large")?;
+        let start = index
+            .checked_mul(PAGE_SIZE)
+            .context("extent offset overflow")?;
+        let end = start
+            .checked_add(bytes.len())
+            .context("extent offset overflow")?;
+        let mut mapping = write_mmap
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ensure!(
+            end <= mapping.len(),
+            "overflow extent at page {start_page} is outside the writable mapping"
+        );
+        mapping[start..end].copy_from_slice(bytes);
+        Ok(true)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn flush_write_pages(&self, pages: &BTreeSet<u64>) -> Result<()> {
+        let Some(write_mmap) = &self.write_mmap else {
+            return Ok(());
+        };
+        let mapping = write_mmap
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut pages = pages.iter().peekable();
+        while let Some(&start_page) = pages.next() {
+            ensure!(start_page >= 2, "data page ID {start_page} is reserved");
+            let mut end_page = start_page + 1;
+            while let Some(&&next_page) = pages.peek() {
+                if next_page != end_page {
+                    break;
+                }
+                end_page += 1;
+                pages.next();
+            }
+            let offset = usize::try_from(start_page - 2)
+                .context("page ID is too large")?
+                .checked_mul(PAGE_SIZE)
+                .context("page offset overflow")?;
+            let len = usize::try_from(end_page - start_page)
+                .context("page range is too large")?
+                .checked_mul(PAGE_SIZE)
+                .context("page range overflow")?;
+            mapping
+                .flush_range(offset, len)
+                .with_context(|| format!("failed to flush pages {start_page}..{end_page}"))?;
+        }
+        Ok(())
     }
 
     #[inline]
@@ -690,6 +805,37 @@ impl EnvState {
         }
     }
 
+    #[cfg(windows)]
+    pub(crate) fn flush_write_extents(
+        &self,
+        starts: &BTreeSet<u64>,
+        extents: &BTreeMap<u64, Vec<u8>>,
+    ) -> Result<()> {
+        let Some(write_mmap) = &self.write_mmap else {
+            return Ok(());
+        };
+        let mapping = write_mmap
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for start_page in starts {
+            let bytes = extents
+                .get(start_page)
+                .with_context(|| format!("missing extent {start_page}"))?;
+            let offset = usize::try_from(start_page - 2)
+                .context("page ID is too large")?
+                .checked_mul(PAGE_SIZE)
+                .context("extent offset overflow")?;
+            ensure!(
+                offset + bytes.len() <= mapping.len(),
+                "overflow extent at page {start_page} is outside the writable mapping"
+            );
+            mapping
+                .flush_range(offset, bytes.len())
+                .with_context(|| format!("failed to flush overflow extent at page {start_page}"))?;
+        }
+        Ok(())
+    }
+
     #[inline]
     pub(crate) fn read_page(&self, page_id: u64, snapshot: &Meta) -> Result<Page<'_>> {
         ensure!(
@@ -698,6 +844,19 @@ impl EnvState {
             2,
             snapshot.page_count
         );
+        self.read_page_from_map(page_id)
+    }
+
+    /// Reads a page written by the current transaction, which may be newer
+    /// than the committed snapshot.
+    #[inline]
+    pub(crate) fn read_written_page(&self, page_id: u64) -> Result<Page<'_>> {
+        self.read_page_from_map(page_id)
+    }
+
+    #[inline]
+    fn read_page_from_map(&self, page_id: u64) -> Result<Page<'_>> {
+        ensure!(page_id >= 2, "data page ID {page_id} is reserved");
         let index = usize::try_from(page_id - 2).context("page ID is too large")?;
         let start = index
             .checked_mul(PAGE_SIZE)
@@ -1082,7 +1241,7 @@ impl EnvInner {
             meta: chosen.meta,
             slot: chosen.slot,
         };
-        let new_state = Arc::new(EnvState::new(data, mmap, map_size, generation));
+        let new_state = Arc::new(EnvState::new(data, mmap, map_size, generation, None));
         {
             let mut state = self
                 .state
@@ -1594,6 +1753,18 @@ impl EnvOpenOptions {
             (loaded, map_size, covers)
         };
 
+        if !self.read_only
+            && data
+                .metadata()
+                .with_context(|| format!("failed to inspect `{}`", data_path.display()))?
+                .len()
+                < map_size as u64
+        {
+            data.set_len(map_size as u64)
+                .with_context(|| format!("failed to size `{}`", data_path.display()))?;
+            data.sync_all()
+                .with_context(|| format!("failed to sync `{}`", data_path.display()))?;
+        }
         let data_offset = (2 * PAGE_SIZE) as u64;
         let mapped_len = map_size - 2 * PAGE_SIZE;
         let mmap = if mapped_len == 0 {
@@ -1601,6 +1772,15 @@ impl EnvOpenOptions {
         } else {
             mmap::map_data(&data, data_offset, mapped_len)
                 .with_context(|| format!("failed to map `{}`", data_path.display()))?
+        };
+        let write_mmap = if self.read_only || mapped_len == 0 {
+            None
+        } else {
+            Some(
+                mmap::map_data_mut(&data, data_offset, mapped_len).with_context(|| {
+                    format!("failed to map `{}` for writing", data_path.display())
+                })?,
+            )
         };
         debug_assert!(mmap.len() >= mapped_len.max(1));
 
@@ -1646,7 +1826,7 @@ impl EnvOpenOptions {
         reader_slots.fetch_add(ENV_COUNT_INDEX, 1, Ordering::AcqRel);
 
         let generation = reader_slots.load(GENERATION_INDEX, Ordering::Acquire);
-        let state = EnvState::new(data, mmap, map_size, generation);
+        let state = EnvState::new(data, mmap, map_size, generation, write_mmap);
         let inner = EnvInner {
             path: path.to_path_buf(),
             max_dbs: self.max_dbs,

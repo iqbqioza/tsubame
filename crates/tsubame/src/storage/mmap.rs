@@ -31,6 +31,24 @@ pub(crate) fn map_data(file: &File, offset: u64, len: usize) -> io::Result<Mmap>
     unsafe { MmapOptions::new().offset(offset).len(len).map(file) }
 }
 
+/// Maps the data region of a writable environment for direct page writes.
+///
+/// The caller must uphold the same lifetime and locking invariants as
+/// [`map_data`]. In addition, only pages that are not reachable from any
+/// committed snapshot or active reader may be written through this mapping
+/// before the commit that publishes them.
+///
+/// # Safety
+///
+/// The mapping aliases the file and allows mutation. The storage engine only
+/// writes pages allocated by the current writer transaction, and it flushes
+/// the mapping before publishing a new meta page.
+#[allow(unsafe_code)]
+pub(crate) fn map_data_mut(file: &File, offset: u64, len: usize) -> io::Result<MmapMut> {
+    // SAFETY: see the function-level contract above.
+    unsafe { MmapOptions::new().offset(offset).len(len).map_mut(file) }
+}
+
 /// Returns a small read-only anonymous mapping for an environment whose data
 /// region is empty (only the two meta pages exist).
 pub(crate) fn map_empty() -> io::Result<Mmap> {
@@ -137,6 +155,26 @@ mod tests {
         assert_eq!(second.load(0, Ordering::Acquire), 1);
         first.fetch_sub(0, 1, Ordering::AcqRel);
         assert_eq!(second.load(0, Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn writable_mapping_is_visible_to_read_mapping() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("data");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(8192).unwrap();
+        let mut writable = map_data_mut(&file, 0, 8192).unwrap();
+        let readable = map_data(&file, 0, 8192).unwrap();
+
+        writable[4096..4104].copy_from_slice(b"mapped!!");
+        writable.flush_range(4096, 8).unwrap();
+        assert_eq!(&readable[4096..4104], b"mapped!!");
     }
 
     #[test]

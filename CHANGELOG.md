@@ -50,7 +50,7 @@ All notable changes to this project are documented here.
 - CRC32C checksums are computed over the page and metadata buffers without
   copying the full page first, and write paths use a faster hardware-backed
   CRC32C implementation. Single-key commit CPU time drops substantially while
-  the on-disk checksum algorithm and format remain unchanged.
+  keeping the same page checksum algorithm.
 - Commits reuse a pre-zeroed meta buffer and write only the metadata prefix
   instead of a full page; single-page commits skip commit-entry vector
   construction.
@@ -92,6 +92,12 @@ All notable changes to this project are documented here.
 - Page slots shrink from 12 to 8 bytes by packing the overflow flag into the
   high bit of the value-length word. The larger slot capacity improves point
   lookup throughput and reduces B+tree fanout pressure.
+- Meta and commit-record checksums cover only the bytes that carry metadata,
+  avoiding a full-page hash on every commit.
+- Committed pages and overflow extents are written directly into a writable
+  shared mapping, removing per-page `pwrite` syscalls and overlay copies from
+  the commit path. POSIX systems flush both the mapping and the meta page with
+  one `fdatasync`; Windows explicitly flushes dirty mapped ranges first.
 
 ### Fixed
 
@@ -104,7 +110,7 @@ All notable changes to this project are documented here.
 - The free list is maintained in memory. Read-only reopening does not scan the
   tree; the first write transaction reconstructs the free list from the latest
   reachable state.
-- The on-disk format is version 3. Version 2 environments are rejected and must
+- The on-disk format is version 4. Earlier format versions are rejected and must
   be recreated; there is no in-place format migration yet.
 
 ## [0.1.0] - 2026-10-21
