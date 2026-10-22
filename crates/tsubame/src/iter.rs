@@ -470,6 +470,90 @@ impl<'txn, 'env, KC, DC> RwIter<'txn, 'env, KC, DC> {
             _codecs: PhantomData,
         })
     }
+
+    /// Advances to the next visible key without decoding its value.
+    ///
+    /// This is used by range deletion, which only needs key bytes and should
+    /// not load overflow values.
+    pub(crate) fn next_key(&mut self) -> Option<Result<&'txn [u8]>> {
+        if self.done {
+            return None;
+        }
+
+        loop {
+            while let Some((key, _)) = self.pending.peek().copied() {
+                if before_start(&self.start, key, self.cursor.comparator()) {
+                    self.pending.next();
+                } else {
+                    break;
+                }
+            }
+
+            let base = match self.cursor.current_key() {
+                Ok(current) => current,
+                Err(error) => {
+                    self.done = true;
+                    return Some(Err(error));
+                }
+            };
+            let base = match base {
+                Some(key) if past_end(&self.end, key, self.cursor.comparator()) => None,
+                base => base,
+            };
+
+            let pending = match self.pending.peek().copied() {
+                Some((key, _)) if past_end(&self.end, key, self.cursor.comparator()) => None,
+                pending => pending,
+            };
+
+            match (base, pending) {
+                (None, None) => {
+                    self.done = true;
+                    return None;
+                }
+                (Some(key), None) => {
+                    if let Err(error) = self.cursor.next() {
+                        self.done = true;
+                        return Some(Err(error));
+                    }
+                    return Some(Ok(key));
+                }
+                (None, Some((key, value))) => {
+                    self.pending.next();
+                    if value.is_some() {
+                        return Some(Ok(key));
+                    }
+                }
+                (Some(base_key), Some((pending_key, pending_value))) => {
+                    match self.cursor.comparator().compare(pending_key, base_key) {
+                        Ordering::Less => {
+                            self.pending.next();
+                            if pending_value.is_some() {
+                                return Some(Ok(pending_key));
+                            }
+                        }
+                        Ordering::Equal => {
+                            self.pending.next();
+                            if let Err(error) = self.cursor.next() {
+                                self.done = true;
+                                return Some(Err(error));
+                            }
+                            if pending_value.is_some() {
+                                return Some(Ok(pending_key));
+                            }
+                        }
+                        Ordering::Greater => {
+                            if let Err(error) = self.cursor.next() {
+                                self.done = true;
+                                return Some(Err(error));
+                            }
+                            return Some(Ok(base_key));
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl<'txn, 'env, KC, DC> Iterator for RwIter<'txn, 'env, KC, DC>

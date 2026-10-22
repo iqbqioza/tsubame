@@ -132,6 +132,42 @@ fn directional_lookups_follow_key_order() -> Result<()> {
 }
 
 #[test]
+fn delete_range_respects_bounds_and_staged_changes() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+    for key in ["a", "b", "c", "d", "e"] {
+        db.put(&mut wtxn, key, key)?;
+    }
+    wtxn.commit()?;
+
+    let mut wtxn = env.write_txn()?;
+    db.put(&mut wtxn, "d", "updated")?;
+    db.delete(&mut wtxn, "c")?;
+    let count = db.delete_range(&mut wtxn, &(Bound::Included("b"), Bound::Excluded("e")))?;
+    assert_eq!(count, 2);
+    wtxn.commit()?;
+
+    let rtxn = env.read_txn()?;
+    let entries = db.iter(&rtxn)?.collect::<Result<Vec<_>>>()?;
+    assert_eq!(entries, vec![("a", "a"), ("e", "e")]);
+    drop(rtxn);
+
+    let mut wtxn = env.write_txn()?;
+    db.put(&mut wtxn, "f", "f")?;
+    let count = db.delete_range(&mut wtxn, &(Bound::Unbounded, Bound::Unbounded))?;
+    assert_eq!(count, 3);
+    assert!(db.is_empty_rw(&wtxn)?);
+    wtxn.commit()?;
+
+    let rtxn = env.read_txn()?;
+    assert!(db.is_empty(&rtxn)?);
+
+    Ok(())
+}
+
+#[test]
 fn heed_style_mut_aliases_reflect_staged_changes() -> Result<()> {
     let dir = tempdir()?;
     let env = options().open(dir.path())?;

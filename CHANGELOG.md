@@ -20,6 +20,9 @@ All notable changes to this project are documented here.
 - `Database::first`, `last`, `len`, and `is_empty` inspection helpers, plus
   `first_rw`, `last_rw`, `len_rw`, and `is_empty_rw` for staged transaction
   views.
+- `Database::delete_range` removes all visible entries in a range and returns
+  the number deleted. A full range is handled through the same path as
+  `Database::clear` after counting.
 - Heed-style write-transaction iterator aliases: `iter_mut`, `range_mut`,
   `rev_iter_mut`, `rev_range_mut`, `prefix_iter_mut`, and `rev_prefix_iter_mut`.
 - `Env::force_sync` flushes committed data and the environment directory while
