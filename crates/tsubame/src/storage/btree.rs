@@ -262,87 +262,106 @@ fn insert_into<S: PageStore>(
     );
 
     let bytes = store.read_page(page_id)?;
-    let page = Page::parse_trusted(&bytes, Some(page_id))?;
+    let page_type = Page::parse_trusted(&bytes, Some(page_id))?.page_type();
 
-    match page.page_type() {
-        PageType::Leaf => insert_leaf(store, page_id, &page, key, value, txn_id, comparator),
+    match page_type {
+        PageType::Leaf => insert_leaf(store, page_id, bytes, key, value, txn_id, comparator),
         PageType::Branch => {
-            insert_branch(store, page_id, &page, key, value, txn_id, depth, comparator)
+            insert_branch(store, page_id, bytes, key, value, txn_id, depth, comparator)
         }
     }
+}
+
+enum LeafEdit {
+    Same(usize),
+    Resized(usize, Option<OverflowRef>),
+    Append,
 }
 
 fn insert_leaf<S: PageStore>(
     store: &mut S,
     page_id: u64,
-    page: &Page<'_>,
+    mut bytes: [u8; PAGE_SIZE],
     key: &[u8],
     value: &[u8],
     txn_id: u64,
     comparator: &KeyComparator,
 ) -> Result<InsertResult> {
-    let position = page.lower_bound_with(key, comparator)?;
-    let existing = position < page.slot_count() && page.key(position)? == key;
-    let inline = SLOT_SIZE + key.len() + value.len() <= INLINE_BUDGET;
+    let edit = {
+        let page = Page::parse_trusted(&bytes, Some(page_id))?;
+        let position = page.lower_bound_with(key, comparator)?;
+        let existing = position < page.slot_count() && page.key(position)? == key;
+        let inline = SLOT_SIZE + key.len() + value.len() <= INLINE_BUDGET;
+        let mut edit = None;
 
-    if inline {
-        if existing {
-            let old_value = page.leaf_value(position)?;
-            if let LeafValue::Inline(old) = old_value
-                && old.len() == value.len()
-            {
-                let new_page_id = store.allocate_pages(1)?;
-                let new_page = page.replace_value(new_page_id, txn_id, position, value, 0)?;
-                store.write_page(new_page_id, new_page)?;
-                store.free_pages(page_id, 1)?;
-                return Ok(InsertResult {
-                    page_id: new_page_id,
-                    split: None,
-                });
+        if inline {
+            if existing {
+                let old_value = page.leaf_value(position)?;
+                if let LeafValue::Inline(old) = old_value
+                    && old.len() == value.len()
+                {
+                    edit = Some(LeafEdit::Same(position));
+                } else {
+                    let old_value_len = match old_value {
+                        LeafValue::Inline(value) => value.len(),
+                        LeafValue::Overflow(_) => overflow::OVERFLOW_REF_SIZE,
+                    };
+                    let used = HEADER_SIZE
+                        .checked_add(page.slot_count() * SLOT_SIZE)
+                        .and_then(|size| size.checked_add(PAGE_SIZE - page.free_end()))
+                        .context("leaf size overflow")?;
+                    let size = used
+                        .checked_sub(old_value_len)
+                        .and_then(|size| size.checked_add(value.len()))
+                        .context("leaf size overflow")?;
+                    if size <= PAGE_SIZE {
+                        let overflow = match old_value {
+                            LeafValue::Overflow(reference) => Some(reference),
+                            LeafValue::Inline(_) => None,
+                        };
+                        edit = Some(LeafEdit::Resized(position, overflow));
+                    }
+                }
+            } else if position == page.slot_count() && page.can_append(key.len(), value.len()) {
+                edit = Some(LeafEdit::Append);
             }
+        }
+        edit
+    };
 
-            // Rebuild from borrowed slots when an updated inline value fits.
-            // This avoids cloning every key and value in the leaf before
-            // replacing a single entry.
-            let old_value_len = match old_value {
-                LeafValue::Inline(value) => value.len(),
-                LeafValue::Overflow(_) => overflow::OVERFLOW_REF_SIZE,
-            };
-            let used = HEADER_SIZE
-                .checked_add(page.slot_count() * SLOT_SIZE)
-                .and_then(|size| size.checked_add(PAGE_SIZE - page.free_end()))
-                .context("leaf size overflow")?;
-            let size = used
-                .checked_sub(old_value_len)
-                .and_then(|size| size.checked_add(value.len()))
-                .context("leaf size overflow")?;
-            if size <= PAGE_SIZE {
-                let new_page_id = store.allocate_pages(1)?;
-                let new_page =
-                    page.replace_value_resized(new_page_id, txn_id, position, value, 0)?;
-                store.write_page(new_page_id, new_page)?;
-                store.free_pages(page_id, 1)?;
-                if let LeafValue::Overflow(reference) = old_value {
+    if let Some(edit) = edit {
+        let new_page_id = store.allocate_pages(1)?;
+        match edit {
+            LeafEdit::Same(position) => {
+                page::replace_value_in_place(&mut bytes, new_page_id, txn_id, position, value, 0)?
+            }
+            LeafEdit::Resized(position, overflow) => {
+                page::replace_value_resized_in_place(
+                    &mut bytes,
+                    new_page_id,
+                    txn_id,
+                    position,
+                    value,
+                    0,
+                )?;
+                if let Some(reference) = overflow {
                     store.free_pages(reference.start_page, reference.page_count)?;
                 }
-                return Ok(InsertResult {
-                    page_id: new_page_id,
-                    split: None,
-                });
             }
-        } else if position == page.slot_count() && page.can_append(key.len(), value.len()) {
-            let new_page_id = store.allocate_pages(1)?;
-            let new_page = page.append_entry(new_page_id, txn_id, key, value, 0)?;
-            store.write_page(new_page_id, new_page)?;
-            store.free_pages(page_id, 1)?;
-            return Ok(InsertResult {
-                page_id: new_page_id,
-                split: None,
-            });
+            LeafEdit::Append => {
+                page::append_entry_in_place(&mut bytes, new_page_id, txn_id, key, value, 0)?
+            }
         }
+        store.write_page(new_page_id, bytes)?;
+        store.free_pages(page_id, 1)?;
+        return Ok(InsertResult {
+            page_id: new_page_id,
+            split: None,
+        });
     }
 
-    let mut entries = collect_leaf(page)?;
+    let page = Page::parse_trusted(&bytes, Some(page_id))?;
+    let mut entries = collect_leaf(&page)?;
     let new_value = make_value(store, key.len(), value, txn_id)?;
     let replaced =
         match entries.binary_search_by(|entry| comparator.compare(entry.key.as_slice(), key)) {
@@ -371,21 +390,24 @@ fn insert_leaf<S: PageStore>(
 fn insert_branch<S: PageStore>(
     store: &mut S,
     page_id: u64,
-    page: &Page<'_>,
+    mut bytes: [u8; PAGE_SIZE],
     key: &[u8],
     value: &[u8],
     txn_id: u64,
     depth: usize,
     comparator: &KeyComparator,
 ) -> Result<InsertResult> {
-    let index = page.branch_child_index_with(key, comparator)?;
-    let child = page.child(index)?;
+    let (index, child) = {
+        let page = Page::parse_trusted(&bytes, Some(page_id))?;
+        let index = page.branch_child_index_with(key, comparator)?;
+        (index, page.child(index)?)
+    };
     let result = insert_into(store, child, key, value, txn_id, depth + 1, comparator)?;
 
     if result.split.is_none() {
         let new_page_id = store.allocate_pages(1)?;
-        let new_page = page.replace_child(new_page_id, txn_id, index, result.page_id)?;
-        store.write_page(new_page_id, new_page)?;
+        page::replace_child_in_place(&mut bytes, new_page_id, txn_id, index, result.page_id)?;
+        store.write_page(new_page_id, bytes)?;
         store.free_pages(page_id, 1)?;
         return Ok(InsertResult {
             page_id: new_page_id,
@@ -393,7 +415,8 @@ fn insert_branch<S: PageStore>(
         });
     }
 
-    let mut entries = collect_branch(page)?;
+    let page = Page::parse_trusted(&bytes, Some(page_id))?;
+    let mut entries = collect_branch(&page)?;
     entries[index].1 = result.page_id;
     if let Some(split) = result.split {
         entries.insert(index + 1, (split.separator, split.right));

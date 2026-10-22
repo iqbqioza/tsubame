@@ -10,7 +10,6 @@ rust-version = "1.88"
 authors = ["Takuya Okada <takuya@iqbqioza.com>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/iqbqioza/tsubame"
-homepage = "https://github.com/iqbqioza/tsubame"
 
 [workspace.dependencies]
 anyhow = "1.0"

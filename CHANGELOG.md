@@ -72,6 +72,8 @@ All notable changes to this project are documented here.
   marked verified to avoid rechecking their checksums on the next writer read.
 - Writer page reads copy validated bytes directly into the owned page buffer
   instead of zero-filling the whole page first.
+- Leaf and branch updates mutate the owned page buffer in place instead of
+  copying the whole page a second time before writing it.
 - Free-list reconstruction marks the tree pages it validated as verified, so
   the first writer after reopening does not checksum them again.
 - Bulk loading builds leaf pages from borrowed entries instead of cloning
