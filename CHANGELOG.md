@@ -20,6 +20,10 @@ All notable changes to this project are documented here.
 - `Database::first`, `last`, `len`, and `is_empty` inspection helpers, plus
   `first_rw`, `last_rw`, `len_rw`, and `is_empty_rw` for staged transaction
   views.
+- Heed-style write-transaction iterator aliases: `iter_mut`, `range_mut`,
+  `rev_iter_mut`, `rev_range_mut`, `prefix_iter_mut`, and `rev_prefix_iter_mut`.
+- `Env::force_sync` flushes committed data and the environment directory while
+  ensuring no write transaction is active.
 - `Database::stat` reports page size, depth, branch/leaf/overflow page counts,
   and entry count for a database snapshot.
 - `Database::get_greater_than`, `get_greater_than_or_equal_to`,

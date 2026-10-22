@@ -59,6 +59,7 @@ added without changing the main API.
 - [x] Offline compaction
 - [x] Consistent environment backup with `Env::copy_to_path`
 - [x] Database structural statistics
+- [x] Heed-style write-transaction iterator aliases and `Env::force_sync`
 
 ## Codec features
 
