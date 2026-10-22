@@ -51,7 +51,7 @@ pub mod txn;
 
 pub use self::comparator::KeyComparator;
 pub use self::database::Database;
-pub use self::env::{DEFAULT_MAP_SIZE, DEFAULT_MAX_DBS, Env, EnvInfo, EnvOpenOptions};
+pub use self::env::{DEFAULT_MAP_SIZE, DEFAULT_MAX_DBS, Env, EnvInfo, EnvOpenOptions, EnvStat};
 pub use self::error::{Error, Result};
 pub use self::txn::{RoTxn, RwTxn};
 
