@@ -94,10 +94,10 @@ All notable changes to this project are documented here.
   lookup throughput and reduces B+tree fanout pressure.
 - Meta and commit-record checksums cover only the bytes that carry metadata,
   avoiding a full-page hash on every commit.
-- Committed pages and overflow extents are written directly into a writable
-  shared mapping, removing per-page `pwrite` syscalls and overlay copies from
-  the commit path. POSIX systems flush both the mapping and the meta page with
-  one `fdatasync`; Windows explicitly flushes dirty mapped ranges first.
+- Committed pages, overflow extents, and the new meta page are written directly
+  into writable shared mappings, removing per-page `pwrite` syscalls and overlay
+  copies from the commit path. POSIX systems flush the mappings with one
+  `fdatasync`; Windows explicitly flushes dirty mapped ranges first.
 
 ### Fixed
 
