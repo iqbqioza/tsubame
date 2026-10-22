@@ -107,6 +107,29 @@ fn database_stat_reports_tree_structure() -> Result<()> {
 }
 
 #[test]
+fn remap_types_preserves_database_identity_and_bytes() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+    db.put(&mut wtxn, "key", "value")?;
+    wtxn.commit()?;
+
+    let rtxn = env.read_txn()?;
+    let both_bytes = db.remap_types::<Bytes, Bytes>();
+    assert_eq!(
+        both_bytes.get(&rtxn, b"key".as_slice())?,
+        Some(b"value".as_slice())
+    );
+    let key_bytes = db.remap_key_type::<Bytes>();
+    assert_eq!(key_bytes.get(&rtxn, b"key".as_slice())?, Some("value"));
+    let value_bytes = db.remap_data_type::<Bytes>();
+    assert_eq!(value_bytes.get(&rtxn, "key")?, Some(b"value".as_slice()));
+
+    Ok(())
+}
+
+#[test]
 fn environment_statistics_match_the_unnamed_database() -> Result<()> {
     let dir = tempdir()?;
     let env = options().open(dir.path())?;
