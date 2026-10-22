@@ -41,6 +41,10 @@ All notable changes to this project are documented here.
 - Commits reuse a pre-zeroed meta buffer and write only the metadata prefix
   instead of a full page; single-page commits skip commit-entry vector
   construction.
+- Multi-process reader registration uses shared atomic memory-mapped slots,
+  removing per-transaction registry file I/O and the global registry lock from
+  the read path. The writer skips the slot scan entirely when the registry is
+  empty.
 - Bulk loading builds leaf pages from borrowed entries instead of cloning
   every key and value.
 - Verified page reads bypass redundant header checks, and binary-search slot

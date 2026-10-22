@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -41,8 +41,8 @@ const COMPARATOR_FILE: &str = "comparator.tsubame";
 const READER_FILE: &str = "readers.tsubame";
 const READER_LOCK_FILE: &str = "readers.tsubame.lock";
 const READER_SLOTS: usize = 4096;
-const READER_SLOT_SIZE: usize = 8;
 const READER_RESERVED: u64 = u64::MAX;
+const READER_REGISTRY_LEN: u64 = ((READER_SLOTS + 1) * 8) as u64;
 const COMPARATOR_MAGIC: [u8; 8] = *b"TSUBCMP\0";
 const COMPARATOR_VERSION: u32 = 1;
 const MAX_COMPARATOR_ID_LEN: usize = 1024;
@@ -763,8 +763,7 @@ pub(crate) struct EnvInner {
     /// extents into its transaction and returns the unused ones.
     pub(crate) free_pool: Mutex<Vec<FreeExtent>>,
     free_pool_ready: AtomicBool,
-    reader_file: Mutex<File>,
-    reader_lock: File,
+    reader_slots: mmap::AtomicSlots,
     pub(crate) meta_buffer: Mutex<[u8; PAGE_SIZE]>,
     pub(crate) poisoned: AtomicBool,
     clean_marker_on_drop: AtomicBool,
@@ -873,103 +872,46 @@ impl EnvInner {
         }
     }
 
-    fn lock_reader_registry(&self, exclusive: bool) -> Result<()> {
-        if exclusive {
-            fs4::FileExt::lock(&self.reader_lock)
-        } else {
-            fs4::FileExt::lock_shared(&self.reader_lock)
-        }
-        .with_context(|| {
-            format!(
-                "failed to lock `{}`",
-                self.path.join(READER_LOCK_FILE).display()
-            )
-        })
-    }
-
-    fn read_reader_slots(&self, file: &mut File) -> Result<Vec<u8>> {
-        file.seek(SeekFrom::Start(0))?;
-        let mut slots = vec![0u8; READER_SLOTS * READER_SLOT_SIZE];
-        file.read_exact(&mut slots)?;
-        Ok(slots)
-    }
-
     pub(crate) fn oldest_external_reader(&self) -> Result<Option<u64>> {
-        let mut file = self
-            .reader_file
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.lock_reader_registry(false)?;
-        let result = (|| {
-            let slots = self.read_reader_slots(&mut file)?;
-            let mut oldest = None;
-            for chunk in slots.as_chunks::<READER_SLOT_SIZE>().0 {
-                let txn_id = LittleEndian::read_u64(chunk);
-                if txn_id == READER_RESERVED {
-                    return Ok(Some(0));
-                }
-                if txn_id != 0 {
-                    oldest = Some(oldest.map_or(txn_id, |value: u64| value.min(txn_id)));
-                }
+        if self.reader_slots.load(0, Ordering::Acquire) == 0 {
+            return Ok(None);
+        }
+        let mut oldest = None;
+        for index in 0..READER_SLOTS {
+            let txn_id = self.reader_slots.load(index + 1, Ordering::Acquire);
+            if txn_id == READER_RESERVED {
+                return Ok(Some(0));
             }
-            Ok(oldest)
-        })();
-        let _ = fs4::FileExt::unlock(&self.reader_lock);
-        result
+            if txn_id != 0 {
+                oldest = Some(oldest.map_or(txn_id, |value: u64| value.min(txn_id)));
+            }
+        }
+        Ok(oldest)
     }
 
     pub(crate) fn reserve_external_reader(&self) -> Result<u64> {
-        let mut file = self
-            .reader_file
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.lock_reader_registry(true)?;
-        let result = (|| {
-            let slots = self.read_reader_slots(&mut file)?;
-            for (index, chunk) in slots.as_chunks::<READER_SLOT_SIZE>().0.iter().enumerate() {
-                if LittleEndian::read_u64(chunk) == 0 {
-                    let offset = (index * READER_SLOT_SIZE) as u64;
-                    file.seek(SeekFrom::Start(offset))?;
-                    file.write_all(&READER_RESERVED.to_le_bytes())?;
-                    file.flush()?;
-                    return Ok(index as u64);
-                }
+        for index in 0..READER_SLOTS {
+            if self.reader_slots.try_claim(index + 1, READER_RESERVED) {
+                self.reader_slots.fetch_add(0, 1, Ordering::AcqRel);
+                return Ok(index as u64);
             }
-            bail!("too many concurrent readers")
-        })();
-        let _ = fs4::FileExt::unlock(&self.reader_lock);
-        result
+        }
+        bail!("too many concurrent readers")
     }
 
     pub(crate) fn publish_external_reader(&self, slot: u64, txn_id: u64) -> Result<()> {
-        let mut file = self
-            .reader_file
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.lock_reader_registry(true)?;
-        let result = (|| {
-            file.seek(SeekFrom::Start(slot * READER_SLOT_SIZE as u64))?;
-            file.write_all(&txn_id.to_le_bytes())?;
-            file.flush()?;
-            Ok(())
-        })();
-        let _ = fs4::FileExt::unlock(&self.reader_lock);
-        result
+        let index = usize::try_from(slot).context("reader slot is too large")?;
+        self.reader_slots
+            .store(index + 1, txn_id, Ordering::Release);
+        Ok(())
     }
 
     pub(crate) fn release_external_reader(&self, slot: u64) {
-        let Ok(mut file) = self.reader_file.lock() else {
+        let Ok(index) = usize::try_from(slot) else {
             return;
         };
-        if self.lock_reader_registry(true).is_err() {
-            return;
-        }
-        let offset = slot * READER_SLOT_SIZE as u64;
-        if file.seek(SeekFrom::Start(offset)).is_ok() {
-            let _ = file.write_all(&0u64.to_le_bytes());
-            let _ = file.flush();
-        }
-        let _ = fs4::FileExt::unlock(&self.reader_lock);
+        self.reader_slots.store(index + 1, 0, Ordering::Release);
+        self.reader_slots.fetch_sub(0, 1, Ordering::AcqRel);
     }
 
     pub(crate) fn take_reusable_free(&self, limit_txn: u64) -> Vec<FreeExtent> {
@@ -1404,6 +1346,12 @@ impl EnvOpenOptions {
         };
 
         let (reader_file, reader_lock) = open_reader_registry(path)?;
+        let reader_slots = mmap::AtomicSlots::map(
+            reader_file,
+            usize::try_from(READER_REGISTRY_LEN).context("reader registry is too large")?,
+        )
+        .context("failed to map the reader registry")?;
+        drop(reader_lock);
 
         let data_path = path.join(DATA_FILE);
         let data = if self.read_only {
@@ -1560,8 +1508,7 @@ impl EnvOpenOptions {
             readers: Mutex::new(BTreeMap::new()),
             free_pool: Mutex::new(Vec::new()),
             free_pool_ready: AtomicBool::new(false),
-            reader_file: Mutex::new(reader_file),
-            reader_lock,
+            reader_slots,
             meta_buffer: Mutex::new([0u8; PAGE_SIZE]),
             poisoned: AtomicBool::new(false),
             clean_marker_on_drop: AtomicBool::new(!self.read_only),
@@ -1588,7 +1535,7 @@ fn open_reader_registry(path: &Path) -> Result<(File, File)> {
     };
     let file = read_write_create()
         .with_context(|| format!("failed to open `{}`", registry_path.display()))?;
-    let expected = (READER_SLOTS * READER_SLOT_SIZE) as u64;
+    let expected = READER_REGISTRY_LEN;
     if file
         .metadata()
         .with_context(|| format!("failed to inspect `{}`", registry_path.display()))?
@@ -1615,7 +1562,7 @@ pub(crate) fn reset_reader_registry(path: &Path) -> Result<()> {
     fs4::FileExt::lock(&lock)
         .with_context(|| format!("failed to lock `{}`", path.join(READER_LOCK_FILE).display()))?;
     let result = (|| {
-        let expected = (READER_SLOTS * READER_SLOT_SIZE) as u64;
+        let expected = READER_REGISTRY_LEN;
         file.set_len(0)
             .with_context(|| format!("failed to clear `{}`", path.join(READER_FILE).display()))?;
         file.set_len(expected)
