@@ -129,6 +129,86 @@ impl<KC, DC> Database<KC, DC> {
         })?))
     }
 
+    /// Returns the first entry whose key is strictly greater than `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bound cannot be encoded or the entry cannot be
+    /// decoded.
+    pub fn get_greater_than<'a, 'txn, 'env>(
+        &self,
+        txn: &'txn RoTxn<'env>,
+        key: &'a KC::EItem,
+    ) -> Result<Option<(KC::DItem, DC::DItem)>>
+    where
+        KC: BytesEncode<'a> + BytesDecode<'txn>,
+        DC: BytesDecode<'txn>,
+    {
+        self.range(txn, Bound::Excluded(key), Bound::Unbounded)?
+            .next()
+            .transpose()
+    }
+
+    /// Returns the first entry whose key is greater than or equal to `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bound cannot be encoded or the entry cannot be
+    /// decoded.
+    pub fn get_greater_than_or_equal_to<'a, 'txn, 'env>(
+        &self,
+        txn: &'txn RoTxn<'env>,
+        key: &'a KC::EItem,
+    ) -> Result<Option<(KC::DItem, DC::DItem)>>
+    where
+        KC: BytesEncode<'a> + BytesDecode<'txn>,
+        DC: BytesDecode<'txn>,
+    {
+        self.range(txn, Bound::Included(key), Bound::Unbounded)?
+            .next()
+            .transpose()
+    }
+
+    /// Returns the last entry whose key is strictly less than `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bound cannot be encoded or the entry cannot be
+    /// decoded.
+    pub fn get_lower_than<'a, 'txn, 'env>(
+        &self,
+        txn: &'txn RoTxn<'env>,
+        key: &'a KC::EItem,
+    ) -> Result<Option<(KC::DItem, DC::DItem)>>
+    where
+        KC: BytesEncode<'a> + BytesDecode<'txn>,
+        DC: BytesDecode<'txn>,
+    {
+        self.rev_range(txn, Bound::Unbounded, Bound::Excluded(key))?
+            .next()
+            .transpose()
+    }
+
+    /// Returns the last entry whose key is less than or equal to `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bound cannot be encoded or the entry cannot be
+    /// decoded.
+    pub fn get_lower_than_or_equal_to<'a, 'txn, 'env>(
+        &self,
+        txn: &'txn RoTxn<'env>,
+        key: &'a KC::EItem,
+    ) -> Result<Option<(KC::DItem, DC::DItem)>>
+    where
+        KC: BytesEncode<'a> + BytesDecode<'txn>,
+        DC: BytesDecode<'txn>,
+    {
+        self.rev_range(txn, Bound::Unbounded, Bound::Included(key))?
+            .next()
+            .transpose()
+    }
+
     /// Returns the first entry in ascending key order.
     ///
     /// # Errors
