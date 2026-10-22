@@ -121,6 +121,12 @@ All notable changes to this project are documented here.
 - Ordered iteration keeps the current leaf page in the cursor instead of looking
   it up again for every entry. Range, prefix, and reverse scans avoid one page
   lookup per key.
+- Range and reverse-range iterators fetch each key/value pair once per step
+  instead of separately reading the key for bound checks.
+- Large pending batches that exceed a byte threshold use bottom-up bulk loading
+  even when their entry count is below the normal threshold.
+- Mixed puts and deletes are applied in one bottom-up pass when their combined
+  pending batch is large, rebuilding each affected tree path once.
 - Writer startup defers state and free-list setup until the first allocation,
   and transaction-owned page sets are boxed/lazily initialized where possible.
   Startup write bursts therefore avoid work not required by the transaction.

@@ -28,6 +28,7 @@ use crate::storage::{PAGE_SIZE, PageSet, io};
 /// Transactions writing at least this many entries into an empty database
 /// build the tree bottom-up instead of inserting one path at a time.
 const BULK_LOAD_THRESHOLD: usize = 1024;
+const BULK_LOAD_BYTES: usize = 1 << 20;
 
 /// Maximum number of contiguous overlay pages combined into one write.
 const WRITE_BATCH_PAGES: u64 = 256;
@@ -171,6 +172,14 @@ impl PendingValue {
 }
 
 impl PendingValue {
+    fn len(&self) -> usize {
+        match self {
+            Self::Inline { len, .. } => *len as usize,
+            Self::Owned(value) => value.len(),
+            Self::Mapped(mapped) => mapped.len,
+        }
+    }
+
     fn is_mapped(&self) -> bool {
         matches!(self, Self::Mapped(_))
     }
@@ -1131,7 +1140,30 @@ impl<'env> RwTxn<'env> {
                     *root = btree::bulk_delete_with(self, *root, &keys, self.txn_id, &comparator)?;
                     return Ok(());
                 }
-                if *root == 0 && entries.len() >= BULK_LOAD_THRESHOLD {
+                if *root != 0 && entries.len() >= BULK_LOAD_THRESHOLD {
+                    let delete_count = entries.iter().filter(|(_, value)| value.is_none()).count();
+                    if delete_count >= BULK_LOAD_THRESHOLD {
+                        let keys: Vec<&PendingKey> = entries
+                            .iter()
+                            .filter_map(|(key, value)| value.is_none().then_some(key))
+                            .collect();
+                        *root =
+                            btree::bulk_delete_with(self, *root, &keys, self.txn_id, &comparator)?;
+                        for (key, value) in entries {
+                            if let Some(value) = value {
+                                self.apply_one(root, key, Some(value), comparator)?;
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
+                let pending_bytes: usize = entries
+                    .iter()
+                    .filter_map(|(_, value)| value.as_ref().map(PendingValue::len))
+                    .sum();
+                if *root == 0
+                    && (entries.len() >= BULK_LOAD_THRESHOLD || pending_bytes >= BULK_LOAD_BYTES)
+                {
                     let entries: Vec<(PendingKey, PendingValue)> = entries
                         .drain(..)
                         .filter_map(|(key, value)| value.map(|value| (key, value)))
@@ -1141,12 +1173,25 @@ impl<'env> RwTxn<'env> {
                     }
                     return Ok(());
                 }
+                if *root != 0 && entries.len() >= BULK_LOAD_THRESHOLD {
+                    let operations: Vec<(&PendingKey, Option<ValueRef<'_>>)> = entries
+                        .iter()
+                        .map(|(key, value)| (key, value.as_ref().map(PendingValue::value_ref)))
+                        .collect();
+                    *root =
+                        btree::bulk_apply_with(self, *root, &operations, self.txn_id, &comparator)?;
+                    return Ok(());
+                }
                 for (key, value) in entries {
                     self.apply_one(root, key, value, comparator)?;
                 }
                 Ok(())
             }
             Pending::Map(pending) => {
+                let pending_bytes: usize = pending
+                    .values()
+                    .filter_map(|value| value.as_ref().map(PendingValue::len))
+                    .sum();
                 if *root != 0
                     && pending.len() >= BULK_LOAD_THRESHOLD
                     && pending.values().all(Option::is_none)
@@ -1155,7 +1200,9 @@ impl<'env> RwTxn<'env> {
                     *root = btree::bulk_delete_with(self, *root, &keys, self.txn_id, &comparator)?;
                     return Ok(());
                 }
-                if *root == 0 && pending.len() >= BULK_LOAD_THRESHOLD {
+                if *root == 0
+                    && (pending.len() >= BULK_LOAD_THRESHOLD || pending_bytes >= BULK_LOAD_BYTES)
+                {
                     let mut entries: Vec<(PendingKey, PendingValue)> = pending
                         .into_iter()
                         .filter_map(|(key, value)| value.map(|value| (key, value)))

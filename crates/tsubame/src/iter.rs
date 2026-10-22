@@ -760,20 +760,6 @@ where
             return None;
         }
 
-        let key = match self.cursor.current_key() {
-            Ok(Some(key)) => key,
-            Ok(None) => return None,
-            Err(error) => {
-                self.done = true;
-                return Some(Err(error));
-            }
-        };
-
-        if self.past_end(key) {
-            self.done = true;
-            return None;
-        }
-
         let Some((key, value)) = (match self.cursor.current() {
             Ok(current) => current,
             Err(error) => {
@@ -784,6 +770,11 @@ where
             self.done = true;
             return None;
         };
+
+        if self.past_end(key) {
+            self.done = true;
+            return None;
+        }
 
         let item = decode::<KC, DC>(key, value);
         if let Err(error) = self.cursor.next() {
@@ -854,20 +845,6 @@ where
             return None;
         }
 
-        let key = match self.cursor.current_key() {
-            Ok(Some(key)) => key,
-            Ok(None) => return None,
-            Err(error) => {
-                self.done = true;
-                return Some(Err(error));
-            }
-        };
-
-        if self.before_start(key) {
-            self.done = true;
-            return None;
-        }
-
         let Some((key, value)) = (match self.cursor.current() {
             Ok(current) => current,
             Err(error) => {
@@ -878,6 +855,11 @@ where
             self.done = true;
             return None;
         };
+
+        if self.before_start(key) {
+            self.done = true;
+            return None;
+        }
 
         let item = decode::<KC, DC>(key, value);
         if let Err(error) = self.cursor.prev() {

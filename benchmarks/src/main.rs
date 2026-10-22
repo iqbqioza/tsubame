@@ -28,7 +28,7 @@ fn config() -> &'static Config {
     CONFIG.get_or_init(|| Config {
         entries: env_u64("TSUBAME_BENCH_ENTRIES", 100_000),
         reads: env_u64("TSUBAME_BENCH_READS", 1_000_000),
-        commits: env_u64("TSUBAME_BENCH_COMMITS", 50),
+        commits: env_u64("TSUBAME_BENCH_COMMITS", 1_000),
         warmup_reads: env_u64("TSUBAME_BENCH_WARMUP", 10_000),
         repeats: u32::try_from(env_u64("TSUBAME_BENCH_REPEATS", 5))
             .unwrap_or(3)

@@ -892,6 +892,318 @@ fn bulk_delete_branch<S: PageStore, K: AsRef<[u8]>>(
     Ok(Some(new_page))
 }
 
+/// Applies a sorted batch of puts and deletes to an existing tree in one
+/// bottom-up pass.
+pub(crate) fn bulk_apply_with<S: PageStore, K: AsRef<[u8]>>(
+    store: &mut S,
+    root: u64,
+    operations: &[(K, Option<ValueRef<'_>>)],
+    txn_id: u64,
+    comparator: &KeyComparator,
+) -> Result<u64> {
+    if root == 0 || operations.is_empty() {
+        return Ok(root);
+    }
+    let result = bulk_apply_into(store, root, operations, txn_id, 0, comparator)?;
+    match result.split {
+        Some(split) => allocate_branch(
+            store,
+            &[(Vec::new(), result.page_id), (split.separator, split.right)],
+            txn_id,
+        ),
+        None => Ok(result.page_id),
+    }
+}
+
+struct BulkApplyResult {
+    page_id: u64,
+    split: Option<Split>,
+}
+
+fn bulk_apply_into<S: PageStore, K: AsRef<[u8]>>(
+    store: &mut S,
+    page_id: u64,
+    operations: &[(K, Option<ValueRef<'_>>)],
+    txn_id: u64,
+    depth: usize,
+    comparator: &KeyComparator,
+) -> Result<BulkApplyResult> {
+    ensure!(
+        depth < MAX_DEPTH,
+        "B+tree depth exceeded {MAX_DEPTH} during bulk apply"
+    );
+    let page_type = store.with_page(page_id, |page| Ok(page.page_type()))?;
+    match page_type {
+        PageType::Leaf => bulk_apply_leaf(store, page_id, operations, txn_id, comparator),
+        PageType::Branch => {
+            bulk_apply_branch(store, page_id, operations, txn_id, depth, comparator)
+        }
+    }
+}
+
+fn bulk_apply_leaf_in_place<S: PageStore, K: AsRef<[u8]>>(
+    store: &mut S,
+    page_id: u64,
+    operations: &[(K, Option<ValueRef<'_>>)],
+    txn_id: u64,
+    comparator: &KeyComparator,
+) -> Result<Option<BulkApplyResult>> {
+    let mut bytes = store.read_page(page_id)?;
+    let mut new_page = None;
+    let mut changed = false;
+    let mut replaced = Vec::new();
+    let mut fallback = false;
+
+    for (key, operation) in operations {
+        let key = key.as_ref();
+        let page = Page::parse_trusted(&bytes, None)?;
+        let index = page.lower_bound_with(key, comparator)?;
+        let exists = index < page.slot_count()
+            && comparator.compare(page.key(index)?, key) == Ordering::Equal;
+        match operation {
+            Some(value) => {
+                if !exists {
+                    fallback = true;
+                    break;
+                }
+                let encoded;
+                let (value_bytes, flags) = match value {
+                    ValueRef::Inline(value)
+                        if SLOT_SIZE + key.len() + value.len() <= INLINE_BUDGET =>
+                    {
+                        (*value, 0)
+                    }
+                    ValueRef::Inline(_) => {
+                        fallback = true;
+                        break;
+                    }
+                    ValueRef::Overflow(reference) => {
+                        encoded = reference.encode();
+                        (encoded.as_slice(), page::FLAG_OVERFLOW)
+                    }
+                };
+                let old_value = page.leaf_value(index)?;
+                let old_len = match old_value {
+                    LeafValue::Inline(bytes) => bytes.len(),
+                    LeafValue::Overflow(_) => overflow::OVERFLOW_REF_SIZE,
+                };
+                if let LeafValue::Overflow(reference) = old_value {
+                    replaced.push(reference);
+                }
+                let new_page_id = if let Some(page_id) = new_page {
+                    page_id
+                } else {
+                    let page_id = store.allocate_pages(1)?;
+                    new_page = Some(page_id);
+                    page_id
+                };
+                let result = if old_len == value_bytes.len() {
+                    page::replace_value_in_place(
+                        &mut bytes,
+                        new_page_id,
+                        txn_id,
+                        index,
+                        value_bytes,
+                        flags,
+                    )
+                } else {
+                    page::replace_value_resized_in_place(
+                        &mut bytes,
+                        new_page_id,
+                        txn_id,
+                        index,
+                        value_bytes,
+                        flags,
+                    )
+                };
+                if result.is_err() {
+                    fallback = true;
+                    break;
+                }
+                changed = true;
+            }
+            None => {
+                if !exists {
+                    continue;
+                }
+                if let LeafValue::Overflow(reference) = page.leaf_value(index)? {
+                    replaced.push(reference);
+                }
+                let new_page_id = if let Some(page_id) = new_page {
+                    page_id
+                } else {
+                    let page_id = store.allocate_pages(1)?;
+                    new_page = Some(page_id);
+                    page_id
+                };
+                page::delete_entry_in_place(&mut bytes, new_page_id, txn_id, index)?;
+                changed = true;
+            }
+        }
+    }
+
+    if fallback {
+        if let Some(page_id) = new_page {
+            store.free_pages(page_id, 1)?;
+        }
+        return Ok(None);
+    }
+    if !changed {
+        return Ok(Some(BulkApplyResult {
+            page_id,
+            split: None,
+        }));
+    }
+
+    let empty = Page::parse_trusted(&bytes, None)?.slot_count() == 0;
+    let new_page_id = new_page.context("changed page has no allocation")?;
+    if empty {
+        store.free_pages(page_id, 1)?;
+        store.free_pages(new_page_id, 1)?;
+    } else {
+        page::seal_page(&mut bytes);
+        store.write_page(new_page_id, bytes)?;
+        store.free_pages(page_id, 1)?;
+    }
+    for reference in replaced {
+        store.free_pages(reference.start_page, reference.page_count)?;
+    }
+
+    Ok(Some(BulkApplyResult {
+        page_id: if empty { 0 } else { new_page_id },
+        split: None,
+    }))
+}
+
+fn bulk_apply_leaf<S: PageStore, K: AsRef<[u8]>>(
+    store: &mut S,
+    page_id: u64,
+    operations: &[(K, Option<ValueRef<'_>>)],
+    txn_id: u64,
+    comparator: &KeyComparator,
+) -> Result<BulkApplyResult> {
+    if let Some(result) = bulk_apply_leaf_in_place(store, page_id, operations, txn_id, comparator)?
+    {
+        return Ok(result);
+    }
+
+    let mut entries = store.with_page(page_id, collect_leaf)?;
+    let mut replaced = Vec::new();
+    for (key, operation) in operations {
+        let key = key.as_ref();
+        let index = entries.binary_search_by(|entry| comparator.compare(entry.key.as_slice(), key));
+        match operation {
+            Some(value) => {
+                let value = make_value(store, key.len(), *value, txn_id)?;
+                match index {
+                    Ok(index) => {
+                        replaced.push(std::mem::replace(&mut entries[index].value, value));
+                    }
+                    Err(index) => entries.insert(
+                        index,
+                        OwnedLeafEntry {
+                            key: key.to_vec(),
+                            value,
+                        },
+                    ),
+                }
+            }
+            None => {
+                if let Ok(index) = index {
+                    replaced.push(entries.remove(index).value);
+                }
+            }
+        }
+    }
+    for value in replaced {
+        free_value(store, &value)?;
+    }
+    if entries.is_empty() {
+        store.free_pages(page_id, 1)?;
+        return Ok(BulkApplyResult {
+            page_id: 0,
+            split: None,
+        });
+    }
+
+    let result = store_leaf(store, page_id, entries, txn_id)?;
+    Ok(BulkApplyResult {
+        page_id: result.page_id,
+        split: result.split,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bulk_apply_branch<S: PageStore, K: AsRef<[u8]>>(
+    store: &mut S,
+    page_id: u64,
+    operations: &[(K, Option<ValueRef<'_>>)],
+    txn_id: u64,
+    depth: usize,
+    comparator: &KeyComparator,
+) -> Result<BulkApplyResult> {
+    let entries = store.with_page(page_id, collect_branch)?;
+    let mut next = Vec::with_capacity(entries.len());
+    for (index, (separator, child)) in entries.iter().enumerate() {
+        let start = if index == 0 {
+            0
+        } else {
+            operations.partition_point(|(key, _)| {
+                comparator.compare(key.as_ref(), separator.as_slice()) == Ordering::Less
+            })
+        };
+        let end = if index + 1 == entries.len() {
+            operations.len()
+        } else {
+            let next_separator = entries[index + 1].0.as_slice();
+            operations.partition_point(|(key, _)| {
+                comparator.compare(key.as_ref(), next_separator) == Ordering::Less
+            })
+        };
+
+        if start == end {
+            next.push((separator.clone(), *child));
+            continue;
+        }
+        let result = bulk_apply_into(
+            store,
+            *child,
+            &operations[start..end],
+            txn_id,
+            depth + 1,
+            comparator,
+        )?;
+        if result.page_id != 0 {
+            next.push((separator.clone(), result.page_id));
+            if let Some(split) = result.split {
+                next.push((split.separator, split.right));
+            }
+        }
+    }
+
+    if next.is_empty() {
+        store.free_pages(page_id, 1)?;
+        return Ok(BulkApplyResult {
+            page_id: 0,
+            split: None,
+        });
+    }
+    if next.len() == 1 {
+        let child = next[0].1;
+        store.free_pages(page_id, 1)?;
+        return Ok(BulkApplyResult {
+            page_id: child,
+            split: None,
+        });
+    }
+    next[0].0.clear();
+    let result = store_branch(store, page_id, next, txn_id)?;
+    Ok(BulkApplyResult {
+        page_id: result.page_id,
+        split: result.split,
+    })
+}
+
 /// Bulk-loads sorted entries into a new tree and returns its root.
 ///
 /// This is used when a transaction writes a large number of entries into an

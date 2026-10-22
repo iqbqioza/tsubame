@@ -1096,6 +1096,50 @@ fn offline_compaction_clears_stale_reader_slots() -> Result<()> {
 }
 
 #[test]
+fn bulk_mixed_updates_and_deletes_preserve_the_tree() -> Result<()> {
+    let dir = tempdir()?;
+    {
+        let env = options().open(dir.path())?;
+        let mut wtxn = env.write_txn()?;
+        let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+        for i in 0..4_096u32 {
+            db.put(&mut wtxn, &format!("key-{i:04}"), &format!("value-{i:04}"))?;
+        }
+        wtxn.commit()?;
+
+        let mut wtxn = env.write_txn()?;
+        for i in 0..1_500u32 {
+            db.put(
+                &mut wtxn,
+                &format!("key-{i:04}"),
+                &format!("updated-{i:04}"),
+            )?;
+        }
+        for i in 1_500..2_500u32 {
+            db.delete(&mut wtxn, &format!("key-{i:04}"))?;
+        }
+        wtxn.commit()?;
+    }
+
+    let env = options().open(dir.path())?;
+    let rtxn = env.read_txn()?;
+    let db = env.open_database::<Str, Str>(&rtxn, None)?;
+    for i in 0..4_096u32 {
+        let key = format!("key-{i:04}");
+        let expected = if i < 1_500 {
+            Some(format!("updated-{i:04}"))
+        } else if (1_500..2_500).contains(&i) {
+            None
+        } else {
+            Some(format!("value-{i:04}"))
+        };
+        assert_eq!(db.get(&rtxn, &key)?, expected.as_deref(), "key {key}");
+    }
+
+    Ok(())
+}
+
+#[test]
 fn bulk_load_uses_staged_large_values() -> Result<()> {
     let dir = tempdir()?;
     let values: Vec<Vec<u8>> = (0..1_100u32)
