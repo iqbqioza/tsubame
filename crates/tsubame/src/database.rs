@@ -1051,6 +1051,37 @@ impl<KC, DC> Database<KC, DC> {
         }
         result
     }
+
+    /// Returns a handle for the same database with different key and value
+    /// codecs.
+    ///
+    /// The underlying bytes and database identity are unchanged. This is
+    /// useful for inspecting entries through a raw byte codec.
+    pub fn remap_types<KC2, DC2>(&self) -> Database<KC2, DC2> {
+        Database {
+            env: Arc::clone(&self.env),
+            kind: self.kind.clone(),
+            _codecs: PhantomData,
+        }
+    }
+
+    /// Returns a handle for the same database with a different key codec.
+    pub fn remap_key_type<KC2>(&self) -> Database<KC2, DC> {
+        Database {
+            env: Arc::clone(&self.env),
+            kind: self.kind.clone(),
+            _codecs: PhantomData,
+        }
+    }
+
+    /// Returns a handle for the same database with a different value codec.
+    pub fn remap_data_type<DC2>(&self) -> Database<KC, DC2> {
+        Database {
+            env: Arc::clone(&self.env),
+            kind: self.kind.clone(),
+            _codecs: PhantomData,
+        }
+    }
 }
 
 impl<KC, DC> Clone for Database<KC, DC> {

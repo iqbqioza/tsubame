@@ -20,6 +20,8 @@ All notable changes to this project are documented here.
 - `Database::first`, `last`, `len`, and `is_empty` inspection helpers, plus
   `first_rw`, `last_rw`, `len_rw`, and `is_empty_rw` for staged transaction
   views.
+- `Database::remap_types`, `remap_key_type`, and `remap_data_type` create
+  typed handles for the same underlying database using different codecs.
 - `PutFlags`, `Database::put_with_flags`, and
   `Database::get_or_put_with_flags`. `NO_OVERWRITE` is supported; append and
   duplicate-data flags are reserved and return an error.

@@ -64,6 +64,7 @@ added without changing the main API.
 - [x] Range deletion with `Database::delete_range`
 - [x] Conditional insertion with `Database::get_or_put`
 - [x] Heed-compatible `PutFlags` and conditional writes
+- [x] Codec remapping for database handles
 - [x] Configurable multi-process reader slot limit
 
 ## Codec features
