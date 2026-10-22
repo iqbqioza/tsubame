@@ -889,6 +889,10 @@ impl<'env> RwTxn<'env> {
         btree::get_with(self, root, key, &self.env.inner.comparator)
     }
 
+    pub(crate) fn contains_raw(&self, kind: &DatabaseKind, key: &[u8]) -> Result<bool> {
+        Ok(self.get_raw(kind, key)?.is_some())
+    }
+
     pub(crate) fn increment_database_count(&mut self) -> Result<()> {
         self.database_count = self
             .database_count

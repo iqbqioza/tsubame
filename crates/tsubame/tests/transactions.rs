@@ -12,7 +12,7 @@ use anyhow::Context;
 use tempfile::tempdir;
 use tsubame::byteorder::NativeEndian;
 use tsubame::types::{Bytes, Str, U32};
-use tsubame::{Env, EnvOpenOptions, KeyComparator, Result};
+use tsubame::{Env, EnvOpenOptions, KeyComparator, PutFlags, Result};
 
 fn options() -> EnvOpenOptions {
     let mut options = EnvOpenOptions::new();
@@ -135,6 +135,66 @@ fn environment_statistics_match_the_unnamed_database() -> Result<()> {
         pages * database_stat.page_size as u64
     );
     assert_eq!(env.max_key_size(), 1_024);
+
+    Ok(())
+}
+
+#[test]
+fn put_with_flags_honors_no_overwrite() -> Result<()> {
+    let dir = tempdir()?;
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+
+    db.put_with_flags(&mut wtxn, PutFlags::empty(), "a", "one")?;
+    assert!(
+        db.put_with_flags(&mut wtxn, PutFlags::NO_OVERWRITE, "a", "two")
+            .is_err()
+    );
+    assert_eq!(db.get_rw(&wtxn, "a")?, Some("one"));
+    db.put_with_flags(&mut wtxn, PutFlags::NO_OVERWRITE, "b", "two")?;
+
+    assert_eq!(
+        db.get_or_put_with_flags(&mut wtxn, PutFlags::NO_OVERWRITE, "b", "three")?,
+        Some("two")
+    );
+    assert_eq!(
+        db.get_or_put_with_flags(&mut wtxn, PutFlags::NO_OVERWRITE, "c", "three")?,
+        None
+    );
+    assert!(
+        db.put_with_flags(&mut wtxn, PutFlags::APPEND, "d", "four")
+            .is_err()
+    );
+    assert!(
+        db.put_with_flags(&mut wtxn, PutFlags::APPEND_DUP, "d", "four")
+            .is_err()
+    );
+    assert!(
+        db.put_with_flags(&mut wtxn, PutFlags::NO_DUP_DATA, "d", "four")
+            .is_err()
+    );
+    assert!(
+        db.put_with_flags(
+            &mut wtxn,
+            PutFlags::NO_OVERWRITE | PutFlags::APPEND,
+            "d",
+            "four",
+        )
+        .is_err()
+    );
+    assert!(
+        db.get_or_put_with_flags(&mut wtxn, PutFlags::APPEND, "d", "four")
+            .is_err()
+    );
+
+    db.put_with_flags(&mut wtxn, PutFlags::empty(), "a", "replaced")?;
+    wtxn.commit()?;
+
+    let rtxn = env.read_txn()?;
+    assert_eq!(db.get(&rtxn, "a")?, Some("replaced"));
+    assert_eq!(db.get(&rtxn, "b")?, Some("two"));
+    assert_eq!(db.get(&rtxn, "c")?, Some("three"));
 
     Ok(())
 }

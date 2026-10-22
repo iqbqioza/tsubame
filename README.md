@@ -63,6 +63,7 @@ added without changing the main API.
 - [x] Heed-style write-transaction iterator aliases and `Env::force_sync`
 - [x] Range deletion with `Database::delete_range`
 - [x] Conditional insertion with `Database::get_or_put`
+- [x] Heed-compatible `PutFlags` and conditional writes
 - [x] Configurable multi-process reader slot limit
 
 ## Codec features

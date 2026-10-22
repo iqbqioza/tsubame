@@ -45,6 +45,7 @@ pub mod cursor;
 pub mod database;
 pub mod env;
 pub mod error;
+pub mod flags;
 pub mod iter;
 mod storage;
 pub mod txn;
@@ -53,6 +54,7 @@ pub use self::comparator::KeyComparator;
 pub use self::database::Database;
 pub use self::env::{DEFAULT_MAP_SIZE, DEFAULT_MAX_DBS, Env, EnvInfo, EnvOpenOptions, EnvStat};
 pub use self::error::{Error, Result};
+pub use self::flags::PutFlags;
 pub use self::txn::{RoTxn, RwTxn};
 
 /// The [`byteorder`] crate, re-exported for codecs such as [`types::U32`].
