@@ -55,6 +55,8 @@ All notable changes to this project are documented here.
 - Small commits build inline commit descriptors directly without allocating a
   `CommitEntry` vector or cloning it. Pages written by a successful commit are
   marked verified to avoid rechecking their checksums on the next writer read.
+- Writer page reads copy validated bytes directly into the owned page buffer
+  instead of zero-filling the whole page first.
 - Bulk loading builds leaf pages from borrowed entries instead of cloning
   every key and value.
 - Verified page reads bypass redundant header checks, and binary-search slot
