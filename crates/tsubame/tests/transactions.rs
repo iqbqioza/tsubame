@@ -158,6 +158,17 @@ fn environment_statistics_match_the_unnamed_database() -> Result<()> {
         pages * database_stat.page_size as u64
     );
     assert_eq!(env.max_key_size(), 1_024);
+    let data_metadata = fs::metadata(dir.path().join("data.tsubame"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            env.real_disk_size()?,
+            data_metadata.blocks().saturating_mul(512)
+        );
+    }
+    #[cfg(not(unix))]
+    assert_eq!(env.real_disk_size()?, data_metadata.len());
 
     Ok(())
 }
