@@ -140,9 +140,9 @@ The examples use a temporary directory and clean up after themselves.
   `multi_process(true)`. Readers advertise their snapshots through
   `readers.tsubame`, and the writer only recycles pages that no advertised
   snapshot can still need. The registry supports up to 4096 simultaneous
-  cross-process readers; stale slots left by a crashed process conservatively
-  block reuse until offline compaction clears them. Read-only environments therefore need write
-  access to their directory for the registry sidecar.
+  cross-process readers; stale slots left by a crashed reader conservatively
+  block reuse until offline compaction clears them. Read-only environments
+  therefore need write access to their directory for the registry sidecar.
 - Freed pages are reused across transactions once the two recoverable meta
   snapshots no longer reference them and no active reader, in any process, can
   still observe them. Readers reserve a registry slot before loading a
@@ -162,8 +162,9 @@ The examples use a temporary directory and clean up after themselves.
 - `Env::compact_online` keeps an open writable environment mapped to the
   compacted file. Read transactions and `Database` handles may remain active;
   existing readers keep their previous file generation. A write transaction
-  must not be active, and read-only/multi-process environments must use
-  offline compaction.
+  must not be active. Read-only environments must use offline compaction; a
+  `multi_process` writer may compact online after all read-only environments
+  have been closed.
 - Custom key comparators are environment-wide and must be supplied again on
   every open and offline compaction. A stable comparator ID is persisted in
   `comparator.tsubame` and must match. Prefix iteration requires lexicographic
