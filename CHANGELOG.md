@@ -66,6 +66,8 @@ All notable changes to this project are documented here.
 - Large pending write batches stage in an unordered vector, then sort and
   deduplicate once at commit. Fixed-width keys use numeric sorting fast paths
   instead of repeated byte-slice comparisons.
+- Lexicographic comparisons for 2-, 4-, and 8-byte keys use native integer
+  comparisons in page searches and lookups.
 - Reusable free runs are coalesced when adjacent, and the smallest larger run
   is split only when no exact-size run is available. This lets small leaf and
   branch allocations reclaim space left by large overflow values without

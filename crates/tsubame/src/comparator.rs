@@ -53,10 +53,38 @@ impl KeyComparator {
     #[inline]
     pub(crate) fn compare(self, a: &[u8], b: &[u8]) -> Ordering {
         if self.lexicographic {
-            a.cmp(b)
+            compare_lexicographic(a, b)
         } else {
             (self.compare)(a, b)
         }
+    }
+}
+
+#[inline]
+pub(crate) fn compare_lexicographic(a: &[u8], b: &[u8]) -> Ordering {
+    match (a.len(), b.len()) {
+        (8, 8) => {
+            let mut left = [0u8; 8];
+            let mut right = [0u8; 8];
+            left.copy_from_slice(a);
+            right.copy_from_slice(b);
+            u64::from_be_bytes(left).cmp(&u64::from_be_bytes(right))
+        }
+        (4, 4) => {
+            let mut left = [0u8; 4];
+            let mut right = [0u8; 4];
+            left.copy_from_slice(a);
+            right.copy_from_slice(b);
+            u32::from_be_bytes(left).cmp(&u32::from_be_bytes(right))
+        }
+        (2, 2) => {
+            let mut left = [0u8; 2];
+            let mut right = [0u8; 2];
+            left.copy_from_slice(a);
+            right.copy_from_slice(b);
+            u16::from_be_bytes(left).cmp(&u16::from_be_bytes(right))
+        }
+        _ => a.cmp(b),
     }
 }
 
