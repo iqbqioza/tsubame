@@ -60,6 +60,7 @@ added without changing the main API.
 - [x] Consistent environment backup with `Env::copy_to_path`
 - [x] Database structural statistics
 - [x] Environment statistics and `Env::non_free_pages_size`
+- [x] Allocated-size reporting with `Env::real_disk_size`
 - [x] Heed-style write-transaction iterator aliases and `Env::force_sync`
 - [x] Range deletion with `Database::delete_range`
 - [x] Conditional insertion with `Database::get_or_put`

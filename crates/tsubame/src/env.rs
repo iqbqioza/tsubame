@@ -172,6 +172,30 @@ impl Env {
             .context("non-free page size overflow")
     }
 
+    /// Returns the number of bytes allocated for the data file on disk.
+    ///
+    /// On Unix this uses the filesystem's allocated-block count, so sparse
+    /// pages that have not been written are not included. Other platforms
+    /// return the logical file length.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the data file metadata cannot be read.
+    pub fn real_disk_size(&self) -> Result<u64> {
+        let path = self.inner.path.join(DATA_FILE);
+        let metadata = fs::metadata(&path)
+            .with_context(|| format!("failed to read metadata for `{}`", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok(metadata.blocks().saturating_mul(512))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(metadata.len())
+        }
+    }
+
     /// Returns the maximum encoded key size accepted by the environment.
     pub fn max_key_size(&self) -> usize {
         MAX_KEY_SIZE
