@@ -19,6 +19,41 @@ use super::page::{
 use super::store::PageStore;
 use crate::comparator::KeyComparator;
 
+/// A value supplied to the B+tree writer, either inline bytes or an
+/// already-written overflow extent.
+#[derive(Clone, Copy)]
+pub(crate) enum ValueRef<'a> {
+    Inline(&'a [u8]),
+    Overflow(OverflowRef),
+}
+
+impl<'a> ValueRef<'a> {
+    fn len(self) -> usize {
+        match self {
+            Self::Inline(bytes) => bytes.len(),
+            Self::Overflow(_) => overflow::OVERFLOW_REF_SIZE,
+        }
+    }
+
+    fn inline(self) -> Option<&'a [u8]> {
+        match self {
+            Self::Inline(bytes) => Some(bytes),
+            Self::Overflow(_) => None,
+        }
+    }
+}
+
+/// A staged value that can be passed to the bulk loader.
+pub(crate) trait BulkValue {
+    fn value_ref(&self) -> ValueRef<'_>;
+}
+
+impl<T: AsRef<[u8]>> BulkValue for T {
+    fn value_ref(&self) -> ValueRef<'_> {
+        ValueRef::Inline(self.as_ref())
+    }
+}
+
 /// The maximum number of branch levels followed by a lookup.
 ///
 /// This is a safety bound against corrupt or cyclic pages, not a format limit.
@@ -160,6 +195,24 @@ pub(crate) fn insert_with<S: PageStore>(
     txn_id: u64,
     comparator: &KeyComparator,
 ) -> Result<u64> {
+    insert_value_with(
+        store,
+        root,
+        key,
+        ValueRef::Inline(value),
+        txn_id,
+        comparator,
+    )
+}
+
+pub(crate) fn insert_value_with<S: PageStore>(
+    store: &mut S,
+    root: u64,
+    key: &[u8],
+    value: ValueRef<'_>,
+    txn_id: u64,
+    comparator: &KeyComparator,
+) -> Result<u64> {
     ensure!(
         key.len() <= MAX_KEY_SIZE,
         "key is {} bytes, maximum is {MAX_KEY_SIZE}",
@@ -251,7 +304,7 @@ fn insert_into<S: PageStore>(
     store: &mut S,
     page_id: u64,
     key: &[u8],
-    value: &[u8],
+    value: ValueRef<'_>,
     txn_id: u64,
     depth: usize,
     comparator: &KeyComparator,
@@ -279,14 +332,15 @@ fn insert_leaf<S: PageStore>(
     store: &mut S,
     page_id: u64,
     key: &[u8],
-    value: &[u8],
+    value: ValueRef<'_>,
     txn_id: u64,
     comparator: &KeyComparator,
 ) -> Result<InsertResult> {
     let edit = store.with_page(page_id, |page| {
         let position = page.lower_bound_with(key, comparator)?;
         let existing = position < page.slot_count() && page.key(position)? == key;
-        let inline = SLOT_SIZE + key.len() + value.len() <= INLINE_BUDGET;
+        let inline =
+            value.inline().is_some() && SLOT_SIZE + key.len() + value.len() <= INLINE_BUDGET;
         let mut edit = None;
 
         if inline {
@@ -325,19 +379,27 @@ fn insert_leaf<S: PageStore>(
     })?;
 
     if let Some(edit) = edit {
+        let value_bytes = value
+            .inline()
+            .context("non-inline value reached the in-place leaf path")?;
         let old_overflow = match edit {
             LeafEdit::Resized(_, overflow) => overflow,
             LeafEdit::Same(_) | LeafEdit::Append => None,
         };
         let new_page_id = store.rewrite_page(page_id, |new_page_id, bytes| match edit {
             LeafEdit::Same(position) => {
-                page::replace_value_in_place(bytes, new_page_id, txn_id, position, value, 0)
+                page::replace_value_in_place(bytes, new_page_id, txn_id, position, value_bytes, 0)
             }
-            LeafEdit::Resized(position, _) => {
-                page::replace_value_resized_in_place(bytes, new_page_id, txn_id, position, value, 0)
-            }
+            LeafEdit::Resized(position, _) => page::replace_value_resized_in_place(
+                bytes,
+                new_page_id,
+                txn_id,
+                position,
+                value_bytes,
+                0,
+            ),
             LeafEdit::Append => {
-                page::append_entry_in_place(bytes, new_page_id, txn_id, key, value, 0)
+                page::append_entry_in_place(bytes, new_page_id, txn_id, key, value_bytes, 0)
             }
         })?;
         if let Some(reference) = old_overflow {
@@ -379,7 +441,7 @@ fn insert_branch<S: PageStore>(
     store: &mut S,
     page_id: u64,
     key: &[u8],
-    value: &[u8],
+    value: ValueRef<'_>,
     txn_id: u64,
     depth: usize,
     comparator: &KeyComparator,
@@ -823,7 +885,7 @@ pub(crate) fn bulk_load<S: PageStore>(
     bulk_load_with(store, entries, txn_id, &KeyComparator::lexicographic())
 }
 
-pub(crate) fn bulk_load_with<S: PageStore, K: AsRef<[u8]>, V: AsRef<[u8]>>(
+pub(crate) fn bulk_load_with<S: PageStore, K: AsRef<[u8]>, V: BulkValue>(
     store: &mut S,
     entries: &[(K, V)],
     txn_id: u64,
@@ -855,8 +917,9 @@ pub(crate) fn bulk_load_with<S: PageStore, K: AsRef<[u8]>, V: AsRef<[u8]>>(
             "key is {} bytes, maximum is {MAX_KEY_SIZE}",
             key.len()
         );
-        let value = value.as_ref();
-        let inline = SLOT_SIZE + key.len() + value.len() <= INLINE_BUDGET;
+        let value = value.value_ref();
+        let inline =
+            value.inline().is_some() && SLOT_SIZE + key.len() + value.len() <= INLINE_BUDGET;
         let value_len = if inline {
             value.len()
         } else {
@@ -882,10 +945,10 @@ pub(crate) fn bulk_load_with<S: PageStore, K: AsRef<[u8]>, V: AsRef<[u8]>>(
         }
 
         leaf_size += entry_size;
-        page_values.push(if inline {
-            LeafValue::Inline(value)
-        } else {
-            LeafValue::Overflow(make_overflow(store, value, txn_id)?)
+        page_values.push(match value {
+            ValueRef::Inline(bytes) if inline => LeafValue::Inline(bytes),
+            ValueRef::Inline(bytes) => LeafValue::Overflow(make_overflow(store, bytes, txn_id)?),
+            ValueRef::Overflow(reference) => LeafValue::Overflow(reference),
         });
     }
     flush_bulk_leaf(
@@ -967,7 +1030,7 @@ fn flush_leaf<S: PageStore>(
     Ok(())
 }
 
-fn flush_bulk_leaf<S: PageStore, K: AsRef<[u8]>, V: AsRef<[u8]>>(
+fn flush_bulk_leaf<S: PageStore, K: AsRef<[u8]>, V>(
     store: &mut S,
     entries: &[(K, V)],
     values: &[LeafValue<'_>],
@@ -1044,14 +1107,19 @@ fn allocate_branch<S: PageStore>(
 fn make_value<S: PageStore>(
     store: &mut S,
     key_len: usize,
-    value: &[u8],
+    value: ValueRef<'_>,
     txn_id: u64,
 ) -> Result<OwnedValue> {
-    if SLOT_SIZE + key_len + value.len() <= INLINE_BUDGET {
-        return Ok(OwnedValue::Inline(value.to_vec()));
+    match value {
+        ValueRef::Overflow(reference) => Ok(OwnedValue::Overflow(reference)),
+        ValueRef::Inline(bytes) => {
+            if SLOT_SIZE + key_len + bytes.len() <= INLINE_BUDGET {
+                Ok(OwnedValue::Inline(bytes.to_vec()))
+            } else {
+                Ok(OwnedValue::Overflow(make_overflow(store, bytes, txn_id)?))
+            }
+        }
     }
-
-    Ok(OwnedValue::Overflow(make_overflow(store, value, txn_id)?))
 }
 
 fn make_overflow<S: PageStore>(store: &mut S, value: &[u8], txn_id: u64) -> Result<OverflowRef> {

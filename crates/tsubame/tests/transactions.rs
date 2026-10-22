@@ -149,6 +149,72 @@ fn overflow_values_survive_reopen() -> Result<()> {
 }
 
 #[test]
+fn staged_large_values_are_readable_and_reused_in_one_transaction() -> Result<()> {
+    let dir = tempdir()?;
+    let first = vec![0x11; 16_000];
+    let second = vec![0x22; 20_000];
+    let env = options().open(dir.path())?;
+
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Bytes>(&mut wtxn, None)?;
+    db.put(&mut wtxn, "large", first.as_slice())?;
+    assert_eq!(db.get_rw(&wtxn, "large")?, Some(first.as_slice()));
+    let staged = db.iter_rw(&wtxn)?.next().transpose()?.unwrap();
+    assert_eq!(staged.1, first.as_slice());
+
+    db.put(&mut wtxn, "large", second.as_slice())?;
+    assert_eq!(db.get_rw(&wtxn, "large")?, Some(second.as_slice()));
+    wtxn.commit()?;
+
+    let base_pages = env.info().page_count;
+    let value = vec![0x33; 16_000];
+    let mut wtxn = env.write_txn()?;
+    let db = env.open_database::<Str, Bytes>(&env.read_txn()?, None)?;
+    for _ in 0..32 {
+        db.put(&mut wtxn, "large", value.as_slice())?;
+    }
+    wtxn.commit()?;
+    assert!(
+        env.info().page_count <= base_pages + 32,
+        "staged large values leaked pages: {base_pages} -> {}",
+        env.info().page_count
+    );
+
+    let rtxn = env.read_txn()?;
+    let db = env.open_database::<Str, Bytes>(&rtxn, None)?;
+    assert_eq!(db.get(&rtxn, "large")?, Some(value.as_slice()));
+
+    Ok(())
+}
+
+#[test]
+fn unordered_staged_large_overwrites_do_not_leak_pages() -> Result<()> {
+    let dir = tempdir()?;
+    let value = vec![0x44; 16_000];
+    let env = options().open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db = env.create_database::<Str, Bytes>(&mut wtxn, None)?;
+    wtxn.commit()?;
+    let before = env.info().page_count;
+
+    let mut wtxn = env.write_txn()?;
+    for _ in 0..1_100 {
+        db.put(&mut wtxn, "large", value.as_slice())?;
+    }
+    wtxn.commit()?;
+    assert!(
+        env.info().page_count <= before + 32,
+        "unordered staged overwrites leaked pages: {before} -> {}",
+        env.info().page_count
+    );
+
+    let rtxn = env.read_txn()?;
+    assert_eq!(db.get(&rtxn, "large")?, Some(value.as_slice()));
+
+    Ok(())
+}
+
+#[test]
 fn single_page_overflow_extents_can_be_replaced_and_deleted() -> Result<()> {
     let dir = tempdir()?;
     let first = vec![0x11; 2_000];
@@ -1025,6 +1091,36 @@ fn offline_compaction_clears_stale_reader_slots() -> Result<()> {
     let rtxn = env.read_txn()?;
     let db = env.open_database::<Str, Str>(&rtxn, None)?;
     assert_eq!(db.get(&rtxn, "key")?, Some("value"));
+
+    Ok(())
+}
+
+#[test]
+fn bulk_load_uses_staged_large_values() -> Result<()> {
+    let dir = tempdir()?;
+    let values: Vec<Vec<u8>> = (0..1_100u32)
+        .map(|i| vec![(i % 251) as u8; 2_000])
+        .collect();
+    {
+        let env = options().open(dir.path())?;
+        let mut wtxn = env.write_txn()?;
+        let db = env.create_database::<Str, Bytes>(&mut wtxn, None)?;
+        for (i, value) in values.iter().enumerate() {
+            db.put(&mut wtxn, &format!("key-{i:04}"), value.as_slice())?;
+        }
+        wtxn.commit()?;
+    }
+
+    let env = options().open(dir.path())?;
+    let rtxn = env.read_txn()?;
+    let db = env.open_database::<Str, Bytes>(&rtxn, None)?;
+    for (i, value) in values.iter().enumerate() {
+        assert_eq!(
+            db.get(&rtxn, &format!("key-{i:04}"))?,
+            Some(value.as_slice()),
+            "key {i}"
+        );
+    }
 
     Ok(())
 }

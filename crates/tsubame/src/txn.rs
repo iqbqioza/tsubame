@@ -14,13 +14,13 @@ use anyhow::{Context, Result, bail, ensure};
 use crate::comparator::KeyComparator;
 use crate::database::DatabaseKind;
 use crate::env::{Committed, Env, EnvInner, EnvState, FreeExtent};
-use crate::storage::btree;
 use crate::storage::btree::PageSource;
+use crate::storage::btree::{self, BulkValue, ValueRef};
 use crate::storage::commit::{self, CommitEntry, Descriptor};
 use crate::storage::meta::{self, InlineCommit, Meta};
 use crate::storage::overflow::{self, OverflowRef};
 use crate::storage::page;
-use crate::storage::page::Page;
+use crate::storage::page::{INLINE_BUDGET, Page};
 use crate::storage::store::PageStore;
 use crate::storage::{PAGE_SIZE, PageSet, io};
 
@@ -128,13 +128,19 @@ impl<'a> Iterator for PageOverlayIter<'a> {
 
 const INLINE_PENDING_VALUE: usize = 32;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 enum PendingValue {
     Inline {
         bytes: [u8; INLINE_PENDING_VALUE],
         len: u8,
     },
     Owned(Vec<u8>),
+    Mapped {
+        reference: OverflowRef,
+        state: Arc<EnvState>,
+        offset: usize,
+        len: usize,
+    },
 }
 
 impl PendingValue {
@@ -155,13 +161,25 @@ impl PendingValue {
         match self {
             Self::Inline { bytes, len } => &bytes[..*len as usize],
             Self::Owned(value) => value,
+            Self::Mapped {
+                state, offset, len, ..
+            } => &state.mmap[*offset..*offset + *len],
         }
     }
 }
 
-impl AsRef<[u8]> for PendingValue {
-    fn as_ref(&self) -> &[u8] {
-        self.as_slice()
+impl PendingValue {
+    fn is_mapped(&self) -> bool {
+        matches!(self, Self::Mapped { .. })
+    }
+}
+
+impl BulkValue for PendingValue {
+    fn value_ref(&self) -> ValueRef<'_> {
+        match self {
+            Self::Mapped { reference, .. } => ValueRef::Overflow(*reference),
+            _ => ValueRef::Inline(self.as_slice()),
+        }
     }
 }
 
@@ -235,6 +253,7 @@ const UNORDERED_PENDING_THRESHOLD: usize = 1024;
 
 struct UnorderedPending {
     entries: Vec<(PendingKey, Option<PendingValue>, usize)>,
+    mapped: BTreeMap<PendingKey, PendingValue>,
     materialized: OnceLock<BTreeMap<PendingKey, Option<PendingValue>>>,
 }
 
@@ -262,42 +281,76 @@ impl Pending {
         Self::Empty
     }
 
-    fn insert(&mut self, key: PendingKey, value: Option<PendingValue>) {
+    fn insert(&mut self, key: PendingKey, value: Option<PendingValue>) -> Option<PendingValue> {
         match std::mem::replace(self, Self::Empty) {
-            Self::Empty => *self = Self::One(key, value),
+            Self::Empty => {
+                *self = Self::One(key, value);
+                None
+            }
             Self::One(existing_key, existing_value) => {
                 if existing_key == key {
                     *self = Self::One(existing_key, value);
+                    existing_value
                 } else {
                     let mut map = BTreeMap::new();
                     map.insert(existing_key, existing_value);
                     map.insert(key, value);
                     *self = Self::Map(map);
+                    None
                 }
             }
             Self::Map(mut map) => {
-                map.insert(key, value);
+                let previous = map.insert(key, value).flatten();
                 if map.len() >= UNORDERED_PENDING_THRESHOLD {
-                    let entries = map
+                    let entries: Vec<_> = map
                         .into_iter()
                         .enumerate()
                         .map(|(sequence, (key, value))| (key, value, sequence))
                         .collect();
+                    let mapped = entries
+                        .iter()
+                        .filter_map(|(key, value, _)| match value {
+                            Some(value) if value.is_mapped() => Some((key.clone(), value.clone())),
+                            _ => None,
+                        })
+                        .collect();
                     *self = Self::Unordered(UnorderedPending {
                         entries,
+                        mapped,
                         materialized: OnceLock::new(),
                     });
                 } else {
                     *self = Self::Map(map);
                 }
+                previous
             }
             Self::Unordered(mut pending) => {
+                let previous = match value.as_ref() {
+                    Some(mapped @ PendingValue::Mapped { .. }) => {
+                        pending.mapped.insert(key.clone(), mapped.clone())
+                    }
+                    _ if !pending.mapped.is_empty() => pending.mapped.remove(&key),
+                    _ => None,
+                };
+                if let Some(PendingValue::Mapped { reference, .. }) = &previous
+                    && let Some(index) = pending.entries.iter().rposition(|(existing, value, _)| {
+                        existing == &key
+                            && matches!(
+                                value,
+                                Some(PendingValue::Mapped { reference: old, .. })
+                                    if old.start_page == reference.start_page
+                            )
+                    })
+                {
+                    pending.entries.remove(index);
+                }
                 let sequence = pending.entries.len();
                 if let Some(map) = pending.materialized.get_mut() {
                     map.insert(key.clone(), value.clone());
                 }
                 pending.entries.push((key, value, sequence));
                 *self = Self::Unordered(pending);
+                previous
             }
         }
     }
@@ -618,28 +671,85 @@ impl<'env> RwTxn<'env> {
         Arc::ptr_eq(&self.env.inner, env)
     }
 
-    pub(crate) fn put_raw(&mut self, kind: DatabaseKind, key: &[u8], value: &[u8]) {
-        let value = PendingValue::new(value);
+    pub(crate) fn put_raw(&mut self, kind: DatabaseKind, key: &[u8], value: &[u8]) -> Result<()> {
+        let value = if value.len() > INLINE_BUDGET && self.state.has_write_mmap() {
+            let pages = overflow::pages_for(value.len())?;
+            let start_page = self.allocate_pages(pages)?;
+            let reference = OverflowRef {
+                total_len: u32::try_from(value.len()).context("value is larger than 4 GiB")?,
+                start_page,
+                page_count: pages,
+            };
+            self.state
+                .write_overflow_direct(reference, value, self.txn_id)?;
+            self.direct_extent_pages.insert(start_page, pages);
+            let offset = usize::try_from(start_page - 2)
+                .context("page ID is too large")?
+                .checked_mul(PAGE_SIZE)
+                .and_then(|offset| offset.checked_add(overflow::EXTENT_HEADER_SIZE))
+                .context("overflow payload offset overflow")?;
+            PendingValue::Mapped {
+                reference,
+                state: Arc::clone(&self.state),
+                offset,
+                len: value.len(),
+            }
+        } else {
+            PendingValue::new(value)
+        };
         let key = PendingKey::new(key);
-        match kind {
+        let previous = match kind {
             DatabaseKind::Unnamed => self.unnamed_pending.insert(key, Some(value)),
             DatabaseKind::Named(name) => self
                 .named_pending
                 .entry(name)
                 .or_insert_with(Pending::new)
                 .insert(key, Some(value)),
-        }
+        };
+        self.release_pending_value(previous)
     }
 
-    pub(crate) fn delete_raw(&mut self, kind: DatabaseKind, key: &[u8]) {
+    pub(crate) fn delete_raw(&mut self, kind: DatabaseKind, key: &[u8]) -> Result<()> {
         let key = PendingKey::new(key);
-        match kind {
+        let previous = match kind {
             DatabaseKind::Unnamed => self.unnamed_pending.insert(key, None),
             DatabaseKind::Named(name) => self
                 .named_pending
                 .entry(name)
                 .or_insert_with(Pending::new)
                 .insert(key, None),
+        };
+        self.release_pending_value(previous)
+    }
+
+    fn release_pending_value(&mut self, value: Option<PendingValue>) -> Result<()> {
+        if let Some(PendingValue::Mapped { reference, .. }) = value
+            && self
+                .direct_extent_pages
+                .remove(&reference.start_page)
+                .is_some()
+        {
+            self.free_pages(reference.start_page, reference.page_count)?;
+        }
+        Ok(())
+    }
+
+    fn release_pending(&mut self, pending: Pending) -> Result<()> {
+        match pending {
+            Pending::Empty => Ok(()),
+            Pending::One(_, value) => self.release_pending_value(value),
+            Pending::Map(map) => {
+                for value in map.into_values() {
+                    self.release_pending_value(value)?;
+                }
+                Ok(())
+            }
+            Pending::Unordered(pending) => {
+                for (_, value, _) in pending.entries {
+                    self.release_pending_value(value)?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -650,7 +760,8 @@ impl<'env> RwTxn<'env> {
                 if root != 0 {
                     btree::free_tree(self, root)?;
                 }
-                self.unnamed_pending = Pending::new();
+                let pending = std::mem::replace(&mut self.unnamed_pending, Pending::new());
+                self.release_pending(pending)?;
                 self.root = Some(0);
             }
             DatabaseKind::Named(name) => {
@@ -660,7 +771,10 @@ impl<'env> RwTxn<'env> {
                 {
                     btree::free_tree(self, root)?;
                 }
-                self.named_pending.remove(&name);
+                let pending = self.named_pending.remove(&name);
+                if let Some(pending) = pending {
+                    self.release_pending(pending)?;
+                }
                 self.cleared_named.insert(name);
             }
         }
@@ -1073,11 +1187,11 @@ impl<'env> RwTxn<'env> {
         comparator: KeyComparator,
     ) -> Result<()> {
         *root = match value {
-            Some(value) => btree::insert_with(
+            Some(value) => btree::insert_value_with(
                 self,
                 *root,
                 key.as_slice(),
-                value.as_slice(),
+                value.value_ref(),
                 self.txn_id,
                 &comparator,
             )?,
