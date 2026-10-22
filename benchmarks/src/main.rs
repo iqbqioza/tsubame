@@ -47,12 +47,16 @@ type TsubameDb = tsubame::Database<TsubameU64<TsubameEndian>, TsubameStr>;
 type HeedDb = heed::Database<HeedU64<HeedEndian>, HeedStr>;
 type TsubameLargeDb = tsubame::Database<TsubameU64<TsubameEndian>, TsubameBytes>;
 type HeedLargeDb = heed::Database<HeedU64<HeedEndian>, HeedBytes>;
+type TsubamePrefixDb = tsubame::Database<TsubameStr, TsubameStr>;
+type HeedPrefixDb = heed::Database<HeedStr, HeedStr>;
 
 #[derive(Clone, Copy)]
 struct Report {
     insert: Duration,
     read: Duration,
     range: Duration,
+    reverse: Duration,
+    prefix: Duration,
     commit: Duration,
     delete: Duration,
     first_write: Duration,
@@ -119,6 +123,20 @@ fn main() -> Result<()> {
         "ns/op",
     );
     print_row(
+        "reverse scan",
+        tsubame.reverse,
+        heed.reverse,
+        config.entries,
+        "ns/op",
+    );
+    print_row(
+        "prefix scan",
+        tsubame.prefix,
+        heed.prefix,
+        config.entries / 10,
+        "ns/op",
+    );
+    print_row(
         "large insert (64 KiB)",
         tsubame.large_insert,
         heed.large_insert,
@@ -179,6 +197,8 @@ fn median_report(reports: &[Report]) -> Report {
         insert: median(reports.iter().map(|report| report.insert).collect()),
         read: median(reports.iter().map(|report| report.read).collect()),
         range: median(reports.iter().map(|report| report.range).collect()),
+        reverse: median(reports.iter().map(|report| report.reverse).collect()),
+        prefix: median(reports.iter().map(|report| report.prefix).collect()),
         commit: median(reports.iter().map(|report| report.commit).collect()),
         delete: median(reports.iter().map(|report| report.delete).collect()),
         first_write: median(reports.iter().map(|report| report.first_write).collect()),
@@ -228,6 +248,16 @@ fn run_tsubame() -> Result<Report> {
     black_box(scanned);
     let range = start.elapsed();
 
+    let start = Instant::now();
+    let mut scanned = 0u64;
+    for item in db.rev_iter(&rtxn)? {
+        let (key, value) = item?;
+        black_box((key, value));
+        scanned += 1;
+    }
+    black_box(scanned);
+    let reverse = start.elapsed();
+
     drop(rtxn);
     drop(db);
     drop(env);
@@ -243,6 +273,7 @@ fn run_tsubame() -> Result<Report> {
     drop(env);
 
     let (large_insert, large_read) = bench_tsubame_large()?;
+    let prefix = bench_tsubame_prefix()?;
     let commit = bench_tsubame_commit(dir.path(), &mut options)?;
     let delete = bench_tsubame_delete(dir.path(), &mut options)?;
     let first_write = bench_tsubame_startup(dir.path(), &mut options)?;
@@ -251,6 +282,8 @@ fn run_tsubame() -> Result<Report> {
         insert,
         read,
         range,
+        reverse,
+        prefix,
         commit,
         delete,
         first_write,
@@ -339,6 +372,16 @@ fn run_heed() -> Result<Report> {
     black_box(scanned);
     let range = start.elapsed();
 
+    let start = Instant::now();
+    let mut scanned = 0u64;
+    for item in db.rev_iter(&rtxn)? {
+        let (key, value) = item?;
+        black_box((key, value));
+        scanned += 1;
+    }
+    black_box(scanned);
+    let reverse = start.elapsed();
+
     drop(rtxn);
     drop(env);
 
@@ -360,6 +403,7 @@ fn run_heed() -> Result<Report> {
     drop(env);
 
     let (large_insert, large_read) = bench_heed_large()?;
+    let prefix = bench_heed_prefix()?;
     let commit = bench_heed_commit(dir.path())?;
     let delete = bench_heed_delete(dir.path())?;
     let first_write = bench_heed_startup(dir.path())?;
@@ -368,6 +412,8 @@ fn run_heed() -> Result<Report> {
         insert,
         read,
         range,
+        reverse,
+        prefix,
         commit,
         delete,
         first_write,
@@ -512,6 +558,54 @@ fn bench_heed_large() -> Result<(Duration, Duration)> {
     }
     let read = start.elapsed();
     Ok((insert, read))
+}
+
+fn bench_tsubame_prefix() -> Result<Duration> {
+    let dir = tempdir()?;
+    let mut options = TsubameOptions::new();
+    options.map_size(MAP_SIZE);
+    let env = options.open(dir.path())?;
+    let mut wtxn = env.write_txn()?;
+    let db: TsubamePrefixDb = env.create_database(&mut wtxn, None)?;
+    for i in 0..100_000u64 {
+        db.put(&mut wtxn, &format!("key-{i:06}"), &format!("value-{i:08}"))?;
+    }
+    wtxn.commit()?;
+    let rtxn = env.read_txn()?;
+    let start = Instant::now();
+    let mut count = 0u64;
+    for item in db.prefix_iter(&rtxn, "key-05")? {
+        black_box(item?);
+        count += 1;
+    }
+    black_box(count);
+    Ok(start.elapsed())
+}
+
+fn bench_heed_prefix() -> Result<Duration> {
+    let dir = tempdir()?;
+    // SAFETY: this benchmark owns the directory.
+    let env = unsafe {
+        HeedOptions::new()
+            .map_size(MAP_SIZE)
+            .max_dbs(1)
+            .open(dir.path())?
+    };
+    let mut wtxn = env.write_txn()?;
+    let db: HeedPrefixDb = env.create_database(&mut wtxn, None)?;
+    for i in 0..100_000u64 {
+        db.put(&mut wtxn, &format!("key-{i:06}"), &format!("value-{i:08}"))?;
+    }
+    wtxn.commit()?;
+    let rtxn = env.read_txn()?;
+    let start = Instant::now();
+    let mut count = 0u64;
+    for item in db.prefix_iter(&rtxn, "key-05")? {
+        black_box(item?);
+        count += 1;
+    }
+    black_box(count);
+    Ok(start.elapsed())
 }
 
 fn value(i: u64) -> String {
