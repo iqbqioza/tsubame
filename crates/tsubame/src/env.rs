@@ -436,6 +436,47 @@ impl Env {
         Ok(())
     }
 
+    /// Clears stale cross-process reader slots when this is the only open
+    /// environment.
+    ///
+    /// Returns the number of reader slots that held a value. If another
+    /// environment is open, no slots are cleared and zero is returned. This is
+    /// only available for writable environments opened with
+    /// [`EnvOpenOptions::multi_process`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a single-process or read-only environment, when a
+    /// write transaction is active, or when the registry cannot be accessed.
+    pub fn clear_stale_readers(&self) -> Result<usize> {
+        ensure!(
+            self.inner.multi_process,
+            "clear_stale_readers requires a writable multi-process environment"
+        );
+        let _gate = lock_open_gate(&self.inner.path)?;
+        let _writer = self
+            .inner
+            .writer
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("a write transaction is active"))?;
+
+        let mut cleared = 0usize;
+        for index in 0..READER_SLOTS {
+            if self
+                .inner
+                .reader_slots
+                .load(READER_SLOT_BASE + index, Ordering::Acquire)
+                != 0
+            {
+                cleared += 1;
+            }
+        }
+        if !self.inner.reset_registry_if_solo()? {
+            return Ok(0);
+        }
+        Ok(cleared)
+    }
+
     /// Compacts the environment at `path` into a fresh data file.
     ///
     /// The environment must be closed; if it is open, this returns an error.
@@ -502,7 +543,7 @@ impl Env {
             .try_lock()
             .map_err(|_| anyhow::anyhow!("a write transaction is active"))?;
         if self.inner.multi_process {
-            self.inner.reset_registry_if_solo()?;
+            let _ = self.inner.reset_registry_if_solo()?;
         }
         let state = self.inner.read_state();
         let map_size = state.map_size;
@@ -1485,9 +1526,8 @@ impl EnvInner {
         Ok(oldest)
     }
 
-    pub(crate) fn reset_registry_if_solo(&self) -> Result<()> {
-        reset_registry_if_solo(&self._lock, &self.reader_slots, 1)?;
-        Ok(())
+    pub(crate) fn reset_registry_if_solo(&self) -> Result<bool> {
+        reset_registry_if_solo(&self._lock, &self.reader_slots, 1)
     }
 
     pub(crate) fn reserve_external_reader(&self) -> Result<u64> {
@@ -2587,6 +2627,28 @@ mod tests {
         assert!(!options.multi_process);
         assert!(options.comparator.is_lexicographic());
         assert!(options.comparator_id.is_none());
+    }
+
+    #[test]
+    fn clear_stale_readers_clears_slots_when_solo() -> Result<()> {
+        let dir = tempdir()?;
+        let mut options = options();
+        options.multi_process(true);
+        let env = options.open(dir.path())?;
+        env.inner
+            .reader_slots
+            .store(READER_SLOT_BASE, 42, Ordering::Release);
+
+        assert_eq!(env.clear_stale_readers()?, 1);
+        assert_eq!(
+            env.inner
+                .reader_slots
+                .load(READER_SLOT_BASE, Ordering::Acquire),
+            0
+        );
+        assert_eq!(env.clear_stale_readers()?, 0);
+
+        Ok(())
     }
 
     #[test]
