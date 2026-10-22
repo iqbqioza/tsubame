@@ -788,10 +788,15 @@ pub type RwRevRange<'txn, 'env, KC, DC> = RwRevIter<'txn, 'env, KC, DC>;
 /// A reverse prefix iterator over a write transaction.
 pub type RwRevPrefix<'txn, 'env, KC, DC> = RwRevIter<'txn, 'env, KC, DC>;
 
+enum RangeEnd {
+    Bound(Bound<Vec<u8>>),
+    Prefix(Vec<u8>),
+}
+
 /// A forward range iterator.
 pub struct RoRange<'txn, 'env, KC, DC> {
     cursor: Cursor<'txn, RoTxn<'env>>,
-    end: Bound<Vec<u8>>,
+    end: RangeEnd,
     done: bool,
     _codecs: PhantomData<(KC, DC)>,
 }
@@ -817,7 +822,18 @@ impl<'txn, 'env, KC, DC> RoRange<'txn, 'env, KC, DC> {
 
         Ok(Self {
             cursor,
-            end,
+            end: RangeEnd::Bound(end),
+            done: false,
+            _codecs: PhantomData,
+        })
+    }
+
+    pub(crate) fn prefix(source: &'txn RoTxn<'env>, root: u64, prefix: Vec<u8>) -> Result<Self> {
+        let mut cursor = Cursor::new(source);
+        cursor.seek_forward(root, &prefix)?;
+        Ok(Self {
+            cursor,
+            end: RangeEnd::Prefix(prefix),
             done: false,
             _codecs: PhantomData,
         })
@@ -825,9 +841,14 @@ impl<'txn, 'env, KC, DC> RoRange<'txn, 'env, KC, DC> {
 
     fn past_end(&self, key: &[u8]) -> bool {
         match &self.end {
-            Bound::Unbounded => false,
-            Bound::Included(end) => self.cursor.comparator().compare(key, end) == Ordering::Greater,
-            Bound::Excluded(end) => self.cursor.comparator().compare(key, end) != Ordering::Less,
+            RangeEnd::Bound(Bound::Unbounded) => false,
+            RangeEnd::Bound(Bound::Included(end)) => {
+                self.cursor.comparator().compare(key, end) == Ordering::Greater
+            }
+            RangeEnd::Bound(Bound::Excluded(end)) => {
+                self.cursor.comparator().compare(key, end) != Ordering::Less
+            }
+            RangeEnd::Prefix(prefix) => !key.starts_with(prefix),
         }
     }
 }

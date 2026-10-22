@@ -118,6 +118,22 @@ fn main() -> Result<()> {
                 );
                 return Ok(());
             }
+            "tsubame-prefix" => {
+                let duration = bench_tsubame_prefix()?;
+                println!(
+                    "tsubame prefix: {:.2} ns/op",
+                    duration.as_secs_f64() * 1_000_000_000.0 / (config().entries / 10) as f64
+                );
+                return Ok(());
+            }
+            "heed-prefix" => {
+                let duration = bench_heed_prefix()?;
+                println!(
+                    "heed prefix: {:.2} ns/op",
+                    duration.as_secs_f64() * 1_000_000_000.0 / (config().entries / 10) as f64
+                );
+                return Ok(());
+            }
             _ => {}
         }
     }
