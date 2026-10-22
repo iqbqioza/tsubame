@@ -1126,7 +1126,11 @@ impl<'env> RwTxn<'env> {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             new_meta.encode_into(&mut page);
-            meta::write_slot_page(data, slot as usize, &page)?;
+            if !self.state.write_meta_direct(slot as usize, &page)? {
+                meta::write_slot_page(data, slot as usize, &page)?;
+            }
+            #[cfg(windows)]
+            self.state.flush_meta_page(slot as usize)?;
         }
         data.sync_data().context("failed to sync the commit")?;
 

@@ -371,6 +371,11 @@ impl Env {
                         })?,
                 )
             };
+            let new_meta_mmap = Some(
+                mmap::map_data_mut(&new_file, 0, 2 * PAGE_SIZE).with_context(|| {
+                    format!("failed to map meta pages of `{}`", temp_data.display())
+                })?,
+            );
 
             let candidates = meta::load_all(&new_file, &temp_data)?;
             let mut chosen = None;
@@ -401,6 +406,7 @@ impl Env {
                 map_size,
                 generation,
                 new_write_mmap,
+                new_meta_mmap,
             ));
             let replacement = Committed {
                 meta: chosen.meta,
@@ -670,6 +676,7 @@ pub(crate) struct EnvState {
     pub(crate) map_size: usize,
     pub(crate) generation: u64,
     write_mmap: Option<Mutex<MmapMut>>,
+    meta_mmap: Option<Mutex<MmapMut>>,
     verified: Vec<AtomicU64>,
 }
 
@@ -680,6 +687,7 @@ impl EnvState {
         map_size: usize,
         generation: u64,
         write_mmap: Option<MmapMut>,
+        meta_mmap: Option<MmapMut>,
     ) -> Self {
         let verified_words = (map_size / PAGE_SIZE).div_ceil(64);
         let verified = (0..verified_words).map(|_| AtomicU64::new(0)).collect();
@@ -689,8 +697,55 @@ impl EnvState {
             map_size,
             generation,
             write_mmap: write_mmap.map(Mutex::new),
+            meta_mmap: meta_mmap.map(Mutex::new),
             verified,
         }
+    }
+
+    /// Copies a meta page into the writable mapping.
+    ///
+    /// Returns `false` when this environment has no writable mapping.
+    pub(crate) fn write_meta_direct(&self, slot: usize, page: &[u8; PAGE_SIZE]) -> Result<bool> {
+        let Some(meta_mmap) = &self.meta_mmap else {
+            return Ok(false);
+        };
+        ensure!(slot < 2, "invalid meta slot {slot}");
+        let mut mapping = meta_mmap
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let start = slot
+            .checked_mul(PAGE_SIZE)
+            .context("meta slot offset overflow")?;
+        let end = start
+            .checked_add(PAGE_SIZE)
+            .context("meta slot offset overflow")?;
+        ensure!(
+            end <= mapping.len(),
+            "meta slot is outside the writable mapping"
+        );
+        mapping[start..end].copy_from_slice(page);
+        Ok(true)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn flush_meta_page(&self, slot: usize) -> Result<()> {
+        let Some(meta_mmap) = &self.meta_mmap else {
+            return Ok(());
+        };
+        let mapping = meta_mmap
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let start = slot
+            .checked_mul(PAGE_SIZE)
+            .context("meta slot offset overflow")?;
+        ensure!(
+            start + PAGE_SIZE <= mapping.len(),
+            "meta slot is outside the mapping"
+        );
+        mapping
+            .flush_range(start, PAGE_SIZE)
+            .with_context(|| format!("failed to flush meta slot {slot}"))?;
+        Ok(())
     }
 
     /// Copies a page into the writable mapping.
@@ -1241,7 +1296,7 @@ impl EnvInner {
             meta: chosen.meta,
             slot: chosen.slot,
         };
-        let new_state = Arc::new(EnvState::new(data, mmap, map_size, generation, None));
+        let new_state = Arc::new(EnvState::new(data, mmap, map_size, generation, None, None));
         {
             let mut state = self
                 .state
@@ -1782,6 +1837,15 @@ impl EnvOpenOptions {
                 })?,
             )
         };
+        let meta_mmap = if self.read_only {
+            None
+        } else {
+            Some(
+                mmap::map_data_mut(&data, 0, 2 * PAGE_SIZE).with_context(|| {
+                    format!("failed to map meta pages of `{}`", data_path.display())
+                })?,
+            )
+        };
         debug_assert!(mmap.len() >= mapped_len.max(1));
 
         let mut chosen = None;
@@ -1826,7 +1890,7 @@ impl EnvOpenOptions {
         reader_slots.fetch_add(ENV_COUNT_INDEX, 1, Ordering::AcqRel);
 
         let generation = reader_slots.load(GENERATION_INDEX, Ordering::Acquire);
-        let state = EnvState::new(data, mmap, map_size, generation, write_mmap);
+        let state = EnvState::new(data, mmap, map_size, generation, write_mmap, meta_mmap);
         let inner = EnvInner {
             path: path.to_path_buf(),
             max_dbs: self.max_dbs,
