@@ -18,6 +18,7 @@ use crate::iter::{
     RoIter, RoPrefix, RoRange, RoRevIter, RoRevPrefix, RoRevRange, RwIter, RwPrefix, RwRange,
     RwRevIter, RwRevPrefix, RwRevRange, prefix_successor,
 };
+use crate::storage::PAGE_SIZE;
 use crate::storage::btree;
 use crate::storage::page::MAX_KEY_SIZE;
 use crate::traits::{BoxedError, BytesDecode, BytesEncode};
@@ -35,6 +36,23 @@ pub(crate) enum DatabaseKind {
     Unnamed,
     /// A named database whose root lives in the catalog.
     Named(Arc<str>),
+}
+
+/// Structural statistics for one database tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatabaseStat {
+    /// Page size in bytes.
+    pub page_size: usize,
+    /// Maximum B+tree depth, or zero for an empty database.
+    pub depth: usize,
+    /// Number of branch pages.
+    pub branch_pages: u64,
+    /// Number of leaf pages.
+    pub leaf_pages: u64,
+    /// Number of pages occupied by overflow extents.
+    pub overflow_pages: u64,
+    /// Number of key/value entries.
+    pub entries: u64,
 }
 
 /// A typed database.
@@ -207,6 +225,28 @@ impl<KC, DC> Database<KC, DC> {
         self.rev_range(txn, Bound::Unbounded, Bound::Included(key))?
             .next()
             .transpose()
+    }
+
+    /// Returns structural statistics for this database.
+    ///
+    /// The tree is walked to compute depth and page counts; this method is
+    /// intended for diagnostics rather than hot paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be resolved or a page cannot be
+    /// traversed.
+    pub fn stat(&self, txn: &RoTxn<'_>) -> Result<DatabaseStat> {
+        let root = self.resolve_root(txn)?;
+        let stat = btree::stat(txn, root)?;
+        Ok(DatabaseStat {
+            page_size: PAGE_SIZE,
+            depth: stat.depth,
+            branch_pages: stat.branch_pages,
+            leaf_pages: stat.leaf_pages,
+            overflow_pages: stat.overflow_pages,
+            entries: stat.entries,
+        })
     }
 
     /// Returns the first entry in ascending key order.
