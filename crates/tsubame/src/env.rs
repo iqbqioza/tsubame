@@ -2193,6 +2193,13 @@ impl EnvOpenOptions {
         reader_slots.fetch_add(ENV_COUNT_INDEX, 1, Ordering::AcqRel);
 
         let generation = reader_slots.load(GENERATION_INDEX, Ordering::Acquire);
+        let (initial_free, free_pool_ready) = if self.read_only {
+            (Vec::new(), false)
+        } else if let Some(free) = read_free_cache(path, meta.txn_id, meta.page_count) {
+            (free, true)
+        } else {
+            (Vec::new(), false)
+        };
         let state = EnvState::new(data, mmap, map_size, generation, write_mmap, meta_mmap);
         let inner = EnvInner {
             path: path.to_path_buf(),
@@ -2209,8 +2216,8 @@ impl EnvOpenOptions {
             }),
             writer: Mutex::new(()),
             readers: Mutex::new(BTreeMap::new()),
-            free_pool: Mutex::new(Vec::new()),
-            free_pool_ready: AtomicBool::new(false),
+            free_pool: Mutex::new(initial_free),
+            free_pool_ready: AtomicBool::new(free_pool_ready),
             reader_slots,
             meta_buffer: Mutex::new([0u8; PAGE_SIZE]),
             poisoned: AtomicBool::new(false),

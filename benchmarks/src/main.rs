@@ -5,13 +5,15 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use heed::EnvOpenOptions as HeedOptions;
 use heed::byteorder::NativeEndian as HeedEndian;
-use heed::types::{Str as HeedStr, U64 as HeedU64};
+use heed::types::{Bytes as HeedBytes, Str as HeedStr, U64 as HeedU64};
 use tempfile::tempdir;
 use tsubame::EnvOpenOptions as TsubameOptions;
 use tsubame::byteorder::NativeEndian as TsubameEndian;
-use tsubame::types::{Str as TsubameStr, U64 as TsubameU64};
+use tsubame::types::{Bytes as TsubameBytes, Str as TsubameStr, U64 as TsubameU64};
 
 const MAP_SIZE: usize = 1024 * 1024 * 1024;
+const LARGE_ENTRIES: u64 = 1_000;
+const LARGE_VALUE_LEN: usize = 64 * 1024;
 
 struct Config {
     entries: u64,
@@ -39,6 +41,8 @@ fn env_u64(name: &str, default: u64) -> u64 {
 
 type TsubameDb = tsubame::Database<TsubameU64<TsubameEndian>, TsubameStr>;
 type HeedDb = heed::Database<HeedU64<HeedEndian>, HeedStr>;
+type TsubameLargeDb = tsubame::Database<TsubameU64<TsubameEndian>, TsubameBytes>;
+type HeedLargeDb = heed::Database<HeedU64<HeedEndian>, HeedBytes>;
 
 struct Report {
     insert: Duration,
@@ -46,6 +50,9 @@ struct Report {
     range: Duration,
     commit: Duration,
     delete: Duration,
+    first_write: Duration,
+    large_insert: Duration,
+    large_read: Duration,
     reopen: Duration,
 }
 
@@ -101,6 +108,20 @@ fn main() -> Result<()> {
         "ns/op",
     );
     print_row(
+        "large insert (64 KiB)",
+        tsubame.large_insert,
+        heed.large_insert,
+        1,
+        "ms",
+    );
+    print_row(
+        "large reads (64 KiB)",
+        tsubame.large_read,
+        heed.large_read,
+        LARGE_ENTRIES,
+        "ns/op",
+    );
+    print_row(
         "durable commit",
         tsubame.commit,
         heed.commit,
@@ -109,6 +130,13 @@ fn main() -> Result<()> {
     );
     print_row("bulk delete (1 txn)", tsubame.delete, heed.delete, 1, "ms");
     print_row("reopen", tsubame.reopen, heed.reopen, 1, "ms");
+    print_row(
+        "first write after reopen",
+        tsubame.first_write,
+        heed.first_write,
+        1,
+        "us/op",
+    );
 
     Ok(())
 }
@@ -182,9 +210,14 @@ fn run_tsubame() -> Result<Report> {
     let db: TsubameDb = env.open_database(&rtxn, None)?;
     assert_eq!(db.get(&rtxn, &0)?, Some(values[0].as_str()));
     drop(rtxn);
+    let start = Instant::now();
+    let first_write_txn = env.write_txn()?;
+    let first_write = start.elapsed();
+    first_write_txn.abort()?;
     drop(db);
     drop(env);
 
+    let (large_insert, large_read) = bench_tsubame_large()?;
     let commit = bench_tsubame_commit(dir.path(), &mut options)?;
     let delete = bench_tsubame_delete(dir.path(), &mut options)?;
 
@@ -194,6 +227,9 @@ fn run_tsubame() -> Result<Report> {
         range,
         commit,
         delete,
+        first_write,
+        large_insert,
+        large_read,
         reopen,
     })
 }
@@ -293,8 +329,13 @@ fn run_heed() -> Result<Report> {
         .context("unnamed database is missing")?;
     assert_eq!(db.get(&rtxn, &0)?, Some(values[0].as_str()));
     drop(rtxn);
+    let start = Instant::now();
+    let first_write_txn = env.write_txn()?;
+    let first_write = start.elapsed();
+    first_write_txn.abort();
     drop(env);
 
+    let (large_insert, large_read) = bench_heed_large()?;
     let commit = bench_heed_commit(dir.path())?;
     let delete = bench_heed_delete(dir.path())?;
 
@@ -304,6 +345,9 @@ fn run_heed() -> Result<Report> {
         range,
         commit,
         delete,
+        first_write,
+        large_insert,
+        large_read,
         reopen,
     })
 }
@@ -353,6 +397,58 @@ fn bench_heed_delete(path: &std::path::Path) -> Result<Duration> {
     }
     wtxn.commit()?;
     Ok(start.elapsed())
+}
+
+fn bench_tsubame_large() -> Result<(Duration, Duration)> {
+    let dir = tempdir()?;
+    let mut options = TsubameOptions::new();
+    options.map_size(MAP_SIZE);
+    let env = options.open(dir.path())?;
+    let value = vec![0x5au8; LARGE_VALUE_LEN];
+    let mut wtxn = env.write_txn()?;
+    let db: TsubameLargeDb = env.create_database(&mut wtxn, None)?;
+    let start = Instant::now();
+    for i in 0..LARGE_ENTRIES {
+        db.put(&mut wtxn, &i, value.as_slice())?;
+    }
+    wtxn.commit()?;
+    let insert = start.elapsed();
+
+    let rtxn = env.read_txn()?;
+    let start = Instant::now();
+    for i in 0..LARGE_ENTRIES {
+        black_box(db.get(&rtxn, &i)?);
+    }
+    let read = start.elapsed();
+    Ok((insert, read))
+}
+
+fn bench_heed_large() -> Result<(Duration, Duration)> {
+    let dir = tempdir()?;
+    // SAFETY: this benchmark owns the directory.
+    let env = unsafe {
+        HeedOptions::new()
+            .map_size(MAP_SIZE)
+            .max_dbs(1)
+            .open(dir.path())?
+    };
+    let value = vec![0x5au8; LARGE_VALUE_LEN];
+    let mut wtxn = env.write_txn()?;
+    let db: HeedLargeDb = env.create_database(&mut wtxn, None)?;
+    let start = Instant::now();
+    for i in 0..LARGE_ENTRIES {
+        db.put(&mut wtxn, &i, value.as_slice())?;
+    }
+    wtxn.commit()?;
+    let insert = start.elapsed();
+
+    let rtxn = env.read_txn()?;
+    let start = Instant::now();
+    for i in 0..LARGE_ENTRIES {
+        black_box(db.get(&rtxn, &i)?);
+    }
+    let read = start.elapsed();
+    Ok((insert, read))
 }
 
 fn value(i: u64) -> String {
