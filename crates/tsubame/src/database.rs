@@ -7,7 +7,7 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::marker::PhantomData;
-use std::ops::Bound;
+use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
 use anyhow::{Context, ensure};
@@ -834,6 +834,71 @@ impl<KC, DC> Database<KC, DC> {
             );
             txn.delete_raw(self.kind.clone(), key.as_slice())?;
             Ok(())
+        })();
+
+        if result.is_err() {
+            txn.mark_failed();
+        }
+        result
+    }
+
+    /// Deletes every entry whose key falls inside `range` and returns how many
+    /// entries were removed.
+    ///
+    /// Staged puts and deletes are taken into account, so the count matches
+    /// the transaction's visible view of the database. A full range is
+    /// implemented as [`Database::clear`] after counting the visible entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a bound cannot be encoded, or if the range cannot
+    /// be traversed or staged. A failed delete marks the transaction as
+    /// failed; it can only be aborted.
+    pub fn delete_range<'a, 'txn, 'env, R>(
+        &self,
+        txn: &'txn mut RwTxn<'env>,
+        range: &'a R,
+    ) -> Result<usize>
+    where
+        KC: BytesEncode<'a>,
+        R: RangeBounds<KC::EItem>,
+    {
+        ensure!(
+            txn.belongs_to(&self.env),
+            "transaction belongs to a different environment"
+        );
+
+        let result = (|| -> Result<usize> {
+            let start = encode_bound::<KC>(range.start_bound())?;
+            let end = encode_bound::<KC>(range.end_bound())?;
+            let full = matches!(&start, Bound::Unbounded) && matches!(&end, Bound::Unbounded);
+            let root = txn.read_root(&self.kind)?;
+            let comparator = txn.comparator();
+            let pending = txn.pending_for(&self.kind, comparator);
+            let mut iter = RwIter::<KC, DC>::range(txn, root, pending, start, end)?;
+
+            let mut keys = Vec::new();
+            let mut count = 0usize;
+            while let Some(key) = iter.next_key() {
+                let key = key?;
+                count = count
+                    .checked_add(1)
+                    .context("delete range count overflow")?;
+                if !full {
+                    keys.push(key.to_vec());
+                }
+            }
+            drop(iter);
+
+            if full {
+                txn.clear_raw(self.kind.clone())?;
+            } else {
+                for key in &keys {
+                    txn.delete_raw(self.kind.clone(), key)?;
+                }
+            }
+
+            Ok(count)
         })();
 
         if result.is_err() {
