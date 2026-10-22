@@ -912,6 +912,13 @@ fn prefix_iteration_filters_keys() -> Result<()> {
     }
     assert_eq!(seen, ["ac", "ab", "aa", "a"]);
 
+    let all = db
+        .prefix_iter(&rtxn, "")?
+        .map(|item| item.map(|(key, _)| key.to_owned()))
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(all, ["a", "aa", "ab", "ac", "b", "ba"]);
+    assert_eq!(db.prefix_iter(&rtxn, "z")?.count(), 0);
+
     Ok(())
 }
 

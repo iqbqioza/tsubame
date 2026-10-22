@@ -772,13 +772,10 @@ impl<KC, DC> Database<KC, DC> {
             "prefix iteration requires a lexicographic comparator"
         );
         let root = self.resolve_root(txn)?;
-        let start = KC::bytes_encode(prefix)
+        let prefix = KC::bytes_encode(prefix)
             .map_err(|error| codec_error("prefix encoding failed", error))?
             .into_owned();
-        let end = prefix_successor(&start)
-            .map(Bound::Excluded)
-            .unwrap_or(Bound::Unbounded);
-        RoRange::new(txn, root, Bound::Included(start), end)
+        RoRange::prefix(txn, root, prefix)
     }
 
     /// Returns a reverse iterator over all keys with the given prefix.

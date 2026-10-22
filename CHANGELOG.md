@@ -145,6 +145,8 @@ All notable changes to this project are documented here.
   full-value copy as well as a temporary encoding buffer. Verified overflow
   extents return their payload without re-reading extent headers, so large-value
   point reads avoid repeated header validation.
+- Forward prefix iteration stops on a prefix mismatch instead of materializing
+  a successor key and comparing a full range bound for every entry.
 - Ordered iteration keeps the current leaf page in the cursor instead of looking
   it up again for every entry. Range, prefix, and reverse scans avoid one page
   lookup per key.
