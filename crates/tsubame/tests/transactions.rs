@@ -1255,6 +1255,32 @@ fn online_compaction_preserves_custom_comparator() -> Result<()> {
 }
 
 #[test]
+fn multi_process_writer_clears_stale_registry_state() -> Result<()> {
+    let dir = tempdir()?;
+    {
+        let env = options().open(dir.path())?;
+        let mut wtxn = env.write_txn()?;
+        let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+        db.put(&mut wtxn, "key", "value")?;
+        wtxn.commit()?;
+    }
+
+    let registry = dir.path().join("readers.tsubame");
+    let stale = vec![0xff; std::fs::read(&registry)?.len()];
+    std::fs::write(&registry, stale)?;
+
+    let mut writer_options = options();
+    writer_options.multi_process(true);
+    let writer = writer_options.open(dir.path())?;
+    writer.compact_online()?;
+    let rtxn = writer.read_txn()?;
+    let db = writer.open_database::<Str, Str>(&rtxn, None)?;
+    assert_eq!(db.get(&rtxn, "key")?, Some("value"));
+
+    Ok(())
+}
+
+#[test]
 fn multi_process_online_compaction_requires_readers_closed() -> Result<()> {
     let dir = tempdir()?;
     let mut writer_options = options();

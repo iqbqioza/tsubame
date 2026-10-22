@@ -311,6 +311,7 @@ impl Env {
             .try_lock()
             .map_err(|_| anyhow::anyhow!("a write transaction is active"))?;
         if self.inner.multi_process {
+            self.inner.reset_registry_if_solo()?;
             ensure!(
                 self.inner
                     .reader_slots
@@ -907,6 +908,11 @@ impl EnvInner {
             }
         }
         Ok(oldest)
+    }
+
+    pub(crate) fn reset_registry_if_solo(&self) -> Result<()> {
+        reset_registry_if_solo(&self._lock, &self.reader_slots, 1)?;
+        Ok(())
     }
 
     pub(crate) fn reserve_external_reader(&self) -> Result<u64> {
@@ -1527,6 +1533,9 @@ impl EnvOpenOptions {
             write_comparator_id(path, &comparator_id)?;
         }
 
+        if self.multi_process && !self.read_only {
+            reset_registry_if_solo(&lock, &reader_slots, 0)?;
+        }
         reader_slots.fetch_add(ENV_COUNT_INDEX, 1, Ordering::AcqRel);
 
         let state = EnvState::new(data, mmap, map_size);
@@ -1578,6 +1587,34 @@ fn lock_open_gate(path: &Path) -> Result<File> {
     fs4::FileExt::lock(&gate)
         .with_context(|| format!("failed to lock `{}`", gate_path.display()))?;
     Ok(gate)
+}
+
+/// Resets reader registry state when this environment has the only lifecycle
+/// lock. The caller must hold the environment-open gate exclusively; Releasing
+/// the shared lifecycle lock then attempting an exclusive lock distinguishes a
+/// live read-only process from stale state left by a crash.
+fn reset_registry_if_solo(lock: &File, slots: &mmap::AtomicSlots, env_count: u64) -> Result<bool> {
+    fs4::FileExt::unlock(lock).context("failed to release the lifecycle lock")?;
+    match fs4::FileExt::try_lock(lock) {
+        Ok(()) => {
+            slots.store(ENV_COUNT_INDEX, 0, Ordering::Release);
+            slots.store(READER_COUNT_INDEX, 0, Ordering::Release);
+            for index in 0..READER_SLOTS {
+                slots.store(READER_SLOT_BASE + index, 0, Ordering::Release);
+            }
+            slots.store(ENV_COUNT_INDEX, env_count, Ordering::Release);
+            fs4::FileExt::lock_shared(lock).context("failed to restore the lifecycle lock")?;
+            Ok(true)
+        }
+        Err(TryLockError::WouldBlock) => {
+            fs4::FileExt::lock_shared(lock).context("failed to restore the lifecycle lock")?;
+            Ok(false)
+        }
+        Err(TryLockError::Error(error)) => {
+            let _ = fs4::FileExt::lock_shared(lock);
+            Err(error).context("failed to test the lifecycle lock")
+        }
+    }
 }
 
 /// Opens or creates the shared reader registry used for cross-process reuse.
