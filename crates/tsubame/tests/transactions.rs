@@ -1381,6 +1381,204 @@ fn bulk_mixed_updates_and_deletes_preserve_the_tree() -> Result<()> {
 }
 
 #[test]
+fn bulk_apply_rewrites_mixed_batches_and_overflow_values() -> Result<()> {
+    const ENTRIES: u32 = 12_000;
+    const UPDATES: u32 = 9_000;
+    const NEW_ENTRIES: u32 = 500;
+    let large = "x".repeat(10_000);
+    let updated_large = "y".repeat(10_000);
+    let dir = tempdir()?;
+    {
+        let env = options().open(dir.path())?;
+        let mut wtxn = env.write_txn()?;
+        let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+        for i in 0..ENTRIES {
+            if i % 1_000 == 0 {
+                db.put(&mut wtxn, &format!("key-{i:05}"), large.as_str())?;
+            } else {
+                db.put(&mut wtxn, &format!("key-{i:05}"), &format!("value-{i:05}"))?;
+            }
+        }
+        wtxn.commit()?;
+
+        let mut wtxn = env.write_txn()?;
+        for i in 0..UPDATES {
+            if i % 1_000 == 0 {
+                db.put(&mut wtxn, &format!("key-{i:05}"), updated_large.as_str())?;
+            } else {
+                db.put(
+                    &mut wtxn,
+                    &format!("key-{i:05}"),
+                    &format!("updated-{i:05}"),
+                )?;
+            }
+        }
+        for i in UPDATES..ENTRIES {
+            db.delete(&mut wtxn, &format!("key-{i:05}"))?;
+        }
+        for i in 0..NEW_ENTRIES {
+            db.put(
+                &mut wtxn,
+                &format!("new-{i:05}"),
+                &format!("new-value-{i:05}"),
+            )?;
+        }
+        wtxn.commit()?;
+    }
+
+    let env = options().open(dir.path())?;
+    let rtxn = env.read_txn()?;
+    let db = env.open_database::<Str, Str>(&rtxn, None)?;
+    assert_eq!(db.len(&rtxn)?, u64::from(UPDATES + NEW_ENTRIES));
+    for i in 0..UPDATES {
+        let key = format!("key-{i:05}");
+        if i % 1_000 == 0 {
+            assert_eq!(
+                db.get(&rtxn, &key)?,
+                Some(updated_large.as_str()),
+                "key {key}"
+            );
+        } else {
+            assert_eq!(
+                db.get(&rtxn, &key)?,
+                Some(format!("updated-{i:05}").as_str()),
+                "key {key}"
+            );
+        }
+    }
+    for i in UPDATES..ENTRIES {
+        assert_eq!(
+            db.get(&rtxn, &format!("key-{i:05}"))?,
+            None,
+            "deleted key {i}"
+        );
+    }
+    for i in 0..NEW_ENTRIES {
+        assert_eq!(
+            db.get(&rtxn, &format!("new-{i:05}"))?,
+            Some(format!("new-value-{i:05}").as_str()),
+            "new key {i}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn bulk_apply_respects_a_custom_comparator() -> Result<()> {
+    const ENTRIES: u32 = 10_000;
+    let dir = tempdir()?;
+    let mut options = options();
+    options
+        .comparator(KeyComparator::custom(reverse_bytes))
+        .comparator_id("reverse-v1");
+    {
+        let env = options.open(dir.path())?;
+        let mut wtxn = env.write_txn()?;
+        let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+        for i in 0..ENTRIES {
+            db.put(&mut wtxn, &format!("key-{i:05}"), &format!("value-{i:05}"))?;
+        }
+        wtxn.commit()?;
+
+        let mut wtxn = env.write_txn()?;
+        for i in 0..9_000u32 {
+            db.put(
+                &mut wtxn,
+                &format!("key-{i:05}"),
+                &format!("updated-{i:05}"),
+            )?;
+        }
+        for i in 8_000..ENTRIES {
+            db.delete(&mut wtxn, &format!("key-{i:05}"))?;
+        }
+        wtxn.commit()?;
+    }
+
+    let env = options.open(dir.path())?;
+    let rtxn = env.read_txn()?;
+    let db = env.open_database::<Str, Str>(&rtxn, None)?;
+    assert_eq!(db.len(&rtxn)?, 8_000);
+    for i in 0..8_000u32 {
+        assert_eq!(
+            db.get(&rtxn, &format!("key-{i:05}"))?,
+            Some(format!("updated-{i:05}").as_str()),
+            "key {i}"
+        );
+    }
+    for i in 8_000..ENTRIES {
+        assert_eq!(db.get(&rtxn, &format!("key-{i:05}"))?, None, "key {i}");
+    }
+    let keys: Vec<_> = db
+        .iter(&rtxn)?
+        .map(|item| item.map(|(key, _)| key))
+        .collect::<Result<_>>()?;
+    assert_eq!(keys.first().copied(), Some("key-07999"));
+    assert_eq!(keys.last().copied(), Some("key-00000"));
+
+    Ok(())
+}
+
+#[test]
+fn bulk_apply_handles_large_insert_only_batches() -> Result<()> {
+    const ENTRIES: u32 = 10_000;
+    const INSERTS: u32 = 9_000;
+    const UPDATES: u32 = 500;
+    let dir = tempdir()?;
+    {
+        let env = options().open(dir.path())?;
+        let mut wtxn = env.write_txn()?;
+        let db = env.create_database::<Str, Str>(&mut wtxn, None)?;
+        for i in 0..ENTRIES {
+            db.put(&mut wtxn, &format!("key-{i:05}"), &format!("value-{i:05}"))?;
+        }
+        wtxn.commit()?;
+
+        let mut wtxn = env.write_txn()?;
+        for i in 0..INSERTS {
+            db.put(
+                &mut wtxn,
+                &format!("aaa-{i:05}"),
+                &format!("inserted-{i:05}"),
+            )?;
+        }
+        for i in 0..UPDATES {
+            db.put(
+                &mut wtxn,
+                &format!("key-{i:05}"),
+                &format!("updated-{i:05}"),
+            )?;
+        }
+        wtxn.commit()?;
+    }
+
+    let env = options().open(dir.path())?;
+    let rtxn = env.read_txn()?;
+    let db = env.open_database::<Str, Str>(&rtxn, None)?;
+    assert_eq!(db.len(&rtxn)?, u64::from(ENTRIES + INSERTS));
+    assert_eq!(db.first(&rtxn)?, Some(("aaa-00000", "inserted-00000")));
+    assert_eq!(db.last(&rtxn)?, Some(("key-09999", "value-09999")));
+    for i in 0..INSERTS {
+        assert_eq!(
+            db.get(&rtxn, &format!("aaa-{i:05}"))?,
+            Some(format!("inserted-{i:05}").as_str()),
+            "inserted key {i}"
+        );
+    }
+    for i in 0..ENTRIES {
+        let key = format!("key-{i:05}");
+        let expected = if i < UPDATES {
+            format!("updated-{i:05}")
+        } else {
+            format!("value-{i:05}")
+        };
+        assert_eq!(db.get(&rtxn, &key)?, Some(expected.as_str()), "key {key}");
+    }
+
+    Ok(())
+}
+
+#[test]
 fn bulk_load_uses_staged_large_values() -> Result<()> {
     let dir = tempdir()?;
     let values: Vec<Vec<u8>> = (0..1_100u32)

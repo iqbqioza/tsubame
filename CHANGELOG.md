@@ -143,6 +143,11 @@ All notable changes to this project are documented here.
   instead of separately reading the key for bound checks.
 - Large pending batches that exceed a byte threshold use bottom-up bulk loading
   even when their entry count is below the normal threshold.
+- Large mixed write batches are applied bottom-up in one pass: each affected
+  leaf is rewritten once, and branch pages are rebuilt from the resulting
+  child list instead of bulk-deleting first and then inserting keys one by one.
+- Tree rewrite entries keep values up to 96 bytes inline, avoiding a heap
+  allocation per entry on large updates.
 - Large pending delete batches are applied bottom-up before staged puts, while
   updates reuse transaction-owned pages in place. This keeps mixed update and
   delete workloads from rebuilding the same path once per key.
