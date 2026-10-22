@@ -717,13 +717,13 @@ impl EnvState {
             .checked_mul(PAGE_SIZE)
             .context("meta slot offset overflow")?;
         let end = start
-            .checked_add(PAGE_SIZE)
+            .checked_add(meta::ENCODED_LEN)
             .context("meta slot offset overflow")?;
         ensure!(
             end <= mapping.len(),
             "meta slot is outside the writable mapping"
         );
-        mapping[start..end].copy_from_slice(page);
+        mapping[start..end].copy_from_slice(&page[..meta::ENCODED_LEN]);
         Ok(true)
     }
 
@@ -739,13 +739,18 @@ impl EnvState {
             .checked_mul(PAGE_SIZE)
             .context("meta slot offset overflow")?;
         ensure!(
-            start + PAGE_SIZE <= mapping.len(),
+            start + meta::ENCODED_LEN <= mapping.len(),
             "meta slot is outside the mapping"
         );
         mapping
-            .flush_range(start, PAGE_SIZE)
+            .flush_range(start, meta::ENCODED_LEN)
             .with_context(|| format!("failed to flush meta slot {slot}"))?;
         Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn has_write_mmap(&self) -> bool {
+        self.write_mmap.is_some()
     }
 
     /// Copies a page into the writable mapping.
@@ -772,6 +777,52 @@ impl EnvState {
             "page {page_id} is outside the writable mapping"
         );
         mapping[start..end].copy_from_slice(page);
+        Ok(true)
+    }
+
+    /// Copies `old_page_id` into `new_page_id` and applies an in-place edit
+    /// without copying the page into the transaction overlay.
+    pub(crate) fn update_page_direct<F>(
+        &self,
+        old_page_id: u64,
+        new_page_id: u64,
+        edit: F,
+    ) -> Result<bool>
+    where
+        F: FnOnce(&mut [u8; PAGE_SIZE]) -> Result<()>,
+    {
+        let Some(write_mmap) = &self.write_mmap else {
+            return Ok(false);
+        };
+        ensure!(old_page_id >= 2, "data page ID {old_page_id} is reserved");
+        ensure!(new_page_id >= 2, "data page ID {new_page_id} is reserved");
+        let old_index = usize::try_from(old_page_id - 2).context("page ID is too large")?;
+        let new_index = usize::try_from(new_page_id - 2).context("page ID is too large")?;
+        let old_start = old_index
+            .checked_mul(PAGE_SIZE)
+            .context("page offset overflow")?;
+        let new_start = new_index
+            .checked_mul(PAGE_SIZE)
+            .context("page offset overflow")?;
+        let old_end = old_start
+            .checked_add(PAGE_SIZE)
+            .context("page offset overflow")?;
+        let new_end = new_start
+            .checked_add(PAGE_SIZE)
+            .context("page offset overflow")?;
+        let mut mapping = write_mmap
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ensure!(
+            old_end <= mapping.len() && new_end <= mapping.len(),
+            "page update is outside the writable mapping"
+        );
+        mapping.copy_within(old_start..old_end, new_start);
+        let new_slice = &mut mapping[new_start..new_end];
+        let bytes: &mut [u8; PAGE_SIZE] = new_slice
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("page has an unexpected size"))?;
+        edit(bytes)?;
         Ok(true)
     }
 

@@ -328,6 +328,20 @@ impl PageStore for CompactStore {
         Ok(page)
     }
 
+    fn with_page<R>(&self, page_id: u64, visit: impl FnOnce(&Page<'_>) -> Result<R>) -> Result<R> {
+        let bytes = self.read_page(page_id)?;
+        visit(&Page::parse(&bytes, Some(page_id))?)
+    }
+
+    fn update_page<F>(&mut self, old_page_id: u64, new_page_id: u64, edit: F) -> Result<()>
+    where
+        F: FnOnce(&mut [u8; PAGE_SIZE]) -> Result<()>,
+    {
+        let mut page = self.read_page(old_page_id)?;
+        edit(&mut page)?;
+        self.write_page(new_page_id, page)
+    }
+
     fn allocate_pages(&mut self, pages: u64) -> Result<u64> {
         ensure!(pages > 0, "allocation must contain at least one page");
         let start = self.next_page;

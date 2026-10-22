@@ -7,11 +7,20 @@
 use anyhow::Result;
 
 use super::PAGE_SIZE;
+use super::page::Page;
 
 /// A mutable page store.
 pub(crate) trait PageStore {
     /// Reads a page into an owned buffer.
     fn read_page(&self, page_id: u64) -> Result<[u8; PAGE_SIZE]>;
+
+    /// Visits a page without copying it first.
+    fn with_page<R>(&self, page_id: u64, visit: impl FnOnce(&Page<'_>) -> Result<R>) -> Result<R>;
+
+    /// Copies `old_page_id` into `new_page_id` and applies an in-place edit.
+    fn update_page<F>(&mut self, old_page_id: u64, new_page_id: u64, edit: F) -> Result<()>
+    where
+        F: FnOnce(&mut [u8; PAGE_SIZE]) -> Result<()>;
 
     /// Allocates a contiguous run of pages and returns its first page ID.
     fn allocate_pages(&mut self, pages: u64) -> Result<u64>;
@@ -70,6 +79,31 @@ pub(crate) mod memory {
                 .get(&page_id)
                 .with_context(|| format!("page {page_id} not found"))?;
             Ok(*page)
+        }
+
+        fn with_page<R>(
+            &self,
+            page_id: u64,
+            visit: impl FnOnce(&Page<'_>) -> Result<R>,
+        ) -> Result<R> {
+            let bytes = self
+                .pages
+                .get(&page_id)
+                .with_context(|| format!("page {page_id} not found"))?;
+            visit(&Page::parse(bytes, Some(page_id))?)
+        }
+
+        fn update_page<F>(&mut self, old_page_id: u64, new_page_id: u64, edit: F) -> Result<()>
+        where
+            F: FnOnce(&mut [u8; PAGE_SIZE]) -> Result<()>,
+        {
+            let mut page = *self
+                .pages
+                .get(&old_page_id)
+                .with_context(|| format!("page {old_page_id} not found"))?;
+            edit(&mut page)?;
+            self.pages.insert(new_page_id, page);
+            Ok(())
         }
 
         fn allocate_pages(&mut self, pages: u64) -> Result<u64> {

@@ -261,14 +261,11 @@ fn insert_into<S: PageStore>(
         "B+tree depth exceeded {MAX_DEPTH} during insert"
     );
 
-    let bytes = store.read_page(page_id)?;
-    let page_type = Page::parse_trusted(&bytes, Some(page_id))?.page_type();
+    let page_type = store.with_page(page_id, |page| Ok(page.page_type()))?;
 
     match page_type {
-        PageType::Leaf => insert_leaf(store, page_id, bytes, key, value, txn_id, comparator),
-        PageType::Branch => {
-            insert_branch(store, page_id, bytes, key, value, txn_id, depth, comparator)
-        }
+        PageType::Leaf => insert_leaf(store, page_id, key, value, txn_id, comparator),
+        PageType::Branch => insert_branch(store, page_id, key, value, txn_id, depth, comparator),
     }
 }
 
@@ -281,14 +278,12 @@ enum LeafEdit {
 fn insert_leaf<S: PageStore>(
     store: &mut S,
     page_id: u64,
-    mut bytes: [u8; PAGE_SIZE],
     key: &[u8],
     value: &[u8],
     txn_id: u64,
     comparator: &KeyComparator,
 ) -> Result<InsertResult> {
-    let edit = {
-        let page = Page::parse_trusted(&bytes, Some(page_id))?;
+    let edit = store.with_page(page_id, |page| {
         let position = page.lower_bound_with(key, comparator)?;
         let existing = position < page.slot_count() && page.key(position)? == key;
         let inline = SLOT_SIZE + key.len() + value.len() <= INLINE_BUDGET;
@@ -326,33 +321,29 @@ fn insert_leaf<S: PageStore>(
                 edit = Some(LeafEdit::Append);
             }
         }
-        edit
-    };
+        Ok(edit)
+    })?;
 
     if let Some(edit) = edit {
+        let old_overflow = match edit {
+            LeafEdit::Resized(_, overflow) => overflow,
+            LeafEdit::Same(_) | LeafEdit::Append => None,
+        };
         let new_page_id = store.allocate_pages(1)?;
-        match edit {
+        store.update_page(page_id, new_page_id, |bytes| match edit {
             LeafEdit::Same(position) => {
-                page::replace_value_in_place(&mut bytes, new_page_id, txn_id, position, value, 0)?
+                page::replace_value_in_place(bytes, new_page_id, txn_id, position, value, 0)
             }
-            LeafEdit::Resized(position, overflow) => {
-                page::replace_value_resized_in_place(
-                    &mut bytes,
-                    new_page_id,
-                    txn_id,
-                    position,
-                    value,
-                    0,
-                )?;
-                if let Some(reference) = overflow {
-                    store.free_pages(reference.start_page, reference.page_count)?;
-                }
+            LeafEdit::Resized(position, _) => {
+                page::replace_value_resized_in_place(bytes, new_page_id, txn_id, position, value, 0)
             }
             LeafEdit::Append => {
-                page::append_entry_in_place(&mut bytes, new_page_id, txn_id, key, value, 0)?
+                page::append_entry_in_place(bytes, new_page_id, txn_id, key, value, 0)
             }
+        })?;
+        if let Some(reference) = old_overflow {
+            store.free_pages(reference.start_page, reference.page_count)?;
         }
-        store.write_page(new_page_id, bytes)?;
         store.free_pages(page_id, 1)?;
         return Ok(InsertResult {
             page_id: new_page_id,
@@ -360,8 +351,7 @@ fn insert_leaf<S: PageStore>(
         });
     }
 
-    let page = Page::parse_trusted(&bytes, Some(page_id))?;
-    let mut entries = collect_leaf(&page)?;
+    let mut entries = store.with_page(page_id, collect_leaf)?;
     let new_value = make_value(store, key.len(), value, txn_id)?;
     let replaced =
         match entries.binary_search_by(|entry| comparator.compare(entry.key.as_slice(), key)) {
@@ -390,24 +380,23 @@ fn insert_leaf<S: PageStore>(
 fn insert_branch<S: PageStore>(
     store: &mut S,
     page_id: u64,
-    mut bytes: [u8; PAGE_SIZE],
     key: &[u8],
     value: &[u8],
     txn_id: u64,
     depth: usize,
     comparator: &KeyComparator,
 ) -> Result<InsertResult> {
-    let (index, child) = {
-        let page = Page::parse_trusted(&bytes, Some(page_id))?;
+    let (index, child) = store.with_page(page_id, |page| {
         let index = page.branch_child_index_with(key, comparator)?;
-        (index, page.child(index)?)
-    };
+        Ok((index, page.child(index)?))
+    })?;
     let result = insert_into(store, child, key, value, txn_id, depth + 1, comparator)?;
 
     if result.split.is_none() {
         let new_page_id = store.allocate_pages(1)?;
-        page::replace_child_in_place(&mut bytes, new_page_id, txn_id, index, result.page_id)?;
-        store.write_page(new_page_id, bytes)?;
+        store.update_page(page_id, new_page_id, |bytes| {
+            page::replace_child_in_place(bytes, new_page_id, txn_id, index, result.page_id)
+        })?;
         store.free_pages(page_id, 1)?;
         return Ok(InsertResult {
             page_id: new_page_id,
@@ -415,8 +404,7 @@ fn insert_branch<S: PageStore>(
         });
     }
 
-    let page = Page::parse_trusted(&bytes, Some(page_id))?;
-    let mut entries = collect_branch(&page)?;
+    let mut entries = store.with_page(page_id, collect_branch)?;
     entries[index].1 = result.page_id;
     if let Some(split) = result.split {
         entries.insert(index + 1, (split.separator, split.right));

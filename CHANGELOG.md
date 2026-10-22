@@ -98,6 +98,9 @@ All notable changes to this project are documented here.
   into writable shared mappings, removing per-page `pwrite` syscalls and overlay
   copies from the commit path. POSIX systems flush the mappings with one
   `fdatasync`; Windows explicitly flushes dirty mapped ranges first.
+- Copy-on-write leaf and branch updates copy the old page directly into the
+  writable mapping and edit it there. This removes one full-page copy at every
+  tree level from the common insert and update path.
 
 ### Fixed
 
