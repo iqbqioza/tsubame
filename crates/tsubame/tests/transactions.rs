@@ -1326,6 +1326,42 @@ fn multi_process_online_compaction_refreshes_read_only_environment() -> Result<(
 }
 
 #[test]
+fn writer_restart_refreshes_read_only_environment() -> Result<()> {
+    let dir = tempdir()?;
+    let mut writer_options = options();
+    writer_options.multi_process(true);
+    {
+        let writer = writer_options.open(dir.path())?;
+        let mut wtxn = writer.write_txn()?;
+        let db = writer.create_database::<Str, Str>(&mut wtxn, None)?;
+        db.put(&mut wtxn, "key", "before")?;
+        wtxn.commit()?;
+    }
+
+    let mut read_options = options();
+    read_options.read_only(true);
+    let reader = read_options.open(dir.path())?;
+    let old_rtxn = reader.read_txn()?;
+    let old_db = reader.open_database::<Str, Str>(&old_rtxn, None)?;
+    assert_eq!(old_db.get(&old_rtxn, "key")?, Some("before"));
+
+    let writer = writer_options.open(dir.path())?;
+    let read_rtxn = writer.read_txn()?;
+    let db = writer.open_database::<Str, Str>(&read_rtxn, None)?;
+    drop(read_rtxn);
+    let mut wtxn = writer.write_txn()?;
+    db.put(&mut wtxn, "key", "after")?;
+    wtxn.commit()?;
+
+    let new_rtxn = reader.read_txn()?;
+    let new_db = reader.open_database::<Str, Str>(&new_rtxn, None)?;
+    assert_eq!(new_db.get(&new_rtxn, "key")?, Some("after"));
+    assert_eq!(old_db.get(&old_rtxn, "key")?, Some("before"));
+
+    Ok(())
+}
+
+#[test]
 fn online_compaction_remaps_an_open_environment() -> Result<()> {
     let dir = tempdir()?;
     let env = options().open(dir.path())?;
